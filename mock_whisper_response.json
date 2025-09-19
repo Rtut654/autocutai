@@ -1,0 +1,274 @@
+{
+  "transcript": "Hello, this is a test audio file for the video editor API. We are testing word-level timestamps from the Whisper API.",
+  "language": "en",
+  "duration": 15.55,
+  "words": [
+    {
+      "word": "Hello",
+      "start": 0.0,
+      "end": 0.95,
+      "confidence": 0.871
+    },
+    {
+      "word": "this",
+      "start": 0.95,
+      "end": 1.71,
+      "confidence": 0.865
+    },
+    {
+      "word": "is",
+      "start": 1.71,
+      "end": 2.65,
+      "confidence": 0.875
+    },
+    {
+      "word": "a",
+      "start": 2.65,
+      "end": 3.23,
+      "confidence": 0.868
+    },
+    {
+      "word": "test",
+      "start": 3.23,
+      "end": 3.99,
+      "confidence": 0.99
+    },
+    {
+      "word": "audio",
+      "start": 3.99,
+      "end": 5.05,
+      "confidence": 0.948
+    },
+    {
+      "word": "file",
+      "start": 5.05,
+      "end": 5.98,
+      "confidence": 0.956
+    },
+    {
+      "word": "for",
+      "start": 5.98,
+      "end": 6.39,
+      "confidence": 0.939
+    },
+    {
+      "word": "the",
+      "start": 6.39,
+      "end": 7.21,
+      "confidence": 0.854
+    },
+    {
+      "word": "video",
+      "start": 7.21,
+      "end": 7.92,
+      "confidence": 0.958
+    },
+    {
+      "word": "editor",
+      "start": 7.92,
+      "end": 8.81,
+      "confidence": 0.879
+    },
+    {
+      "word": "API",
+      "start": 8.81,
+      "end": 9.35,
+      "confidence": 0.948
+    },
+    {
+      "word": "We",
+      "start": 9.35,
+      "end": 10.1,
+      "confidence": 0.99
+    },
+    {
+      "word": "are",
+      "start": 10.1,
+      "end": 10.57,
+      "confidence": 0.959
+    },
+    {
+      "word": "testing",
+      "start": 10.57,
+      "end": 11.21,
+      "confidence": 0.907
+    },
+    {
+      "word": "word-level",
+      "start": 11.21,
+      "end": 12.08,
+      "confidence": 0.973
+    },
+    {
+      "word": "timestamps",
+      "start": 12.08,
+      "end": 12.4,
+      "confidence": 0.853
+    },
+    {
+      "word": "from",
+      "start": 12.4,
+      "end": 13.45,
+      "confidence": 0.967
+    },
+    {
+      "word": "the",
+      "start": 13.45,
+      "end": 13.85,
+      "confidence": 0.858
+    },
+    {
+      "word": "Whisper",
+      "start": 13.85,
+      "end": 14.78,
+      "confidence": 0.957
+    },
+    {
+      "word": "API",
+      "start": 14.78,
+      "end": 15.55,
+      "confidence": 0.915
+    }
+  ],
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 15.55,
+      "text": "Hello, this is a test audio file for the video editor API. We are testing word-level timestamps from the Whisper API.",
+      "words": [
+        {
+          "word": "Hello",
+          "start": 0.0,
+          "end": 0.95,
+          "confidence": 0.871
+        },
+        {
+          "word": "this",
+          "start": 0.95,
+          "end": 1.71,
+          "confidence": 0.865
+        },
+        {
+          "word": "is",
+          "start": 1.71,
+          "end": 2.65,
+          "confidence": 0.875
+        },
+        {
+          "word": "a",
+          "start": 2.65,
+          "end": 3.23,
+          "confidence": 0.868
+        },
+        {
+          "word": "test",
+          "start": 3.23,
+          "end": 3.99,
+          "confidence": 0.99
+        },
+        {
+          "word": "audio",
+          "start": 3.99,
+          "end": 5.05,
+          "confidence": 0.948
+        },
+        {
+          "word": "file",
+          "start": 5.05,
+          "end": 5.98,
+          "confidence": 0.956
+        },
+        {
+          "word": "for",
+          "start": 5.98,
+          "end": 6.39,
+          "confidence": 0.939
+        },
+        {
+          "word": "the",
+          "start": 6.39,
+          "end": 7.21,
+          "confidence": 0.854
+        },
+        {
+          "word": "video",
+          "start": 7.21,
+          "end": 7.92,
+          "confidence": 0.958
+        },
+        {
+          "word": "editor",
+          "start": 7.92,
+          "end": 8.81,
+          "confidence": 0.879
+        },
+        {
+          "word": "API",
+          "start": 8.81,
+          "end": 9.35,
+          "confidence": 0.948
+        },
+        {
+          "word": "We",
+          "start": 9.35,
+          "end": 10.1,
+          "confidence": 0.99
+        },
+        {
+          "word": "are",
+          "start": 10.1,
+          "end": 10.57,
+          "confidence": 0.959
+        },
+        {
+          "word": "testing",
+          "start": 10.57,
+          "end": 11.21,
+          "confidence": 0.907
+        },
+        {
+          "word": "word-level",
+          "start": 11.21,
+          "end": 12.08,
+          "confidence": 0.973
+        },
+        {
+          "word": "timestamps",
+          "start": 12.08,
+          "end": 12.4,
+          "confidence": 0.853
+        },
+        {
+          "word": "from",
+          "start": 12.4,
+          "end": 13.45,
+          "confidence": 0.967
+        },
+        {
+          "word": "the",
+          "start": 13.45,
+          "end": 13.85,
+          "confidence": 0.858
+        },
+        {
+          "word": "Whisper",
+          "start": 13.85,
+          "end": 14.78,
+          "confidence": 0.957
+        },
+        {
+          "word": "API",
+          "start": 14.78,
+          "end": 15.55,
+          "confidence": 0.915
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "model": "whisper-1",
+    "processing_time": 3.03,
+    "timestamp": 1758199413.4220376
+  }
+}

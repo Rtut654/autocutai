@@ -46,7 +46,7 @@ async def test_api_endpoints():
         # Test transcription info endpoint
         print("\n3. Testing transcription info endpoint...")
         try:
-            response = await client.get(f"{base_url}/api/transcription/info")
+            response = await client.get(f"{base_url}/api/info")
             print(f"   Status: {response.status_code}")
             if response.status_code == 200:
                 data = response.json()
@@ -68,7 +68,7 @@ async def test_api_endpoints():
                     data = {'language': 'en'}
                     
                     response = await client.post(
-                        f"{base_url}/api/transcription/transcribe",
+                        f"{base_url}/api/transcribe",
                         files=files,
                         data=data
                     )
@@ -106,3 +106,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
