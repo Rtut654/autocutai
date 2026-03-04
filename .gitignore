@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+backvenv/
+
+# macOS
+.DS_Store
+
+# Mobile/Web heavy generated folders
+mobile/node_modules/
+mobile/.expo/
+mobile/ios/build/
+mobile/android/build/
+web/node_modules/
+web/.next/
+web/out/
+web/dist/
+
+# Build artifacts
+build/
+dist/

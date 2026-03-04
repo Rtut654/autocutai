@@ -1,0 +1,10 @@
+{
+  "expo": {
+    "name": "BestShotAI",
+    "slug": "bestshotai",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.bestshotai.app"
+    }
+  }
+}

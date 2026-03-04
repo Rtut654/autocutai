@@ -1,0 +1,53 @@
+{
+  "id": "af855cbc-9aba-4830-a4fe-32da18c5aed0",
+  "name": "Smoke",
+  "description": null,
+  "created_at": "2026-02-26T10:15:12.754571",
+  "updated_at": "2026-02-26T10:15:12.754581",
+  "tracks": [
+    {
+      "id": "f9b5aa4e-9d00-49d3-9058-23a084e10797",
+      "type": "video",
+      "filename": "3a3c17abc38d4ca480b3270e19564906_clip1.mp4",
+      "file_path": "temp/3a3c17abc38d4ca480b3270e19564906_clip1.mp4",
+      "duration": 30.0,
+      "start_time": null,
+      "end_time": null,
+      "position": 0,
+      "metadata": {
+        "filename": "3a3c17abc38d4ca480b3270e19564906_clip1.mp4",
+        "size": 9,
+        "extension": ".mp4",
+        "uploaded_at": "2026-02-26T18:15:12.744915"
+      },
+      "transcription": null,
+      "has_voice": false,
+      "recorded_at": "2026-02-26T10:15:12.744784",
+      "local_gap_ranges": []
+    }
+  ],
+  "settings": {
+    "aspect_ratio": "horizontal",
+    "edit_mode": "chronological",
+    "remove_duplicates": false,
+    "smart_pause_cutter": false,
+    "generate_subtitles": false,
+    "insert_suggestions": false,
+    "min_gap_seconds": 1.0
+  },
+  "status": "draft",
+  "output_path": null,
+  "user_id": null,
+  "pipeline": {
+    "combined_transcript": "",
+    "combined_words": [],
+    "word_srt_path": null,
+    "subtitle_path": null,
+    "subtitle_cues": [],
+    "gap_ranges": [],
+    "insertion_suggestions": [],
+    "locations": [],
+    "render_plan": {}
+  },
+  "error_message": null
+}
