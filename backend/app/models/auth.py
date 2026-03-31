@@ -27,11 +27,26 @@ class PaymentStartRequest(BaseModel):
     plan: Literal["free", "pro_monthly", "pro_yearly"] = "pro_monthly"
 
 
+class OAuthLoginRequest(BaseModel):
+    code: Optional[str] = None
+    id_token: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
+    picture: Optional[str] = None
+    provider_user_id: Optional[str] = None
+
+
+class ProfileUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+
+
 class AuthUser(BaseModel):
     id: str
     email: str
     password_hash: str
     full_name: Optional[str] = None
+    provider: Literal["email", "google", "apple"] = "email"
+    provider_user_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     onboarding_completed: bool = False
     onboarding: OnboardingData = Field(default_factory=OnboardingData)
@@ -50,6 +65,7 @@ class MeResponse(BaseModel):
     full_name: Optional[str] = None
     onboarding_completed: bool
     subscription_plan: str
+    provider: str = "email"
 
 
 class PaymentStartResponse(BaseModel):

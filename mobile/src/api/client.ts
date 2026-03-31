@@ -1,6 +1,49 @@
-export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://localhost:8000';
+export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://autocutai.app';
 
 export type SubscriptionPlan = 'free' | 'pro_monthly' | 'pro_yearly';
+export type BillingPlanKey = 'monthly' | 'six_month' | 'yearly';
+
+export type BillingPlan = {
+  key: BillingPlanKey;
+  title: string;
+  billing_period: string;
+  price_label: string;
+  original_price_label: string;
+  discount_label: string;
+};
+
+const DEFAULT_BILLING_PLANS: BillingPlan[] = [
+  {
+    key: 'monthly',
+    title: '1 Month',
+    billing_period: '1 month',
+    price_label: '$19.99',
+    original_price_label: '',
+    discount_label: '',
+  },
+  {
+    key: 'six_month',
+    title: '6 Months',
+    billing_period: '6 months',
+    price_label: '$59.99',
+    original_price_label: '$99.99',
+    discount_label: '-40%',
+  },
+  {
+    key: 'yearly',
+    title: '1 Year',
+    billing_period: '1 year',
+    price_label: '$99.00',
+    original_price_label: '$247.50',
+    discount_label: '-60%',
+  },
+];
+
+const BILLING_TO_SUBSCRIPTION: Record<BillingPlanKey, SubscriptionPlan> = {
+  monthly: 'pro_monthly',
+  six_month: 'pro_yearly',
+  yearly: 'pro_yearly',
+};
 
 export type MeUser = {
   id: string;
@@ -8,6 +51,7 @@ export type MeUser = {
   full_name?: string | null;
   onboarding_completed: boolean;
   subscription_plan: SubscriptionPlan;
+  provider?: string | null;
 };
 
 export type AuthSession = {
@@ -15,6 +59,20 @@ export type AuthSession = {
   token_type: string;
   user_id: string;
   user: MeUser;
+};
+
+type ProjectSummary = {
+  id: string;
+  name: string;
+  status: string;
+  output_path?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  tracks?: Array<{ duration?: number }>;
+  pipeline?: {
+    insertion_suggestions?: Array<unknown>;
+    gap_ranges?: Array<unknown>;
+  };
 };
 
 async function check<T>(res: Response): Promise<T> {
@@ -49,7 +107,16 @@ async function hydrateSession(raw: { access_token: string; token_type?: string; 
   };
 }
 
+function normalizeBillingPlanKey(value?: string): BillingPlanKey {
+  if (value === 'monthly' || value === 'six_month' || value === 'yearly') return value;
+  return 'yearly';
+}
+
 export const api = {
+  getBaseUrl() {
+    return API_BASE_URL;
+  },
+
   async signup(payload: { email: string; password: string; full_name?: string }) {
     const raw = await request<{ access_token: string; token_type: string; user_id: string }>(
       '/api/auth/signup',
@@ -71,6 +138,40 @@ export const api = {
 
   async me(token: string) {
     return request<MeUser>('/api/auth/me', { method: 'GET' }, token);
+  },
+
+  async googleLogin(payload: {
+    id_token?: string;
+    email?: string;
+    name?: string;
+    picture?: string;
+    provider_user_id?: string;
+  }) {
+    const raw = await request<{ access_token: string; token_type: string; user_id: string }>(
+      '/api/auth/google_login',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+    );
+    return hydrateSession(raw);
+  },
+
+  async appleLogin(payload: {
+    code?: string;
+    id_token?: string;
+    email?: string;
+    name?: string;
+    provider_user_id?: string;
+  }) {
+    const raw = await request<{ access_token: string; token_type: string; user_id: string }>(
+      '/api/auth/apple_login',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+    );
+    return hydrateSession(raw);
   },
 
   async completeOnboarding(
@@ -107,6 +208,60 @@ export const api = {
       },
       token,
     );
+  },
+
+  async getBillingPlans(_token?: string | null) {
+    return DEFAULT_BILLING_PLANS;
+  },
+
+  async getBillingStatus(token: string) {
+    const me = await request<MeUser>('/api/auth/me', { method: 'GET' }, token);
+    return { is_premium: me.subscription_plan !== 'free', plan: me.subscription_plan };
+  },
+
+  async subscribePremium(
+    token: string,
+    payloadOrPlanKey:
+      | BillingPlanKey
+      | {
+          plan_key?: string;
+          purchase_provider?: string;
+          product_id?: string;
+          transaction_id?: string;
+          receipt_data?: string;
+          purchase_token?: string;
+        },
+  ) {
+    const billingPlanKey =
+      typeof payloadOrPlanKey === 'string'
+        ? normalizeBillingPlanKey(payloadOrPlanKey)
+        : normalizeBillingPlanKey(payloadOrPlanKey?.plan_key);
+
+    const mappedPlan = BILLING_TO_SUBSCRIPTION[billingPlanKey];
+    await api.startPayment(token, mappedPlan);
+    return api.activatePayment(token, mappedPlan);
+  },
+
+  async listProjects(limit = 100, offset = 0) {
+    return request<{ projects: ProjectSummary[]; total: number }>(
+      `/api/projects/?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`,
+      { method: 'GET' },
+    );
+  },
+
+  async updateProfile(token: string, payload: { full_name?: string | null }) {
+    return request<MeUser>(
+      '/api/auth/me',
+      {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      },
+      token,
+    );
+  },
+
+  async deleteAccount(token: string) {
+    return request<{ message: string }>('/api/auth/me', { method: 'DELETE' }, token);
   },
 };
 

@@ -6,25 +6,16 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
-import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system';
-import * as Sharing from 'expo-sharing';
 
-import { api, AuthSession, downloadOutput, getTimeline, processProjectSync, createProject, SubscriptionPlan } from './src/api/client';
+import { api, AuthSession } from './src/api/client';
 import LoginScreen from './src/screens/LoginScreen';
 import OnboardingScreen from './src/screens/OnboardingScreen';
 import PricingScreen from './src/screens/PricingScreen';
 import ProjectsScreen from './src/screens/ProjectsScreen';
-import CreateScreen from './src/screens/CreateScreen';
-import TimelineScreen from './src/screens/TimelineScreen';
+import UploadScreen from './src/screens/UploadScreen';
+import ProcessingScreen from './src/screens/ProcessingScreen';
+import HistoryScreen from './src/screens/HistoryScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
-
-type LocalFile = {
-  uri: string;
-  name: string;
-  mimeType?: string;
-  recordedAt?: string;
-};
 
 const PRELOGIN_ONBOARDING_KEY = 'onboarding_done_guest_v1';
 const Tab: any = createBottomTabNavigator();
@@ -34,43 +25,32 @@ function MainTabs({
   session,
   onLogout,
   onOpenPricing,
-  files,
-  canRun,
-  status,
-  summary,
-  projectId,
-  onPickVideos,
-  onRunPipeline,
-  onSaveFinalVideo,
+  activeJobId,
+  onJobStarted,
+  onClearJob,
 }: {
   session: AuthSession;
   onLogout: () => Promise<void>;
   onOpenPricing: () => void;
-  files: LocalFile[];
-  canRun: boolean;
-  status: string;
-  summary: string;
-  projectId: string | null;
-  onPickVideos: () => Promise<void>;
-  onRunPipeline: () => Promise<void>;
-  onSaveFinalVideo: () => Promise<void>;
+  activeJobId: string | null;
+  onJobStarted: (jobId: string) => void;
+  onClearJob: () => void;
 }) {
   const insets = useSafeAreaInsets();
-
   const tabIcon = (name: React.ComponentProps<typeof MaterialCommunityIcons>['name'], focused: boolean, color: string) => (
-    <MaterialCommunityIcons name={name} size={22} color={focused ? '#031b33' : color} />
+    <MaterialCommunityIcons name={name} size={22} color={focused ? '#173e75' : color} />
   );
 
   return (
     <Tab.Navigator
-      initialRouteName="Projects"
+      initialRouteName="Upload"
       screenOptions={{
         headerShown: false,
-        tabBarActiveTintColor: '#031b33',
+        tabBarActiveTintColor: '#173e75',
         tabBarInactiveTintColor: '#60748a',
         tabBarStyle: {
           backgroundColor: '#eef5ff',
-          borderTopColor: '#c7d7ea',
+          borderTopColor: '#d2ddeb',
           borderTopWidth: 1,
           height: 56 + insets.bottom,
           paddingBottom: Math.max(insets.bottom, 8),
@@ -83,34 +63,45 @@ function MainTabs({
       }}
     >
       <Tab.Screen
+        name="Upload"
+        options={{ tabBarIcon: ({ focused, color }) => tabIcon('movie-open-plus-outline', focused, color) }}
+      >
+        {() =>
+          activeJobId ? (
+            <ProcessingScreen jobId={activeJobId} onBack={onClearJob} />
+          ) : (
+            <UploadScreen onJobStarted={onJobStarted} />
+          )
+        }
+      </Tab.Screen>
+      <Tab.Screen
         name="Projects"
         options={{ tabBarIcon: ({ focused, color }) => tabIcon('folder-multiple-outline', focused, color) }}
       >
-        {(props) => <ProjectsScreen {...props} projectId={projectId} status={status} onGoCreate={() => props.navigation.navigate('Create')} />}
+        {(props: any) => (
+          <ProjectsScreen
+            {...props}
+            projectId={activeJobId}
+            status={activeJobId ? 'Processing' : 'Idle'}
+            onGoCreate={() => props.navigation.navigate('Upload')}
+          />
+        )}
       </Tab.Screen>
       <Tab.Screen
-        name="Create"
-        options={{ tabBarIcon: ({ focused, color }) => tabIcon('movie-open-plus-outline', focused, color) }}
+        name="History"
+        options={{
+          tabBarIcon: ({ focused, color }) => tabIcon('history', focused, color),
+          unmountOnBlur: true,
+        }}
       >
-        {(props) => <CreateScreen {...props} files={files} canRun={canRun} status={status} onPickVideos={onPickVideos} onRunPipeline={onRunPipeline} />}
-      </Tab.Screen>
-      <Tab.Screen
-        name="Timeline"
-        options={{ tabBarIcon: ({ focused, color }) => tabIcon('timeline-outline', focused, color) }}
-      >
-        {(props) => <TimelineScreen {...props} projectId={projectId} summary={summary} onSaveFinalVideo={onSaveFinalVideo} />}
+        {(props: any) => <HistoryScreen {...props} />}
       </Tab.Screen>
       <Tab.Screen
         name="Profile"
         options={{ tabBarIcon: ({ focused, color }) => tabIcon('account-circle-outline', focused, color) }}
       >
-        {(props) => (
-          <ProfileScreen
-            {...props}
-            user={session.user}
-            onLogout={onLogout}
-            onOpenPricing={onOpenPricing}
-          />
+        {(props: any) => (
+            <ProfileScreen {...props} token={session.access_token} session={session} onLogout={onLogout} onOpenPricing={onOpenPricing} />
         )}
       </Tab.Screen>
     </Tab.Navigator>
@@ -123,12 +114,7 @@ export default function App() {
   const [preloginOnboardingDone, setPreloginOnboardingDone] = useState(false);
   const [authBootstrapDone, setAuthBootstrapDone] = useState(false);
 
-  const [files, setFiles] = useState<LocalFile[]>([]);
-  const [status, setStatus] = useState('Idle');
-  const [projectId, setProjectId] = useState<string | null>(null);
-  const [summary, setSummary] = useState('');
-
-  const canRun = useMemo(() => files.length > 0, [files]);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -189,10 +175,11 @@ export default function App() {
   const onLogout = async () => {
     setSession(null);
     setOnboardingDone(false);
+    setActiveJobId(null);
     await AsyncStorage.removeItem('session');
   };
 
-  const finishOnboarding = async ({ plan }: { plan?: SubscriptionPlan } = {}) => {
+  const finishOnboarding = async () => {
     if (!session?.access_token) {
       await AsyncStorage.setItem(PRELOGIN_ONBOARDING_KEY, '1');
       setPreloginOnboardingDone(true);
@@ -205,102 +192,16 @@ export default function App() {
       preferred_edit_style: 'smart-cut',
     });
 
-    let nextUser = updated;
-    if (plan && plan !== 'free') {
-      nextUser = await api.activatePayment(session.access_token, plan);
-    }
-
     const nextSession: AuthSession = {
       ...session,
-      user: nextUser,
-      user_id: nextUser.id,
+      user: updated,
+      user_id: updated.id,
     };
 
     setSession(nextSession);
     await AsyncStorage.setItem('session', JSON.stringify(nextSession));
     setOnboardingDone(true);
   };
-
-  const pickVideos = async () => {
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ['video/*'],
-        multiple: true,
-        copyToCacheDirectory: true,
-      });
-
-      if (result.canceled) return;
-
-      const next = result.assets.map((asset) => ({
-        uri: asset.uri,
-        name: asset.name,
-        mimeType: asset.mimeType,
-        recordedAt: new Date().toISOString(),
-      }));
-
-      setFiles(next);
-      setStatus(`Selected ${next.length} videos`);
-    } catch (err: any) {
-      Alert.alert('Selection failed', err?.message || 'Unable to pick videos.');
-    }
-  };
-
-  const runPipeline = async () => {
-    if (!canRun) return;
-
-    try {
-      setStatus('Uploading videos...');
-      const created = await createProject({ name: `Project ${Date.now()}`, files });
-      const id = created.project.id;
-      setProjectId(id);
-
-      setStatus('Processing auto pre-edit...');
-      await processProjectSync(id);
-
-      setStatus('Fetching timeline...');
-      const timeline = await getTimeline(id);
-      const gaps = timeline.pipeline.gap_ranges?.length || 0;
-      const insertions = timeline.pipeline.insertion_suggestions?.length || 0;
-      setSummary(`Tracks: ${timeline.tracks.length}, Gaps: ${gaps}, Insertions: ${insertions}`);
-      setStatus('Completed');
-    } catch (err: any) {
-      Alert.alert('Pipeline failed', err?.message || 'Unknown error');
-      setStatus('Error');
-    }
-  };
-
-  const saveFinalVideo = async () => {
-    if (!projectId) return;
-
-    try {
-      setStatus('Downloading final video...');
-      const outputUrl = downloadOutput(projectId);
-      const localUri = `${FileSystem.documentDirectory}final-${projectId}.mp4`;
-      const out = await FileSystem.downloadAsync(outputUrl, localUri);
-      setStatus('Saved locally');
-
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(out.uri);
-      }
-    } catch (err: any) {
-      Alert.alert('Download failed', err?.message || 'Unknown error');
-      setStatus('Error');
-    }
-  };
-
-  useEffect(() => {
-    let alive = true;
-    const subscription = AppState.addEventListener('change', (nextState) => {
-      if (!alive) return;
-      if (nextState === 'active') {
-        setStatus((prev) => (prev === 'Idle' ? 'Ready' : prev));
-      }
-    });
-    return () => {
-      alive = false;
-      subscription.remove();
-    };
-  }, []);
 
   if (!authBootstrapDone) {
     return (
@@ -317,25 +218,20 @@ export default function App() {
           onboardingDone ? (
             <RootStack.Navigator screenOptions={{ headerShown: false }}>
               <RootStack.Screen name="Main">
-                {(props) => (
+                {(props: any) => (
                   <MainTabs
                     {...props}
                     session={session}
                     onLogout={onLogout}
                     onOpenPricing={() => props.navigation.navigate('Pricing')}
-                    files={files}
-                    canRun={canRun}
-                    status={status}
-                    summary={summary}
-                    projectId={projectId}
-                    onPickVideos={pickVideos}
-                    onRunPipeline={runPipeline}
-                    onSaveFinalVideo={saveFinalVideo}
+                    activeJobId={activeJobId}
+                    onJobStarted={setActiveJobId}
+                    onClearJob={() => setActiveJobId(null)}
                   />
                 )}
               </RootStack.Screen>
               <RootStack.Screen name="Pricing">
-                {(props) => <PricingScreen {...props} token={session.access_token} />}
+                {(props: any) => <PricingScreen {...props} token={session.access_token} onRequireAccount={onLogout} />}
               </RootStack.Screen>
             </RootStack.Navigator>
           ) : (
