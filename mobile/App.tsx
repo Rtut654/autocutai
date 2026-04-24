@@ -13,7 +13,6 @@ import OnboardingScreen from './src/screens/OnboardingScreen';
 import PricingScreen from './src/screens/PricingScreen';
 import ProjectsScreen from './src/screens/ProjectsScreen';
 import UploadScreen from './src/screens/UploadScreen';
-import ProcessingScreen from './src/screens/ProcessingScreen';
 import HistoryScreen from './src/screens/HistoryScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
 
@@ -25,16 +24,14 @@ function MainTabs({
   session,
   onLogout,
   onOpenPricing,
-  activeJobId,
-  onJobStarted,
-  onClearJob,
+  activeProjectId,
+  onProjectReady,
 }: {
   session: AuthSession;
   onLogout: () => Promise<void>;
   onOpenPricing: () => void;
-  activeJobId: string | null;
-  onJobStarted: (jobId: string) => void;
-  onClearJob: () => void;
+  activeProjectId: string | null;
+  onProjectReady: (projectId: string) => void;
 }) {
   const insets = useSafeAreaInsets();
   const tabIcon = (name: React.ComponentProps<typeof MaterialCommunityIcons>['name'], focused: boolean, color: string) => (
@@ -66,13 +63,7 @@ function MainTabs({
         name="Upload"
         options={{ tabBarIcon: ({ focused, color }) => tabIcon('movie-open-plus-outline', focused, color) }}
       >
-        {() =>
-          activeJobId ? (
-            <ProcessingScreen jobId={activeJobId} onBack={onClearJob} />
-          ) : (
-            <UploadScreen onJobStarted={onJobStarted} />
-          )
-        }
+        {() => <UploadScreen onProjectReady={onProjectReady} />}
       </Tab.Screen>
       <Tab.Screen
         name="Projects"
@@ -81,8 +72,8 @@ function MainTabs({
         {(props: any) => (
           <ProjectsScreen
             {...props}
-            projectId={activeJobId}
-            status={activeJobId ? 'Processing' : 'Idle'}
+            projectId={activeProjectId}
+            status={activeProjectId ? 'Hybrid analysis ready' : 'Idle'}
             onGoCreate={() => props.navigation.navigate('Upload')}
           />
         )}
@@ -114,7 +105,7 @@ export default function App() {
   const [preloginOnboardingDone, setPreloginOnboardingDone] = useState(false);
   const [authBootstrapDone, setAuthBootstrapDone] = useState(false);
 
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -175,7 +166,7 @@ export default function App() {
   const onLogout = async () => {
     setSession(null);
     setOnboardingDone(false);
-    setActiveJobId(null);
+    setActiveProjectId(null);
     await AsyncStorage.removeItem('session');
   };
 
@@ -224,9 +215,8 @@ export default function App() {
                     session={session}
                     onLogout={onLogout}
                     onOpenPricing={() => props.navigation.navigate('Pricing')}
-                    activeJobId={activeJobId}
-                    onJobStarted={setActiveJobId}
-                    onClearJob={() => setActiveJobId(null)}
+                    activeProjectId={activeProjectId}
+                    onProjectReady={setActiveProjectId}
                   />
                 )}
               </RootStack.Screen>

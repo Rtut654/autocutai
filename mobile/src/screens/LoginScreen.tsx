@@ -10,8 +10,9 @@ import { api, AuthSession } from '../api/client';
 
 WebBrowser.maybeCompleteAuthSession();
 
+const DEFAULT_IOS_GOOGLE_CLIENT_ID = '643423102814-odqhn4m5k5jq7uuoitvbpolcvmhpfe94.apps.googleusercontent.com';
 const normalizeClientId = (value?: string) => String(value || '').trim().replace(/^['"]|['"]$/g, '');
-const IOS_GOOGLE_CLIENT_ID = normalizeClientId(process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID);
+const IOS_GOOGLE_CLIENT_ID = normalizeClientId(process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID) || DEFAULT_IOS_GOOGLE_CLIENT_ID;
 const ANDROID_GOOGLE_CLIENT_ID = normalizeClientId(process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID);
 const WEB_GOOGLE_CLIENT_ID = normalizeClientId(process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID);
 const IOS_GOOGLE_CLIENT_MATCH = IOS_GOOGLE_CLIENT_ID.match(/^(.+)\.apps\.googleusercontent\.com$/);

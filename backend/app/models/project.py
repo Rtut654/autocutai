@@ -52,6 +52,7 @@ class VideoTrack(BaseModel):
     local_gap_ranges: List["GapRange"] = Field(
         default_factory=list, description="Track-local pause ranges to remove"
     )
+    excluded: bool = Field(default=False, description="Soft-deleted from project (file kept on disk)")
 
 
 class ProjectSettings(BaseModel):
@@ -141,6 +142,45 @@ class ProjectCreateRequest(BaseModel):
         default=None, description="Per-track metadata from client"
     )
     settings: ProjectSettings = Field(default_factory=ProjectSettings, description="Project settings")
+
+
+class HybridTrackInput(BaseModel):
+    """Client-prepared analysis input for hybrid mobile/cloud workflow."""
+
+    filename: str = Field(..., description="Original local filename")
+    duration: Optional[float] = Field(default=None, description="Clip duration in seconds if known on-device")
+    recorded_at: Optional[datetime] = Field(default=None, description="Client capture timestamp")
+    source_reference: Optional[str] = Field(
+        default=None,
+        description="Opaque client-side reference to the original source media for local render",
+    )
+    proxy_reference: Optional[str] = Field(
+        default=None,
+        description="Optional client-side reference to low-res proxy media",
+    )
+    thumbnail_reference: Optional[str] = Field(
+        default=None,
+        description="Optional client-side reference to a thumbnail image",
+    )
+    shot_boundaries: List[float] = Field(default_factory=list, description="Client-detected shot boundary timestamps")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional client metadata")
+    transcription: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Client-generated transcript payload with words/segments/text",
+    )
+
+
+class HybridProjectAnalyzeRequest(BaseModel):
+    """Request for hybrid analysis where raw source video stays on the device."""
+
+    name: str = Field(..., description="Project name")
+    description: Optional[str] = Field(None, description="Project description")
+    tracks: List[HybridTrackInput] = Field(..., description="Per-track client analysis payload")
+    settings: ProjectSettings = Field(default_factory=ProjectSettings, description="Project settings")
+    render_strategy: Literal["on_device", "selected_ranges_upload"] = Field(
+        default="on_device",
+        description="How final export is expected to happen after backend analysis",
+    )
 
 
 class ProjectUpdateRequest(BaseModel):

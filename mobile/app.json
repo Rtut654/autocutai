@@ -15,7 +15,16 @@
     ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.bestshotai.app"
+      "bundleIdentifier": "com.bestshotai.app",
+      "infoPlist": {
+        "CFBundleURLTypes": [
+          {
+            "CFBundleURLSchemes": [
+              "com.googleusercontent.apps.643423102814-odqhn4m5k5jq7uuoitvbpolcvmhpfe94"
+            ]
+          }
+        ]
+      }
     },
     "android": {
       "package": "com.bestshotai.app",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import uuid
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from ..models.auth import AuthUser, LoginRequest, OnboardingData, SignupRequest
 
@@ -14,8 +14,20 @@ class AuthService:
     def __init__(self) -> None:
         self.users_by_email: Dict[str, AuthUser] = {}
         self.tokens_to_user_id: Dict[str, str] = {}
+        self.refresh_tokens_to_user_id: Dict[str, str] = {}
         self.users_by_id: Dict[str, AuthUser] = {}
         self.users_by_provider_identity: Dict[str, str] = {}
+
+    def configure(self, _db_path=None) -> None:
+        """Compatibility no-op for older tests and startup paths."""
+        return None
+
+    def reset_for_tests(self) -> None:
+        self.users_by_email.clear()
+        self.tokens_to_user_id.clear()
+        self.refresh_tokens_to_user_id.clear()
+        self.users_by_id.clear()
+        self.users_by_provider_identity.clear()
 
     @staticmethod
     def _hash_password(password: str) -> str:
@@ -30,6 +42,11 @@ class AuthService:
     def _issue_token(self, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
         self.tokens_to_user_id[token] = user_id
+        return token
+
+    def _issue_refresh_token(self, user_id: str) -> str:
+        token = secrets.token_urlsafe(32)
+        self.refresh_tokens_to_user_id[token] = user_id
         return token
 
     def signup(self, request: SignupRequest) -> AuthUser:
@@ -63,6 +80,7 @@ class AuthService:
         provider: str,
         email: Optional[str] = None,
         full_name: Optional[str] = None,
+        picture: Optional[str] = None,
         provider_user_id: Optional[str] = None,
     ) -> str:
         normalized_email = email.lower().strip() if email else ""
@@ -83,6 +101,7 @@ class AuthService:
                 email=fallback_email,
                 password_hash="",
                 full_name=full_name,
+                picture=picture,
                 provider=provider,  # type: ignore[arg-type]
                 provider_user_id=provider_user_id,
             )
@@ -91,6 +110,8 @@ class AuthService:
         else:
             if full_name and not user.full_name:
                 user.full_name = full_name
+            if picture:
+                user.picture = picture
             if normalized_email and user.email != normalized_email and user.email.endswith("@local.bestshotai"):
                 self.users_by_email.pop(user.email, None)
                 user.email = normalized_email
@@ -103,11 +124,29 @@ class AuthService:
             self.users_by_provider_identity[provider_key] = user.id
         return self._issue_token(user.id)
 
-    def get_user_by_token(self, token: str) -> Optional[AuthUser]:
-        user_id = self.tokens_to_user_id.get(token)
+    def get_user_by_token(self, token: str, token_type: Optional[str] = None) -> Optional[AuthUser]:
+        token_map = self.refresh_tokens_to_user_id if token_type == "refresh" else self.tokens_to_user_id
+        user_id = token_map.get(token)
         if not user_id:
             return None
         return self.users_by_id.get(user_id)
+
+    def create_session(self, user_id: str) -> Tuple[str, str]:
+        return self._issue_token(user_id), self._issue_refresh_token(user_id)
+
+    def refresh_session(self, refresh_token: str) -> Tuple[str, str, AuthUser]:
+        user = self.get_user_by_token(refresh_token, token_type="refresh")
+        if not user:
+            raise ValueError("Invalid refresh token")
+        self.refresh_tokens_to_user_id.pop(refresh_token, None)
+        access_token, new_refresh_token = self.create_session(user.id)
+        return access_token, new_refresh_token, user
+
+    def logout(self, access_token: Optional[str] = None, refresh_token: Optional[str] = None) -> None:
+        if access_token:
+            self.tokens_to_user_id.pop(access_token, None)
+        if refresh_token:
+            self.refresh_tokens_to_user_id.pop(refresh_token, None)
 
     def update_onboarding(self, user_id: str, data: OnboardingData) -> AuthUser:
         user = self.users_by_id[user_id]
@@ -137,6 +176,11 @@ class AuthService:
         self.tokens_to_user_id = {
             token: existing_user_id
             for token, existing_user_id in self.tokens_to_user_id.items()
+            if existing_user_id != user_id
+        }
+        self.refresh_tokens_to_user_id = {
+            token: existing_user_id
+            for token, existing_user_id in self.refresh_tokens_to_user_id.items()
             if existing_user_id != user_id
         }
         return True

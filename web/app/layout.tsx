@@ -6,12 +6,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
-        <header className="siteHeader">
-          <div className="headerInner">
-            <Nav />
-          </div>
-        </header>
-        <main className="main">{children}</main>
+        <div className="siteShell">
+          <header className="siteHeader">
+            <div className="headerInner">
+              <Nav />
+            </div>
+          </header>
+          <main className="main">{children}</main>
+        </div>
         <Footer />
       </body>
     </html>

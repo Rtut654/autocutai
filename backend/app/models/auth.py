@@ -45,6 +45,7 @@ class AuthUser(BaseModel):
     email: str
     password_hash: str
     full_name: Optional[str] = None
+    picture: Optional[str] = None
     provider: Literal["email", "google", "apple"] = "email"
     provider_user_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -63,6 +64,7 @@ class MeResponse(BaseModel):
     id: str
     email: str
     full_name: Optional[str] = None
+    picture: Optional[str] = None
     onboarding_completed: bool
     subscription_plan: str
     provider: str = "email"

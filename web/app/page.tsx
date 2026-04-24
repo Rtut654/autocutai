@@ -1,131 +1,64 @@
-const features = [
-  {
-    title: 'Silence Cleanup',
-    description: 'Detect and remove pauses over 1 second while preserving natural speech flow.',
-  },
-  {
-    title: 'Subtitles + Location',
-    description: 'Generate subtitle overlays from word-level timestamps with optional location context.',
-  },
-  {
-    title: 'Smart Insertions',
-    description: 'Suggest supporting images, memes, or b-roll moments based on narration context.',
-  },
-];
-
-const reviews = [
-  {
-    name: 'Maya R.',
-    role: 'Travel Creator',
-    text: 'My first cut went from 2 hours to 35 minutes. Subtitle timing is precise.',
-  },
-  {
-    name: 'Oleg D.',
-    role: 'YouTube Host',
-    text: 'Gap detection cleans my talking-head videos with almost no manual edits.',
-  },
-  {
-    name: 'Nina K.',
-    role: 'Reels Editor',
-    text: 'Insertion suggestions are surprisingly useful for engagement spikes.',
-  },
-];
-
-const faqs = [
-  {
-    q: 'Does BestShotAI keep word-level timestamps for all clips?',
-    a: 'Yes. We store a full word timeline and can export a word-level SRT file.',
-  },
-  {
-    q: 'Can I review cuts before final export?',
-    a: 'Yes. Auto pre-edit is applied first, then you confirm in timeline view before exporting.',
-  },
-  {
-    q: 'Can I upload multiple videos at once from iPhone?',
-    a: 'Yes. The iOS flow supports multi-select upload and chronological ordering.',
-  },
-];
-
 export default function Home() {
   return (
     <>
-      <section className="hero">
+      <section className="pageHero">
         <div className="card stack">
           <span className="badge">BestShotAI Studio</span>
-          <h1>Cut dead air. Keep the story.</h1>
+          <h1>Edit flow that matches the mobile app.</h1>
           <p className="muted">
-            ShapeMiles-like structure, adapted for video editing: clear workflow, clean sections, fast path to export.
+            The web flow now follows the ShapeMiles structure: login, onboarding, pricing, project list, new project, and timeline review.
           </p>
           <div className="row">
-            <a href="/projects/new" className="btn">Create Project</a>
-            <a href="/projects/demo" className="btn secondary">Open Timeline</a>
+            <a href="/login" className="btn">Open Login</a>
+            <a href="/onboarding" className="btn secondary">Open Onboarding</a>
           </div>
         </div>
 
         <div className="card stack">
-          <h2>Pre-edit pipeline</h2>
-          <span>1. Multi-video ingest + chronological ordering</span>
-          <span>2. Whisper transcription with word timestamps</span>
-          <span>3. Gap detection ({'>'}1 sec), subtitles, insertion cues</span>
-          <span>4. Export final cut + word-level SRT</span>
-          <div className="stack" style={{ marginTop: 6 }}>
-            <div className="listItem"><span>VO waveform cleanup</span><b>92%</b></div>
-            <div className="listItem"><span>Subtitle timing confidence</span><b>97%</b></div>
-            <div className="listItem"><span>Insertion opportunities</span><b>14 cues</b></div>
+          <h2>Current Product Path</h2>
+          <div className="list">
+            <div className="listItem"><span>1. Log in with email or Google</span><b>/login</b></div>
+            <div className="listItem"><span>2. Complete onboarding</span><b>/onboarding</b></div>
+            <div className="listItem"><span>3. Activate pricing</span><b>/pricing</b></div>
+            <div className="listItem"><span>4. Create or review projects</span><b>/projects</b></div>
           </div>
         </div>
       </section>
 
+      <section className="flowGrid">
+        <article className="flowCard">
+          <strong>Login</strong>
+          <p>Google button stays visible, email auth stays available, and the page redirects back into the chosen flow.</p>
+        </article>
+        <article className="flowCard">
+          <strong>Onboarding</strong>
+          <p>Profile setup lands before pricing, matching the same step order as the mobile app.</p>
+        </article>
+        <article className="flowCard">
+          <strong>Pricing</strong>
+          <p>The pricing page uses the same card structure and activation path as the ShapeMiles boilerplate.</p>
+        </article>
+        <article className="flowCard">
+          <strong>Projects</strong>
+          <p>Projects, new project, and timeline review now sit behind the same shell instead of a broken dashboard mock.</p>
+        </article>
+      </section>
+
       <section className="card stack">
-        <h2>Live metrics</h2>
+        <h2>What The Web App Does</h2>
         <div className="kpiGrid">
-          <div className="kpi"><b>3.4x</b><span className="muted">faster first cut</span></div>
-          <div className="kpi"><b>Word-level</b><span className="muted">timestamp sync</span></div>
-          <div className="kpi"><b>Auto</b><span className="muted">subtitles + insertions</span></div>
+          <div className="kpi"><b>Auth</b><span className="muted">email + Google entry point</span></div>
+          <div className="kpi"><b>Hybrid</b><span className="muted">review timelines and render manifests</span></div>
+          <div className="kpi"><b>Export</b><span className="muted">download final video and word SRT</span></div>
         </div>
       </section>
 
       <section className="card stack">
-        <div className="sectionHead">
-          <h2>Features</h2>
-          <p className="muted">Built for fast voice-driven video editing.</p>
-        </div>
-        <div className="featureGrid">
-          {features.map((item) => (
-            <article key={item.title} className="featureCard">
-              <h3>{item.title}</h3>
-              <p>{item.description}</p>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="card stack">
-        <div className="sectionHead">
-          <h2>Reviews</h2>
-        </div>
-        <div className="reviewGrid">
-          {reviews.map((item) => (
-            <article key={item.name} className="reviewCard">
-              <p>“{item.text}”</p>
-              <strong>{item.name}</strong>
-              <span className="muted">{item.role}</span>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="card stack">
-        <div className="sectionHead">
-          <h2>FAQ</h2>
-        </div>
-        <div className="faqList">
-          {faqs.map((item) => (
-            <article key={item.q} className="faqItem">
-              <h3>{item.q}</h3>
-              <p>{item.a}</p>
-            </article>
-          ))}
+        <h2>Open Key Pages</h2>
+        <div className="row">
+          <a href="/pricing" className="btn secondary">Pricing</a>
+          <a href="/projects" className="btn secondary">Projects</a>
+          <a href="/projects/new" className="btn secondary">New Project</a>
         </div>
       </section>
     </>

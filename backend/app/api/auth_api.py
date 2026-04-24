@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Cookie, Header, HTTPException, Response
 
 from ..models.auth import (
     AuthResponse,
@@ -25,67 +27,120 @@ def _me_response(user) -> MeResponse:
         id=user.id,
         email=user.email,
         full_name=user.full_name,
+        picture=user.picture,
         onboarding_completed=user.onboarding_completed,
         subscription_plan=user.subscription_plan,
         provider=user.provider,
     )
 
 
+def _set_session_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    response.set_cookie("access_token", access_token, httponly=True, samesite="lax", path="/")
+    response.set_cookie("refresh_token", refresh_token, httponly=True, samesite="lax", path="/")
+
+
+def _clear_session_cookies(response: Response) -> None:
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+
+
 @router.post("/signup", response_model=AuthResponse)
-async def signup(request: SignupRequest) -> AuthResponse:
+async def signup(request: SignupRequest, response: Response) -> AuthResponse:
     try:
         auth_service.signup(request)
         token = auth_service.login(LoginRequest(email=request.email, password=request.password))
         user = auth_service.get_user_by_token(token)
         if not user:
             raise ValueError("Failed to create token")
-        return AuthResponse(access_token=token, user_id=user.id)
+        access_token, refresh_token = auth_service.create_session(user.id)
+        auth_service.logout(access_token=token)
+        _set_session_cookies(response, access_token, refresh_token)
+        return AuthResponse(access_token=access_token, user_id=user.id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/google_login", response_model=AuthResponse)
-async def google_login(request: OAuthLoginRequest) -> AuthResponse:
+async def google_login(request: OAuthLoginRequest, response: Response) -> AuthResponse:
     if not (request.email or request.provider_user_id or request.id_token):
         raise HTTPException(status_code=400, detail="Missing Google identity payload")
     token = auth_service.social_login(
         "google",
         email=request.email,
         full_name=request.name,
+        picture=request.picture,
         provider_user_id=request.provider_user_id,
     )
     user = auth_service.get_user_by_token(token)
     if not user:
         raise HTTPException(status_code=400, detail="Failed to create token")
-    return AuthResponse(access_token=token, user_id=user.id)
+    access_token, refresh_token = auth_service.create_session(user.id)
+    auth_service.logout(access_token=token)
+    _set_session_cookies(response, access_token, refresh_token)
+    return AuthResponse(access_token=access_token, user_id=user.id)
 
 
 @router.post("/apple_login", response_model=AuthResponse)
-async def apple_login(request: OAuthLoginRequest) -> AuthResponse:
+async def apple_login(request: OAuthLoginRequest, response: Response) -> AuthResponse:
     if not (request.email or request.provider_user_id or request.id_token or request.code):
         raise HTTPException(status_code=400, detail="Missing Apple identity payload")
     token = auth_service.social_login(
         "apple",
         email=request.email,
         full_name=request.name,
+        picture=request.picture,
         provider_user_id=request.provider_user_id,
     )
     user = auth_service.get_user_by_token(token)
     if not user:
         raise HTTPException(status_code=400, detail="Failed to create token")
-    return AuthResponse(access_token=token, user_id=user.id)
+    access_token, refresh_token = auth_service.create_session(user.id)
+    auth_service.logout(access_token=token)
+    _set_session_cookies(response, access_token, refresh_token)
+    return AuthResponse(access_token=access_token, user_id=user.id)
 
 
 @router.post("/login", response_model=AuthResponse)
-async def login(request: LoginRequest) -> AuthResponse:
+async def login(request: LoginRequest, response: Response) -> AuthResponse:
     try:
         token = auth_service.login(request)
         user = auth_service.get_user_by_token(token)
         if not user:
             raise ValueError("Invalid credentials")
-        return AuthResponse(access_token=token, user_id=user.id)
+        access_token, refresh_token = auth_service.create_session(user.id)
+        auth_service.logout(access_token=token)
+        _set_session_cookies(response, access_token, refresh_token)
+        return AuthResponse(access_token=access_token, user_id=user.id)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@router.post("/refresh", response_model=AuthResponse)
+async def refresh_session(
+    response: Response,
+    refresh_token: Optional[str] = Cookie(default=None),
+) -> AuthResponse:
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        access_token, new_refresh_token, user = auth_service.refresh_session(refresh_token)
+    except ValueError as exc:
+        _clear_session_cookies(response)
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    _set_session_cookies(response, access_token, new_refresh_token)
+    return AuthResponse(access_token=access_token, user_id=user.id)
+
+
+@router.post("/logout")
+async def logout(
+    response: Response,
+    authorization: str = Header(default=""),
+    refresh_token: Optional[str] = Cookie(default=None),
+):
+    access_token = authorization.replace("Bearer", "").strip() or None
+    auth_service.logout(access_token=access_token, refresh_token=refresh_token)
+    _clear_session_cookies(response)
+    return {"message": "Logged out"}
 
 
 @router.get("/me", response_model=MeResponse)

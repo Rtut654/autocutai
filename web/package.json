@@ -3,6 +3,10 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "clean:dev": "node -e \"require('fs').rmSync('.next-dev',{ recursive: true, force: true })\"",
+    "clean:build": "node -e \"require('fs').rmSync('.next',{ recursive: true, force: true })\"",
+    "predev": "npm run clean:dev",
+    "prebuild": "npm run clean:build",
     "dev": "next dev",
     "build": "next build",
     "start": "next start"

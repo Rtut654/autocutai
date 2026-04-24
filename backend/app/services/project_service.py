@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..models.project import (
+    HybridProjectAnalyzeRequest,
+    HybridTrackInput,
     Project,
     ProjectCreateRequest,
     ProjectUpdateRequest,
@@ -33,16 +36,26 @@ logger = logging.getLogger(__name__)
 class ProjectService:
     """Service for managing video editing projects."""
 
-    def __init__(self, projects_dir: str = "projects", temp_dir: str = "temp"):
+    def __init__(self, projects_dir: str = "backend/projects", temp_dir: str = "temp"):
         self.projects_dir = Path(projects_dir)
         self.temp_dir = Path(temp_dir)
-        self.projects_dir.mkdir(exist_ok=True)
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
         self.projects: Dict[str, Project] = {}
         logger.info("ProjectService initialized")
 
     async def create_project(self, request: ProjectCreateRequest, user_id: Optional[str] = None) -> Project:
         project_id = str(uuid.uuid4())
+        return await self.create_project_with_id(project_id, request, user_id=user_id)
+
+    async def create_project_with_id(
+        self,
+        project_id: str,
+        request: ProjectCreateRequest,
+        user_id: Optional[str] = None,
+    ) -> Project:
+        if not user_id:
+            raise ValueError("Authenticated user is required")
         tracks: List[VideoTrack] = []
         for i, file_path in enumerate(request.track_files):
             captured = None
@@ -70,19 +83,91 @@ class ProjectService:
         self.projects[project_id] = project
         return project
 
-    async def get_project(self, project_id: str) -> Optional[Project]:
-        if project_id in self.projects:
-            return self.projects[project_id]
+    async def analyze_hybrid_project(
+        self,
+        request: HybridProjectAnalyzeRequest,
+        user_id: Optional[str] = None,
+    ) -> Project:
+        if not user_id:
+            raise ValueError("Authenticated user is required")
+        project_id = str(uuid.uuid4())
+        tracks = [self._create_track_from_hybrid_input(track, idx) for idx, track in enumerate(request.tracks)]
 
-        project_file = self.projects_dir / f"{project_id}.json"
-        if project_file.exists():
-            project = await self._load_project(project_file)
-            self.projects[project_id] = project
-            return project
+        project = Project(
+            id=project_id,
+            name=request.name,
+            description=request.description,
+            tracks=self._sorted_tracks(tracks),
+            settings=request.settings,
+            user_id=user_id,
+            status="processing",
+        )
+
+        await self._build_pipeline(project, render_strategy=request.render_strategy)
+        project.status = "completed"
+        project.output_path = None
+        project.updated_at = datetime.utcnow()
+
+        await self._save_project(project)
+        self.projects[project_id] = project
+        return project
+
+    def get_user_projects_dir(self, user_id: str, *, create: bool = True) -> Path:
+        root = self.projects_dir / user_id
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def get_project_dir(self, user_id: str, project_id: str, *, create: bool = True) -> Path:
+        directory = self.get_user_projects_dir(user_id, create=create) / project_id
+        if create:
+            directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def get_project_file(self, user_id: str, project_id: str, *, create: bool = False) -> Path:
+        return self.get_project_dir(user_id, project_id, create=create) / "project.json"
+
+    def get_project_video_dir(self, user_id: str, project_id: str) -> Path:
+        directory = self.get_project_dir(user_id, project_id, create=True) / "video"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def get_project_audio_dir(self, user_id: str, project_id: str) -> Path:
+        directory = self.get_project_dir(user_id, project_id, create=True) / "audio"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def get_project_transcript_dir(self, user_id: str, project_id: str) -> Path:
+        directory = self.get_project_dir(user_id, project_id, create=True) / "transcript"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    async def get_project(self, project_id: str, user_id: Optional[str] = None) -> Optional[Project]:
+        cached = self.projects.get(project_id)
+        if cached and (not user_id or cached.user_id == user_id):
+            return cached
+
+        candidate_files: List[Path] = []
+        if user_id:
+            candidate_files.append(self.get_project_file(user_id, project_id, create=False))
+        else:
+            candidate_files.extend(self.projects_dir.glob(f"*/{project_id}/project.json"))
+
+        for project_file in candidate_files:
+            if project_file.exists():
+                project = await self._load_project(project_file)
+                self.projects[project_id] = project
+                if not user_id or project.user_id == user_id:
+                    return project
         return None
 
-    async def update_project(self, project_id: str, request: ProjectUpdateRequest) -> Optional[Project]:
-        project = await self.get_project(project_id)
+    async def update_project(
+        self,
+        project_id: str,
+        request: ProjectUpdateRequest,
+        user_id: Optional[str] = None,
+    ) -> Optional[Project]:
+        project = await self.get_project(project_id, user_id=user_id)
         if not project:
             return None
 
@@ -100,25 +185,51 @@ class ProjectService:
         self.projects[project_id] = project
         return project
 
-    async def delete_project(self, project_id: str) -> bool:
-        project = await self.get_project(project_id)
+    async def delete_project(self, project_id: str, user_id: Optional[str] = None) -> bool:
+        project = await self.get_project(project_id, user_id=user_id)
         if not project:
             return False
 
         self.projects.pop(project_id, None)
-        project_file = self.projects_dir / f"{project_id}.json"
-        if project_file.exists():
-            project_file.unlink()
+        if not project.user_id:
+            return False
+        project_dir = self.get_project_dir(project.user_id, project.id, create=False)
+        if project_dir.exists():
+            shutil.rmtree(project_dir)
         return True
 
+    def reserve_project_video_path(self, user_id: str, project_id: str, filename: str) -> Path:
+        base_name = Path(filename).name
+        media_dir = self.get_project_video_dir(user_id, project_id)
+        candidate = media_dir / base_name
+        if not candidate.exists():
+            return candidate
+
+        stem = candidate.stem
+        suffix = candidate.suffix
+        counter = 2
+        while True:
+            next_candidate = media_dir / f"{stem}-{counter}{suffix}"
+            if not next_candidate.exists():
+                return next_candidate
+            counter += 1
+
     async def list_projects(self, user_id: Optional[str] = None) -> List[Project]:
-        projects = list(self.projects.values())
+        projects: List[Project] = []
         if user_id:
-            projects = [p for p in projects if p.user_id == user_id]
+            root = self.get_user_projects_dir(user_id, create=False)
+            candidate_files = sorted(root.glob("*/project.json"))
+        else:
+            candidate_files = sorted(self.projects_dir.glob("*/*/project.json"))
+
+        for project_file in candidate_files:
+            project = await self._load_project(project_file)
+            self.projects[project.id] = project
+            projects.append(project)
         return sorted(projects, key=lambda p: p.updated_at, reverse=True)
 
-    async def process_project(self, project_id: str) -> Project:
-        project = await self.get_project(project_id)
+    async def process_project(self, project_id: str, user_id: Optional[str] = None) -> Project:
+        project = await self.get_project(project_id, user_id=user_id)
         if not project:
             raise ValueError(f"Project {project_id} not found")
 
@@ -213,13 +324,26 @@ class ProjectService:
         return ordered
 
     async def _transcribe_tracks(self, project: Project) -> None:
+        processor = VideoProcessor()
+        if not project.user_id:
+            raise ValueError("Project owner missing")
+        audio_dir = self.get_project_audio_dir(project.user_id, project.id)
+        transcript_dir = self.get_project_transcript_dir(project.user_id, project.id)
         for track in project.tracks:
             if track.type not in {TrackType.VIDEO, TrackType.AUDIO}:
                 continue
-            with open(track.file_path, "rb") as handle:
-                audio_data = handle.read()
+            audio_path = track.file_path
+            if track.type == TrackType.VIDEO:
+                audio_output_path = self._reserve_named_output(audio_dir, Path(track.filename).stem, ".wav")
+                extracted_audio_path = await processor.extract_audio_for_transcription(track.file_path, str(audio_output_path))
+                audio_path = extracted_audio_path
+                track.metadata["audio_path"] = extracted_audio_path
 
-            raw_transcription = await transcribe_audio(audio_data, track.filename, "en")
+            with open(audio_path, "rb") as handle:
+                audio_data = handle.read()
+            transcription_filename = Path(audio_path).name
+            raw_transcription = await transcribe_audio(audio_data, transcription_filename, "en")
+
             words = normalize_words(
                 raw_transcription.get("words")
                 or [
@@ -237,8 +361,56 @@ class ProjectService:
                 "segments": raw_transcription.get("segments", []),
             }
             track.local_gap_ranges = find_gaps(words, project.settings.min_gap_seconds)
+            transcript_text_path = self._reserve_named_output(transcript_dir, Path(track.filename).stem, ".txt")
+            transcript_text_path.write_text(track.transcription["text"], encoding="utf-8")
+            track.metadata["transcript_path"] = str(transcript_text_path)
 
-    async def _build_pipeline(self, project: Project) -> None:
+    def _create_track_from_hybrid_input(self, track: HybridTrackInput, position: int) -> VideoTrack:
+        transcription = track.transcription or {}
+        words = normalize_words(
+            transcription.get("words")
+            or [
+                word
+                for segment in transcription.get("segments", [])
+                for word in segment.get("words", [])
+            ]
+        )
+
+        duration = float(track.duration or 0.0)
+        if duration <= 0 and words:
+            duration = float(max(word.end for word in words))
+
+        metadata: Dict[str, Any] = {
+            "analysis_origin": "hybrid_client",
+            "thumbnail_reference": track.thumbnail_reference,
+            "proxy_reference": track.proxy_reference,
+            "source_reference": track.source_reference,
+            "shot_boundaries": track.shot_boundaries,
+        }
+        metadata.update(track.metadata)
+
+        return VideoTrack(
+            id=str(uuid.uuid4()),
+            type=TrackType.VIDEO,
+            filename=track.filename,
+            file_path=track.source_reference or f"client://{track.filename}",
+            duration=duration,
+            position=position,
+            metadata=metadata,
+            transcription={
+                "text": transcription.get("text") or transcription.get("transcript") or "",
+                "words": [word.model_dump() for word in words],
+                "language": transcription.get("language", "en"),
+                "segments": transcription.get("segments", []),
+            }
+            if transcription
+            else None,
+            has_voice=bool(words),
+            recorded_at=track.recorded_at or datetime.utcnow(),
+            local_gap_ranges=[],
+        )
+
+    async def _build_pipeline(self, project: Project, render_strategy: str = "server_render") -> None:
         combined_words = []
         timeline_offset = 0.0
         locations: List[str] = []
@@ -252,16 +424,22 @@ class ProjectService:
                 combined_words.append(
                     word.model_copy(update={"start": word.start + timeline_offset, "end": word.end + timeline_offset})
                 )
+            track.local_gap_ranges = find_gaps(track_words, project.settings.min_gap_seconds)
             timeline_offset += track.duration
 
         combined_words = sorted(combined_words, key=lambda w: w.start)
         transcript = " ".join(word.word for word in combined_words).strip()
         gap_ranges = find_gaps(combined_words, project.settings.min_gap_seconds)
 
-        word_srt_path = self.temp_dir / f"{project.id}_word_level.srt"
-        subtitle_srt_path = self.temp_dir / f"{project.id}_subtitles.srt"
+        if not project.user_id:
+            raise ValueError("Project owner missing")
+        transcript_dir = self.get_project_transcript_dir(project.user_id, project.id)
+        word_srt_path = transcript_dir / f"{project.id}_word_level.srt"
+        subtitle_srt_path = transcript_dir / f"{project.id}_subtitles.srt"
+        combined_transcript_path = transcript_dir / f"{project.id}_combined.txt"
 
         write_word_level_srt(combined_words, word_srt_path)
+        combined_transcript_path.write_text(transcript, encoding="utf-8")
 
         subtitle_cues = build_subtitle_cues(combined_words)
         if locations:
@@ -274,6 +452,27 @@ class ProjectService:
         if project.settings.insert_suggestions:
             insertions = await ai_service.suggest_insertions(combined_words)
 
+        track_decisions = []
+        for track in project.tracks:
+            track_decisions.append(
+                {
+                    "track_id": track.id,
+                    "filename": track.filename,
+                    "duration": track.duration,
+                    "recorded_at": track.recorded_at.isoformat() if track.recorded_at else None,
+                    "source_reference": track.metadata.get("source_reference"),
+                    "proxy_reference": track.metadata.get("proxy_reference"),
+                    "thumbnail_reference": track.metadata.get("thumbnail_reference"),
+                    "shot_boundaries": track.metadata.get("shot_boundaries", []),
+                    "keep_ranges": self._build_keep_ranges(
+                        track.duration,
+                        track.local_gap_ranges,
+                        project.settings.smart_pause_cutter,
+                    ),
+                    "remove_ranges": [gap.model_dump() for gap in track.local_gap_ranges],
+                }
+            )
+
         project.pipeline.combined_transcript = transcript
         project.pipeline.combined_words = combined_words
         project.pipeline.gap_ranges = gap_ranges
@@ -283,15 +482,36 @@ class ProjectService:
         project.pipeline.locations = sorted(set(locations))
         project.pipeline.insertion_suggestions = insertions
         project.pipeline.render_plan = {
+            "render_strategy": render_strategy,
             "ordered_track_ids": [track.id for track in project.tracks],
             "auto_cut_enabled": project.settings.smart_pause_cutter,
             "gap_ranges": [gap.model_dump() for gap in gap_ranges],
+            "track_decisions": track_decisions,
             "subtitle_path": str(subtitle_srt_path) if project.settings.generate_subtitles else None,
+            "requires_source_upload_for_server_render": render_strategy != "on_device",
         }
 
     async def _generate_final_video(self, project: Project) -> str:
         processor = VideoProcessor()
         return await processor.process_project(project)
+
+    @staticmethod
+    def _build_keep_ranges(duration: float, gaps: List[Any], auto_cut_enabled: bool) -> List[Dict[str, float]]:
+        if duration <= 0:
+            return []
+        if not auto_cut_enabled or not gaps:
+            return [{"start": 0.0, "end": round(duration, 3)}]
+
+        ranges: List[Dict[str, float]] = []
+        cursor = 0.0
+        for gap in sorted(gaps, key=lambda item: item.start):
+            if gap.start > cursor:
+                ranges.append({"start": round(cursor, 3), "end": round(gap.start, 3)})
+            cursor = max(cursor, gap.end)
+
+        if cursor < duration:
+            ranges.append({"start": round(cursor, 3), "end": round(duration, 3)})
+        return ranges
 
     @staticmethod
     def _extract_location_from_streams(streams: List[Dict[str, Any]], fmt: Dict[str, Any]) -> Optional[str]:
@@ -315,13 +535,27 @@ class ProjectService:
         return None
 
     async def _save_project(self, project: Project) -> None:
-        project_file = self.projects_dir / f"{project.id}.json"
+        if not project.user_id:
+            raise ValueError("Project owner missing")
+        project_file = self.get_project_file(project.user_id, project.id)
         payload = project.model_dump(mode="json")
         project_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     async def _load_project(self, project_file: Path) -> Project:
         payload = json.loads(project_file.read_text(encoding="utf-8"))
         return Project(**payload)
+
+    @staticmethod
+    def _reserve_named_output(directory: Path, stem: str, suffix: str) -> Path:
+        candidate = directory / f"{stem}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter = 2
+        while True:
+            next_candidate = directory / f"{stem}-{counter}{suffix}"
+            if not next_candidate.exists():
+                return next_candidate
+            counter += 1
 
 
 project_service = ProjectService()

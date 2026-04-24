@@ -30,6 +30,12 @@
           <string>com.bestshotai.app</string>
         </array>
       </dict>
+      <dict>
+        <key>CFBundleURLSchemes</key>
+        <array>
+          <string>com.googleusercontent.apps.643423102814-odqhn4m5k5jq7uuoitvbpolcvmhpfe94</string>
+        </array>
+      </dict>
     </array>
     <key>CFBundleVersion</key>
     <string>1</string>

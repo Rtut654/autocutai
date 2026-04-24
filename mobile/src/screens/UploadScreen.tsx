@@ -10,15 +10,15 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as DocumentPicker from "expo-document-picker";
-import { uploadClips } from "../api/pipeline";
+import { analyzeHybridProjectOnBackend } from "../api/hybrid";
 
 type Props = {
-  onJobStarted: (jobId: string) => void;
+  onProjectReady: (projectId: string) => void;
 };
 
-export default function UploadScreen({ onJobStarted }: Props) {
+export default function UploadScreen({ onProjectReady }: Props) {
   const [clips, setClips] = useState<
-    { uri: string; name: string; mimeType?: string }[]
+    { uri: string; name: string; mimeType?: string; lastModified?: number | null }[]
   >([]);
   const [uploading, setUploading] = useState(false);
 
@@ -35,6 +35,7 @@ export default function UploadScreen({ onJobStarted }: Props) {
             uri: a.uri,
             name: a.name,
             mimeType: a.mimeType,
+            lastModified: typeof a.lastModified === "number" ? a.lastModified : null,
           }))
         );
       }
@@ -47,10 +48,18 @@ export default function UploadScreen({ onJobStarted }: Props) {
     if (clips.length === 0) return;
     setUploading(true);
     try {
-      const jobId = await uploadClips(clips);
-      onJobStarted(jobId);
+      const result = await analyzeHybridProjectOnBackend({
+        name: `Hybrid Edit ${new Date().toLocaleDateString()}`,
+        files: clips,
+        settings: {
+          smart_pause_cutter: true,
+          generate_subtitles: true,
+          insert_suggestions: true,
+        },
+      });
+      onProjectReady(result.id);
     } catch (err: any) {
-      Alert.alert("Upload failed", err?.message || "Unknown error");
+      Alert.alert("Analysis failed", err?.message || "Unknown error");
     } finally {
       setUploading(false);
     }
@@ -60,7 +69,7 @@ export default function UploadScreen({ onJobStarted }: Props) {
     <SafeAreaView style={styles.container} edges={["top"]}>
       <Text style={styles.title}>Upload</Text>
       <Text style={styles.subtitle}>
-        Select your travel clips and let AI edit them.
+        Select clips. The app transcribes them directly from your device, then sends only analysis data to the backend.
       </Text>
 
       <View style={styles.card}>
@@ -87,7 +96,7 @@ export default function UploadScreen({ onJobStarted }: Props) {
             ) : (
               <Pressable style={styles.processButton} onPress={startProcessing}>
                 <Text style={styles.buttonText}>
-                  Process {clips.length} Clips
+                  Analyze {clips.length} Clips
                 </Text>
               </Pressable>
             )}

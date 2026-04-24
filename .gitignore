@@ -18,9 +18,16 @@ mobile/ios/build/
 mobile/android/build/
 web/node_modules/
 web/.next/
+web/.next-dev/
+web/tsconfig.tsbuildinfo
 web/out/
 web/dist/
 
 # Build artifacts
 build/
 dist/
+
+# Local project media and render artifacts
+backend/projects/
+projects/
+temp/

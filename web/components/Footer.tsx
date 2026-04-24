@@ -1,10 +1,10 @@
 import Link from 'next/link';
 
 const links = [
-  ['#', 'Privacy'],
-  ['#', 'Terms'],
-  ['#', 'Support'],
-  ['#', 'Contact'],
+  ['/privacy-policy', 'Privacy'],
+  ['/terms-of-use', 'Terms'],
+  ['/pricing', 'Pricing'],
+  ['/login', 'Login'],
 ] as const;
 
 export default function Footer() {

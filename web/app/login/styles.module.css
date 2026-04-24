@@ -1,0 +1,206 @@
+.page {
+  min-height: calc(100vh - 180px);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.card {
+  width: min(460px, 100%);
+  border: 1px solid #e6e9ec;
+  border-radius: 16px;
+  padding: 24px;
+  background: #ffffff;
+  box-shadow: 0 24px 44px rgba(16, 24, 40, 0.08);
+  display: grid;
+  gap: 12px;
+}
+
+.headRow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: start;
+}
+
+.head h1 {
+  margin: 0;
+  font-size: 34px;
+  line-height: 1.05;
+  color: #111827;
+}
+
+.head p {
+  margin: 8px 0 0;
+  color: #4b5563;
+}
+
+.closeButton {
+  border: 1px solid #c8ddd4 !important;
+  background: #f7fbf9 !important;
+  color: #2a5b4d !important;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px !important;
+  font-size: 24px;
+  line-height: 1;
+  padding: 0 !important;
+  cursor: pointer;
+}
+
+.card label {
+  display: grid;
+  gap: 6px;
+  color: #374151;
+  font-size: 14px;
+}
+
+.card input {
+  width: 100%;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 11px 12px;
+  background: #fff;
+}
+
+.card button,
+.modalCard button {
+  border: none;
+  border-radius: 10px;
+  background: #111827;
+  color: #fff;
+  padding: 12px 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.card button:disabled,
+.modalCard button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.googleButton {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  overflow: visible;
+  width: 100%;
+  display: block;
+  min-height: 42px;
+}
+
+.googleButton > div {
+  width: 100%;
+  display: block;
+}
+
+.googleFallback {
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  background: #f8fafc;
+  color: #64748b;
+  padding: 12px;
+  font-size: 14px;
+}
+
+.googlePlaceholder {
+  width: 100%;
+  border: 1px solid #d1d5db !important;
+  border-radius: 999px !important;
+  background: #ffffff !important;
+  color: #111827 !important;
+  padding: 11px 16px !important;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.7);
+}
+
+.googlePlaceholder:hover {
+  background: #f8fafc !important;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #6b7280;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  height: 1px;
+  background: #e5e7eb;
+  flex: 1;
+}
+
+.error {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.info {
+  border: 1px solid #b7dfcf;
+  background: #eef8f3;
+  color: #15543f;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.signupCta {
+  margin: 4px 0 0;
+  text-align: center;
+  color: #4b5563;
+}
+
+.linkButton {
+  background: transparent !important;
+  border: none !important;
+  color: #1f6a56 !important;
+  padding: 0 !important;
+  text-decoration: underline;
+  font-weight: 700;
+}
+
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.35);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+
+.modalCard {
+  width: min(460px, 100%);
+  border: 1px solid #e6e9ec;
+  border-radius: 16px;
+  padding: 24px;
+  background: #fff;
+  box-shadow: 0 24px 44px rgba(16, 24, 40, 0.12);
+  display: grid;
+  gap: 12px;
+}
+
+.modalCard label {
+  display: grid;
+  gap: 6px;
+  color: #374151;
+  font-size: 14px;
+}
+
+.modalCard input {
+  width: 100%;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 11px 12px;
+  background: #fff;
+}

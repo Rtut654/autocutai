@@ -1,6 +1,9 @@
 /** @type {import('next').NextConfig} */
+const isDev = process.env.NODE_ENV !== "production";
+
 const nextConfig = {
-  output: "standalone",
+  distDir: isDev ? ".next-dev" : ".next",
+  output: isDev ? undefined : "standalone",
   experimental: {
     typedRoutes: false
   }

@@ -26,6 +26,30 @@ async def _update_status(job_id: str, status: PipelineStatus):
     job_status[job_id] = status
 
 
+async def _run_pipeline_job(job_id: str, clip_paths: list[str]) -> None:
+    try:
+        await run_pipeline(
+            clip_paths,
+            job_id,
+            status_callback=lambda s: _update_status(job_id, s),
+            output_dir=OUTPUT_DIR,
+        )
+    except Exception as exc:
+        if isinstance(exc, FileNotFoundError):
+            message = "ffmpeg is required but was not found in PATH"
+        else:
+            message = str(exc) or "Pipeline failed"
+        await _update_status(
+            job_id,
+            PipelineStatus(
+                job_id=job_id,
+                stage="error",
+                progress=0.0,
+                message=message,
+            ),
+        )
+
+
 @router.post("/upload")
 async def upload_clips(files: list[UploadFile] = File(...)):
     """Accept multiple video clips, return a job_id."""
@@ -40,15 +64,18 @@ async def upload_clips(files: list[UploadFile] = File(...)):
             await f.write(await file.read())
         clip_paths.append(dest)
 
-    # Kick off pipeline as background task
-    asyncio.create_task(
-        run_pipeline(
-            clip_paths,
-            job_id,
-            status_callback=lambda s: _update_status(job_id, s),
-            output_dir=OUTPUT_DIR
-        )
+    await _update_status(
+        job_id,
+        PipelineStatus(
+            job_id=job_id,
+            stage="queued",
+            progress=0.0,
+            message="Upload complete. Waiting to start pipeline...",
+        ),
     )
+
+    # Kick off pipeline as background task
+    asyncio.create_task(_run_pipeline_job(job_id, clip_paths))
 
     return {"job_id": job_id}
 
@@ -63,7 +90,7 @@ async def get_status(job_id: str):
             if status and status.stage != last_stage:
                 last_stage = status.stage
                 yield f"data: {status.model_dump_json()}\n\n"
-                if status.stage == "done":
+                if status.stage in {"done", "error"}:
                     break
             await asyncio.sleep(0.5)
 
@@ -113,13 +140,15 @@ async def retry_job(job_id: str):
     if not clip_paths:
         return {"error": "No clips found for this job"}
 
-    asyncio.create_task(
-        run_pipeline(
-            clip_paths,
-            job_id,
-            status_callback=lambda s: _update_status(job_id, s),
-            output_dir=OUTPUT_DIR
-        )
+    await _update_status(
+        job_id,
+        PipelineStatus(
+            job_id=job_id,
+            stage="queued",
+            progress=0.0,
+            message="Retry queued. Waiting to restart pipeline...",
+        ),
     )
+    asyncio.create_task(_run_pipeline_job(job_id, clip_paths))
 
     return {"job_id": job_id, "message": "Retrying from last checkpoint"}

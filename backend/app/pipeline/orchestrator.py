@@ -186,6 +186,7 @@ async def process_audio_track(clips: list[dict], cache: StepCache):
             if cache.has_step(clip["clip_id"], "whisper"):
                 transcripts.append({
                     "clip_id": clip["clip_id"],
+                    "source_file": clip["source_file"],
                     **cache.get_step(clip["clip_id"], "whisper")
                 })
             else:
@@ -198,12 +199,18 @@ async def process_audio_track(clips: list[dict], cache: StepCache):
             ])
             for t in new_transcripts:
                 cid = t["clip_id"]
+                source_file = next(
+                    clip["source_file"]
+                    for clip in uncached
+                    if clip["clip_id"] == cid
+                )
                 cache.save_step(cid, "whisper", {
                     "transcript": t["transcript"],
                     "segments":   t["segments"],
                     "words":      t["words"],
                     "language":   t.get("language", "en"),
                 })
+                t["source_file"] = source_file
                 transcripts.append(t)
 
     # Gap classification

@@ -22,17 +22,29 @@ async def transcribe_clip(client: httpx.AsyncClient, audio_path: str, clip_id: s
     with open(audio_path, "rb") as f:
         response = await client.post(
             WHISPER_URL,
-            files={"audio": (Path(audio_path).name, f, "audio/wav")},
-            data={"response_format": "verbose_json", "timestamp_granularities": "word"},
+            files={"file": (Path(audio_path).name, f, "audio/wav")},
+            params={"language": "en"},
             timeout=60.0
         )
+    response.raise_for_status()
 
     data = response.json()
+    segments = data.get("segments", [])
+    words = data.get("words") or [
+        {
+            "word": word.get("word") or word.get("text", ""),
+            "start": word.get("start", 0.0),
+            "end": word.get("end", 0.0),
+            "confidence": word.get("confidence"),
+        }
+        for segment in segments
+        for word in segment.get("words", [])
+    ]
     return {
         "clip_id": clip_id,
-        "transcript": data.get("text", ""),
-        "segments": data.get("segments", []),
-        "words": data.get("words", []),
+        "transcript": data.get("text") or data.get("transcript", ""),
+        "segments": segments,
+        "words": words,
     }
 
 

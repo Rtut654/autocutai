@@ -128,6 +128,12 @@ def clip_classify_frames(image_paths: list[str]) -> list[dict]:
     return results
 
 
+def _fallback_frame_description(frame: dict) -> str:
+    scene = frame.get("scene_type", "travel scene")
+    mood = frame.get("mood", "neutral")
+    return f"{scene}, {mood} mood"
+
+
 async def gpt4o_describe_frame(
     client: openai.AsyncOpenAI,
     image_path: str,
@@ -182,6 +188,11 @@ async def describe_uncertain_frames(frames: list[dict]) -> list[dict]:
     if not uncertain:
         return frames
 
+    if not os.getenv("OPENAI_API_KEY"):
+        for frame in uncertain:
+            frame["gpt_description"] = _fallback_frame_description(frame)
+        return frames
+
     client = openai.AsyncOpenAI()
     tasks = [
         gpt4o_describe_frame(
@@ -193,16 +204,19 @@ async def describe_uncertain_frames(frames: list[dict]) -> list[dict]:
         for f in uncertain
     ]
 
-    descriptions = await asyncio.gather(*tasks)
+    descriptions = await asyncio.gather(*tasks, return_exceptions=True)
     desc_map = {
         (d["clip_id"], d["frame_idx"]): d["description"]
         for d in descriptions
+        if not isinstance(d, Exception)
     }
 
     for frame in frames:
         key = (frame["clip_id"], frame.get("frame_idx", 0))
         if key in desc_map:
             frame["gpt_description"] = desc_map[key]
+        elif frame in uncertain:
+            frame["gpt_description"] = _fallback_frame_description(frame)
 
     return frames
 

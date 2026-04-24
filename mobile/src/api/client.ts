@@ -2,6 +2,7 @@ export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://aut
 
 export type SubscriptionPlan = 'free' | 'pro_monthly' | 'pro_yearly';
 export type BillingPlanKey = 'monthly' | 'six_month' | 'yearly';
+export type RenderStrategy = 'on_device' | 'selected_ranges_upload';
 
 export type BillingPlan = {
   key: BillingPlanKey;
@@ -73,6 +74,42 @@ type ProjectSummary = {
     insertion_suggestions?: Array<unknown>;
     gap_ranges?: Array<unknown>;
   };
+};
+
+export type ProjectSettingsPayload = {
+  aspect_ratio?: 'horizontal' | 'vertical';
+  edit_mode?: 'chronological' | 'manual';
+  remove_duplicates?: boolean;
+  smart_pause_cutter?: boolean;
+  generate_subtitles?: boolean;
+  insert_suggestions?: boolean;
+  min_gap_seconds?: number;
+};
+
+export type ProjectAnalysisTrack = {
+  id: string;
+  filename: string;
+  duration: number;
+  metadata?: Record<string, unknown>;
+  transcription?: {
+    text?: string;
+    words?: Array<{ word?: string; text?: string; start: number; end: number }>;
+  } | null;
+};
+
+export type ProjectAnalysisResult = {
+  id: string;
+  name: string;
+  status: string;
+  pipeline: {
+    combined_transcript: string;
+    gap_ranges: Array<{ start: number; end: number; duration: number; reason?: string }>;
+    insertion_suggestions: Array<{ time: number; suggestion: string; media_type: string }>;
+    render_plan: Record<string, unknown>;
+    subtitle_cues?: Array<unknown>;
+  };
+  tracks: ProjectAnalysisTrack[];
+  output_path?: string | null;
 };
 
 async function check<T>(res: Response): Promise<T> {
@@ -249,6 +286,34 @@ export const api = {
     );
   },
 
+  async analyzeHybridProject(payload: {
+    name: string;
+    description?: string;
+    tracks: Array<Record<string, unknown>>;
+    settings?: Partial<ProjectSettingsPayload>;
+    render_strategy?: RenderStrategy;
+  }) {
+    const response = await request<{ project: ProjectAnalysisResult }>(
+      '/api/projects/hybrid-analyze',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          name: payload.name,
+          description: payload.description,
+          tracks: payload.tracks,
+          settings: {
+            smart_pause_cutter: true,
+            generate_subtitles: true,
+            insert_suggestions: true,
+            ...(payload.settings || {}),
+          },
+          render_strategy: payload.render_strategy || 'on_device',
+        }),
+      },
+    );
+    return response.project;
+  },
+
   async updateProfile(token: string, payload: { full_name?: string | null }) {
     return request<MeUser>(
       '/api/auth/me',
@@ -303,6 +368,11 @@ export async function processProjectSync(projectId: string) {
 
 export async function getTimeline(projectId: string) {
   const res = await fetch(`${API_BASE_URL}/api/projects/${projectId}/timeline`);
+  return check<any>(res);
+}
+
+export async function getRenderManifest(projectId: string) {
+  const res = await fetch(`${API_BASE_URL}/api/projects/${projectId}/render-manifest`);
   return check<any>(res);
 }
 
