@@ -42,6 +42,7 @@ class ProjectService:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
         self.projects: Dict[str, Project] = {}
+        self._active_transcription_jobs: set[str] = set()
         logger.info("ProjectService initialized")
 
     async def create_project(self, request: ProjectCreateRequest, user_id: Optional[str] = None) -> Project:
@@ -255,6 +256,83 @@ class ProjectService:
 
         return project
 
+    @staticmethod
+    def _track_is_transcribable(track: VideoTrack) -> bool:
+        return track.type in {TrackType.VIDEO, TrackType.AUDIO}
+
+    @staticmethod
+    def _track_has_transcript(track: VideoTrack) -> bool:
+        transcription = track.transcription or {}
+        text = transcription.get("text") or transcription.get("transcript") or ""
+        words = transcription.get("words") or []
+        return bool(str(text).strip()) or bool(words)
+
+    @classmethod
+    def _get_track_transcript_status(cls, track: VideoTrack) -> Optional[str]:
+        if cls._track_has_transcript(track):
+            return "completed"
+        status = track.metadata.get("transcript_status")
+        return status if isinstance(status, str) else None
+
+    @staticmethod
+    def _set_track_transcript_status(track: VideoTrack, status: str, error: Optional[str] = None) -> None:
+        track.metadata["transcript_status"] = status
+        if error:
+            track.metadata["transcript_error"] = error
+        else:
+            track.metadata.pop("transcript_error", None)
+
+    @classmethod
+    def _track_needs_transcription(cls, track: VideoTrack) -> bool:
+        if not cls._track_is_transcribable(track):
+            return False
+        if cls._track_has_transcript(track):
+            return False
+        return cls._get_track_transcript_status(track) != "not_applicable"
+
+    def project_has_missing_transcripts(self, project: Project) -> bool:
+        return any(self._track_needs_transcription(track) for track in project.tracks)
+
+    def mark_missing_transcripts_pending(self, project: Project) -> bool:
+        changed = False
+        for track in project.tracks:
+            if not self._track_is_transcribable(track):
+                continue
+            if self._track_has_transcript(track):
+                if self._get_track_transcript_status(track) != "completed":
+                    self._set_track_transcript_status(track, "completed")
+                    changed = True
+                continue
+            status = self._get_track_transcript_status(track)
+            if status not in {"pending", "processing"}:
+                self._set_track_transcript_status(track, "pending")
+                changed = True
+        return changed
+
+    async def backfill_missing_transcripts(self, project_id: str, user_id: Optional[str] = None) -> Optional[Project]:
+        if project_id in self._active_transcription_jobs:
+            return await self.get_project(project_id, user_id=user_id)
+
+        self._active_transcription_jobs.add(project_id)
+        try:
+            project = await self.get_project(project_id, user_id=user_id)
+            if not project:
+                return None
+            if not self.project_has_missing_transcripts(project):
+                return project
+
+            self.mark_missing_transcripts_pending(project)
+            project.updated_at = datetime.utcnow()
+            await self._save_project(project)
+
+            await self._transcribe_project_tracks(project, persist=True, continue_on_error=True)
+            project.updated_at = datetime.utcnow()
+            await self._save_project(project)
+            self.projects[project.id] = project
+            return project
+        finally:
+            self._active_transcription_jobs.discard(project_id)
+
     async def _create_track_from_file(
         self,
         file_path: str,
@@ -284,6 +362,8 @@ class ProjectService:
             "uploaded_at": datetime.utcnow().isoformat(),
         }
         metadata.update(extra_metadata)
+        if track_type in {TrackType.VIDEO, TrackType.AUDIO}:
+            metadata.setdefault("transcript_status", "pending")
 
         duration = 30.0
         if track_type in {TrackType.VIDEO, TrackType.AUDIO}:
@@ -324,46 +404,91 @@ class ProjectService:
         return ordered
 
     async def _transcribe_tracks(self, project: Project) -> None:
+        await self._transcribe_project_tracks(project, persist=False, continue_on_error=False)
+
+    async def _transcribe_project_tracks(
+        self,
+        project: Project,
+        *,
+        persist: bool = False,
+        continue_on_error: bool = False,
+    ) -> None:
         processor = VideoProcessor()
         if not project.user_id:
             raise ValueError("Project owner missing")
         audio_dir = self.get_project_audio_dir(project.user_id, project.id)
         transcript_dir = self.get_project_transcript_dir(project.user_id, project.id)
         for track in project.tracks:
-            if track.type not in {TrackType.VIDEO, TrackType.AUDIO}:
+            if not self._track_is_transcribable(track):
                 continue
-            audio_path = track.file_path
-            if track.type == TrackType.VIDEO:
-                audio_output_path = self._reserve_named_output(audio_dir, Path(track.filename).stem, ".wav")
-                extracted_audio_path = await processor.extract_audio_for_transcription(track.file_path, str(audio_output_path))
-                audio_path = extracted_audio_path
-                track.metadata["audio_path"] = extracted_audio_path
+            if self._track_has_transcript(track):
+                self._set_track_transcript_status(track, "completed")
+                continue
 
-            with open(audio_path, "rb") as handle:
-                audio_data = handle.read()
-            transcription_filename = Path(audio_path).name
-            raw_transcription = await transcribe_audio(audio_data, transcription_filename, "en")
+            self._set_track_transcript_status(track, "processing")
+            if persist:
+                project.updated_at = datetime.utcnow()
+                await self._save_project(project)
 
-            words = normalize_words(
-                raw_transcription.get("words")
-                or [
-                    word
-                    for segment in raw_transcription.get("segments", [])
-                    for word in segment.get("words", [])
-                ]
-            )
+            try:
+                await self._transcribe_track(
+                    project,
+                    track,
+                    processor=processor,
+                    audio_dir=audio_dir,
+                    transcript_dir=transcript_dir,
+                )
+                self._set_track_transcript_status(track, "completed")
+            except Exception as exc:
+                self._set_track_transcript_status(track, "error", str(exc))
+                if not continue_on_error:
+                    raise
+            finally:
+                if persist:
+                    project.updated_at = datetime.utcnow()
+                    await self._save_project(project)
 
-            track.has_voice = len(words) > 0
-            track.transcription = {
-                "text": raw_transcription.get("text") or raw_transcription.get("transcript") or "",
-                "words": [word.model_dump() for word in words],
-                "language": raw_transcription.get("language", "en"),
-                "segments": raw_transcription.get("segments", []),
-            }
-            track.local_gap_ranges = find_gaps(words, project.settings.min_gap_seconds)
-            transcript_text_path = self._reserve_named_output(transcript_dir, Path(track.filename).stem, ".txt")
-            transcript_text_path.write_text(track.transcription["text"], encoding="utf-8")
-            track.metadata["transcript_path"] = str(transcript_text_path)
+    async def _transcribe_track(
+        self,
+        project: Project,
+        track: VideoTrack,
+        *,
+        processor: VideoProcessor,
+        audio_dir: Path,
+        transcript_dir: Path,
+    ) -> None:
+        audio_path = track.file_path
+        if track.type == TrackType.VIDEO:
+            audio_output_path = self._reserve_named_output(audio_dir, Path(track.filename).stem, ".wav")
+            extracted_audio_path = await processor.extract_audio_for_transcription(track.file_path, str(audio_output_path))
+            audio_path = extracted_audio_path
+            track.metadata["audio_path"] = extracted_audio_path
+
+        with open(audio_path, "rb") as handle:
+            audio_data = handle.read()
+        transcription_filename = Path(audio_path).name
+        raw_transcription = await transcribe_audio(audio_data, transcription_filename, "en")
+
+        words = normalize_words(
+            raw_transcription.get("words")
+            or [
+                word
+                for segment in raw_transcription.get("segments", [])
+                for word in segment.get("words", [])
+            ]
+        )
+
+        track.has_voice = len(words) > 0
+        track.transcription = {
+            "text": raw_transcription.get("text") or raw_transcription.get("transcript") or "",
+            "words": [word.model_dump() for word in words],
+            "language": raw_transcription.get("language", "en"),
+            "segments": raw_transcription.get("segments", []),
+        }
+        track.local_gap_ranges = find_gaps(words, project.settings.min_gap_seconds)
+        transcript_text_path = self._reserve_named_output(transcript_dir, Path(track.filename).stem, ".txt")
+        transcript_text_path.write_text(track.transcription["text"], encoding="utf-8")
+        track.metadata["transcript_path"] = str(transcript_text_path)
 
     def _create_track_from_hybrid_input(self, track: HybridTrackInput, position: int) -> VideoTrack:
         transcription = track.transcription or {}
@@ -386,6 +511,7 @@ class ProjectService:
             "proxy_reference": track.proxy_reference,
             "source_reference": track.source_reference,
             "shot_boundaries": track.shot_boundaries,
+            "transcript_status": "completed" if transcription else "not_applicable",
         }
         metadata.update(track.metadata)
 

@@ -6,6 +6,8 @@ import { api } from "../../../lib/api";
 import { getStoredSession, setLastProjectId } from "../../../lib/session";
 import type { ProjectDetail, ProjectTrack, TranscriptSegment } from "../../../lib/types";
 
+type TranscriptStatus = "pending" | "processing" | "completed" | "error" | "not_applicable";
+
 function formatDate(value?: string | null): string {
   if (!value) return "Unknown date";
   const parsed = new Date(value);
@@ -32,6 +34,14 @@ function formatDuration(seconds: number): string {
   return formatTime(seconds || 0);
 }
 
+function normalizeTranscriptBackfillError(error: unknown): string {
+  const text = String((error as Error).message || error || "").trim();
+  if (text === "Not Found") {
+    return "Transcript backfill endpoint is unavailable. Restart the backend so the latest /transcribe-missing route is loaded.";
+  }
+  return text || "Transcript processing request failed.";
+}
+
 function getTranscriptText(track: ProjectTrack): string | null {
   const text = track.transcription?.text;
   if (typeof text !== "string") return null;
@@ -48,6 +58,46 @@ function hasTranscript(track: ProjectTrack): boolean {
   return Array.isArray(track.transcription?.words) && track.transcription!.words!.length > 0;
 }
 
+function getTrackTranscriptStatus(track: ProjectTrack): TranscriptStatus | null {
+  if (hasTranscript(track)) return "completed";
+  const status = track.metadata?.transcript_status;
+  if (
+    status === "pending" ||
+    status === "processing" ||
+    status === "completed" ||
+    status === "error" ||
+    status === "not_applicable"
+  ) {
+    return status;
+  }
+  return null;
+}
+
+function isTranscriptProcessing(track: ProjectTrack): boolean {
+  const status = getTrackTranscriptStatus(track);
+  return status === "pending" || status === "processing";
+}
+
+function isTrackTranscribable(track: ProjectTrack): boolean {
+  return track.type === "video" || track.type === "audio";
+}
+
+function projectHasProcessingTranscripts(project: ProjectDetail | null): boolean {
+  return Boolean(project?.tracks.some((track) => isTranscriptProcessing(track)));
+}
+
+function shouldRequestTranscriptBackfill(project: ProjectDetail | null): boolean {
+  if (!project) return false;
+  return project.tracks.some((track) => {
+    if (!isTrackTranscribable(track)) return false;
+    const status = getTrackTranscriptStatus(track);
+    if (status === "completed" || status === "pending" || status === "processing" || status === "not_applicable") {
+      return false;
+    }
+    return !hasTranscript(track);
+  });
+}
+
 function sortChronologically(tracks: ProjectTrack[]): ProjectTrack[] {
   return [...tracks].sort((left, right) => {
     const leftTime = left.recorded_at ? new Date(left.recorded_at).getTime() : Number.POSITIVE_INFINITY;
@@ -55,6 +105,10 @@ function sortChronologically(tracks: ProjectTrack[]): ProjectTrack[] {
     if (leftTime !== rightTime) return leftTime - rightTime;
     return left.position - right.position;
   });
+}
+
+function isTrackHidden(track: ProjectTrack): boolean {
+  return track.status === "hidden" || track.excluded === true;
 }
 
 /**
@@ -108,6 +162,21 @@ function useAuthedBlobUrl(
 }
 
 function TranscriptPanel({ track }: { track: ProjectTrack }) {
+  const transcriptStatus = getTrackTranscriptStatus(track);
+
+  if (transcriptStatus === "pending" || transcriptStatus === "processing") {
+    return (
+      <span className="clipTag clipTagProcessing">
+        <span className="spinner" aria-hidden="true" />
+        transcript processing
+      </span>
+    );
+  }
+
+  if (transcriptStatus === "error") {
+    return <span className="clipTag clipTagMuted">transcript failed</span>;
+  }
+
   if (!hasTranscript(track)) {
     return <span className="clipTag clipTagMuted">no transcript</span>;
   }
@@ -144,12 +213,16 @@ function ClipCard({
   token,
   track,
   onOpen,
+  onHide,
+  hiding,
 }: {
   projectId: string;
   projectCreatedAt?: string;
   token: string | undefined;
   track: ProjectTrack;
   onOpen: (track: ProjectTrack) => void;
+  onHide: (trackId: string) => void;
+  hiding: boolean;
 }) {
   const rawUrl = api.getTrackMediaUrl(projectId, track.id);
   const { blobUrl, loading, error } = useAuthedBlobUrl(rawUrl, token);
@@ -180,6 +253,18 @@ function ClipCard({
   return (
     <article className="clipCard">
       <div className="clipMediaWrap">
+        <button
+          type="button"
+          className="clipHideButton"
+          aria-label={`Remove ${track.filename} from project`}
+          disabled={hiding}
+          onClick={(event) => {
+            event.stopPropagation();
+            onHide(track.id);
+          }}
+        >
+          ×
+        </button>
         <button type="button" className="clipPreviewButton" onClick={() => onOpen(track)}>
           {blobUrl ? (
             <video
@@ -287,8 +372,12 @@ export default function ProjectDetailPage() {
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [addingTracks, setAddingTracks] = useState(false);
+  const [hidingTrackId, setHidingTrackId] = useState<string | null>(null);
   const [activeTrack, setActiveTrack] = useState<ProjectTrack | null>(null);
   const [token, setToken] = useState<string | undefined>(undefined);
+  const requestedTranscriptBackfill = useRef(false);
+  const addTracksInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const session = getStoredSession();
@@ -315,7 +404,81 @@ export default function ProjectDetailPage() {
       .finally(() => setLoading(false));
   }, [projectId, router]);
 
-  const sortedTracks = useMemo(() => sortChronologically(project?.tracks || []), [project?.tracks]);
+  useEffect(() => {
+    requestedTranscriptBackfill.current = false;
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId || !token || !project || !shouldRequestTranscriptBackfill(project)) return;
+    if (requestedTranscriptBackfill.current) return;
+
+    requestedTranscriptBackfill.current = true;
+    api.requestMissingTranscripts(projectId, token)
+      .then((response) => {
+        setProject(response.project);
+        setMessage(null);
+      })
+      .catch((error) => {
+        requestedTranscriptBackfill.current = false;
+        setMessage(normalizeTranscriptBackfillError(error));
+      });
+  }, [project, projectId, token]);
+
+  useEffect(() => {
+    if (!projectId || !token || !projectHasProcessingTranscripts(project)) return;
+
+    const intervalId = window.setInterval(() => {
+      api.getProject(projectId, token)
+        .then((response) => {
+          setProject(response.project);
+          setMessage(null);
+        })
+        .catch((error) => setMessage(String((error as Error).message || error)));
+    }, 3000);
+
+    return () => window.clearInterval(intervalId);
+  }, [project, projectId, token]);
+
+  const handleAddTracks = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const nextFiles = Array.from(event.target.files || []);
+    event.target.value = "";
+    if (nextFiles.length === 0 || !token) return;
+
+    try {
+      setAddingTracks(true);
+      setMessage(null);
+      const response = await api.addTracksToProject(projectId, nextFiles, token);
+      requestedTranscriptBackfill.current = false;
+      setProject(response.project);
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    } finally {
+      setAddingTracks(false);
+    }
+  };
+
+  const handleHideTrack = async (trackId: string) => {
+    if (!token || !project) return;
+    try {
+      setHidingTrackId(trackId);
+      setMessage(null);
+      await api.excludeTrack(project.id, trackId, token);
+      const response = await api.getProject(project.id, token);
+      setProject(response.project);
+      if (activeTrack?.id === trackId) {
+        setActiveTrack(null);
+      }
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    } finally {
+      setHidingTrackId(null);
+    }
+  };
+
+  const sortedTracks = useMemo(
+    () => sortChronologically((project?.tracks || []).filter((track) => !isTrackHidden(track))),
+    [project?.tracks],
+  );
 
   if (loading) {
     return (
@@ -367,11 +530,31 @@ export default function ProjectDetailPage() {
       {message ? <div className="notice">{message}</div> : null}
 
       <section className="card stack" style={{ gap: 16 }}>
-        <div className="stack" style={{ gap: 4 }}>
-          <h2>Clips ({sortedTracks.length})</h2>
-          <span className="muted">
-            Ordered chronologically from the earliest clip to the latest.
-          </span>
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+          <div className="stack" style={{ gap: 4 }}>
+            <h2>Clips ({sortedTracks.length})</h2>
+            <span className="muted">
+              Ordered chronologically from the earliest clip to the latest.
+            </span>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <input
+              ref={addTracksInputRef}
+              type="file"
+              accept="video/*"
+              multiple
+              hidden
+              onChange={handleAddTracks}
+            />
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={addingTracks}
+              onClick={() => addTracksInputRef.current?.click()}
+            >
+              {addingTracks ? "Adding..." : "Add Clips"}
+            </button>
+          </div>
         </div>
 
         {sortedTracks.length === 0 ? (
@@ -386,6 +569,8 @@ export default function ProjectDetailPage() {
                 token={token}
                 track={track}
                 onOpen={setActiveTrack}
+                onHide={handleHideTrack}
+                hiding={hidingTrackId === track.id}
               />
             ))}
           </div>

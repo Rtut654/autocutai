@@ -65,6 +65,7 @@ async def hybrid_analyze_project(
 
 @router.post("/", response_model=ProjectResponse)
 async def create_project(
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
     name: str = Form(...),
     description: Optional[str] = Form(None),
@@ -119,6 +120,8 @@ async def create_project(
         )
 
         project = await project_service.create_project_with_id(project_id, request, user_id=current_user.id)
+        if project_service.project_has_missing_transcripts(project):
+            background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
         return ProjectResponse(project=project, message="Project created successfully")
     except HTTPException:
         raise
@@ -281,14 +284,16 @@ async def exclude_track(project_id: str, track_id: str, current_user=Depends(get
         raise HTTPException(status_code=404, detail="Track not found")
 
     track.excluded = not track.excluded
+    track.status = "hidden" if track.excluded else "visible"
     project.updated_at = datetime.now()
     await project_service._save_project(project)
-    return {"track_id": track_id, "excluded": track.excluded}
+    return {"track_id": track_id, "excluded": track.excluded, "status": track.status}
 
 
 @router.post("/{project_id}/tracks", response_model=ProjectResponse)
 async def add_tracks_to_project(
     project_id: str,
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
     files: List[UploadFile] = File(...),
     capture_times_json: Optional[str] = Form(default=None),
@@ -329,9 +334,33 @@ async def add_tracks_to_project(
         project.tracks.append(track)
 
     project.tracks = project_service._sorted_tracks(project.tracks)
+    project_service.mark_missing_transcripts_pending(project)
     project.updated_at = datetime.now()
     await project_service._save_project(project)
+    if project_service.project_has_missing_transcripts(project):
+        background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
     return ProjectResponse(project=project, message="Tracks added successfully")
+
+
+@router.post("/{project_id}/transcribe-missing", response_model=ProjectResponse)
+async def transcribe_missing_project_tracks(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+):
+    project = await project_service.get_project(project_id, user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_service.mark_missing_transcripts_pending(project)
+    project.updated_at = datetime.utcnow()
+    await project_service._save_project(project)
+
+    if project_service.project_has_missing_transcripts(project):
+        background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
+        return ProjectResponse(project=project, message="Transcript processing started")
+
+    return ProjectResponse(project=project, message="All transcripts already available")
 
 
 @router.get("/{project_id}/tracks/{track_id}/media")

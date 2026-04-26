@@ -8,14 +8,14 @@
     {
       "id": "f9b5aa4e-9d00-49d3-9058-23a084e10797",
       "type": "video",
-      "filename": "3a3c17abc38d4ca480b3270e19564906_clip1.mp4",
-      "file_path": "temp/3a3c17abc38d4ca480b3270e19564906_clip1.mp4",
+      "filename": "clip1.mp4",
+      "file_path": "projects/af855cbc-9aba-4830-a4fe-32da18c5aed0/media/clip1.mp4",
       "duration": 30.0,
       "start_time": null,
       "end_time": null,
       "position": 0,
       "metadata": {
-        "filename": "3a3c17abc38d4ca480b3270e19564906_clip1.mp4",
+        "filename": "clip1.mp4",
         "size": 9,
         "extension": ".mp4",
         "uploaded_at": "2026-02-26T18:15:12.744915"

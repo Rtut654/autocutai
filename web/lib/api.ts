@@ -306,7 +306,7 @@ export const api = {
     return `${getApiBase()}/api/projects/${projectId}/word-srt`;
   },
   async excludeTrack(projectId: string, trackId: string, token?: string) {
-    return request<{ track_id: string; excluded: boolean }>(
+    return request<{ track_id: string; excluded: boolean; status: "visible" | "hidden" }>(
       `/api/projects/${projectId}/tracks/${trackId}/exclude`,
       "PATCH",
       token,
@@ -318,5 +318,8 @@ export const api = {
     form.append("metadata_json", JSON.stringify(files.map(() => ({}))));
     files.forEach((file) => form.append("files", file));
     return requestMultipart<ProjectResponse>(`/api/projects/${projectId}/tracks`, form, token);
+  },
+  async requestMissingTranscripts(projectId: string, token?: string) {
+    return request<ProjectResponse>(`/api/projects/${projectId}/transcribe-missing`, "POST", token);
   },
 };

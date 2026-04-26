@@ -472,7 +472,7 @@ input, select {
 
 .clipGrid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -499,9 +499,35 @@ input, select {
   cursor: pointer;
 }
 
+.clipHideButton {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(220, 38, 38, 0.92);
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 8px 18px rgba(220, 38, 38, 0.24);
+}
+
+.clipHideButton:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
 .clipMedia {
   width: 100%;
-  height: 240px;
+  aspect-ratio: 16 / 9;
+  height: auto;
   border-radius: 16px;
   background: #0f1523;
   display: block;
@@ -531,7 +557,7 @@ input, select {
 }
 
 .clipFileName {
-  font-size: 20px;
+  font-size: 18px;
   line-height: 1.2;
   letter-spacing: -0.02em;
   word-break: break-word;
@@ -562,6 +588,13 @@ input, select {
 .clipTagMuted {
   color: #66778c;
   background: #f8fafc;
+}
+
+.clipTagProcessing {
+  gap: 8px;
+  color: #d97706;
+  background: #fffbeb;
+  border-color: #fde68a;
 }
 
 .clipTranscriptDetails {
@@ -656,6 +689,18 @@ input, select {
   border-radius: 18px;
   background: #0f1523;
   object-fit: contain;
+}
+
+@media (max-width: 1360px) {
+  .clipGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1160px) {
+  .clipGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 980px) {

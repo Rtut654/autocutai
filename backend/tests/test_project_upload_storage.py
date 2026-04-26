@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -87,6 +88,50 @@ def test_create_project_stores_uploads_in_user_project_video_dir(tmp_path, monke
     assert payload["tracks"][1]["file_path"] == str(video_dir / "IMG_6158.MOV")
 
 
+def test_create_project_queues_transcript_backfill(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    calls = []
+
+    async def fake_backfill(project_id: str, user_id: str | None = None):
+        calls.append((project_id, user_id))
+        return None
+
+    monkeypatch.setattr(project_service, "backfill_missing_transcripts", fake_backfill)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "queued@example.com",
+            "password": "password123",
+            "full_name": "Queued User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Queued Transcript Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["project"]
+    assert payload["tracks"][0]["metadata"]["transcript_status"] == "pending"
+    assert calls == [(payload["id"], user_id)]
+
+
 def test_create_project_requires_authenticated_user(tmp_path, monkeypatch):
     from backend.app.main import app
     from backend.app.services.auth_service import auth_service
@@ -156,6 +201,70 @@ def test_track_media_route_serves_browser_preview(tmp_path, monkeypatch):
     assert media_response.status_code == 200
     assert media_response.content == b"preview-mp4"
     assert media_response.headers["content-type"].startswith("video/mp4")
+
+
+def test_transcribe_missing_route_marks_legacy_tracks_pending(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    projects_dir = tmp_path / "projects"
+    temp_dir = tmp_path / "temp"
+    projects_dir.mkdir()
+    temp_dir.mkdir()
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", projects_dir)
+    monkeypatch.setattr(project_service, "temp_dir", temp_dir)
+    project_service.projects.clear()
+
+    calls = []
+
+    async def fake_backfill(project_id: str, user_id: str | None = None):
+        calls.append((project_id, user_id))
+        return None
+
+    monkeypatch.setattr(project_service, "backfill_missing_transcripts", fake_backfill)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "legacy@example.com",
+            "password": "password123",
+            "full_name": "Legacy User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Legacy Transcript Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project_id = create_response.json()["project"]["id"]
+    calls.clear()
+
+    project_file = projects_dir / user_id / project_id / "project.json"
+    stored = json.loads(project_file.read_text(encoding="utf-8"))
+    stored["tracks"][0]["transcription"] = None
+    stored["tracks"][0]["metadata"].pop("transcript_status", None)
+    project_file.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    project_service.projects.clear()
+
+    response = client.post(
+        f"/api/projects/{project_id}/transcribe-missing",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["project"]
+    assert payload["tracks"][0]["metadata"]["transcript_status"] == "pending"
+    assert calls == [(project_id, user_id)]
 
 
 def test_download_uses_resolved_output_path(tmp_path, monkeypatch):

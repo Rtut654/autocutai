@@ -76,6 +76,8 @@ export type ProjectTrack = {
   has_voice?: boolean;
   recorded_at?: string | null;
   local_gap_ranges?: GapRange[];
+  status?: "visible" | "hidden";
+  excluded?: boolean;
 };
 
 export type ProjectPipeline = {

@@ -52,6 +52,7 @@ class VideoTrack(BaseModel):
     local_gap_ranges: List["GapRange"] = Field(
         default_factory=list, description="Track-local pause ranges to remove"
     )
+    status: Literal["visible", "hidden"] = Field(default="visible", description="Visibility within the project")
     excluded: bool = Field(default=False, description="Soft-deleted from project (file kept on disk)")
 
 
