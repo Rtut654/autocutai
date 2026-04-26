@@ -39,6 +39,14 @@ class AuthService:
             return None
         return f"{provider}:{provider_user_id}"
 
+    @staticmethod
+    def _preferred_social_user_id(provider: str, provider_user_id: Optional[str]) -> Optional[str]:
+        if not provider_user_id:
+            return None
+        if provider in {"google", "apple"}:
+            return provider_user_id
+        return None
+
     def _issue_token(self, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
         self.tokens_to_user_id[token] = user_id
@@ -86,6 +94,7 @@ class AuthService:
         normalized_email = email.lower().strip() if email else ""
         user: Optional[AuthUser] = None
         provider_key = self._provider_key(provider, provider_user_id)
+        preferred_user_id = self._preferred_social_user_id(provider, provider_user_id)
         if provider_key:
             existing_user_id = self.users_by_provider_identity.get(provider_key)
             if existing_user_id:
@@ -97,7 +106,7 @@ class AuthService:
         if user is None:
             fallback_email = normalized_email or f"{provider}_{provider_user_id or uuid.uuid4().hex}@local.bestshotai"
             user = AuthUser(
-                id=str(uuid.uuid4()),
+                id=preferred_user_id or str(uuid.uuid4()),
                 email=fallback_email,
                 password_hash="",
                 full_name=full_name,

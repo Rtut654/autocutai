@@ -62,6 +62,28 @@ export type TrackTranscription = {
   language?: string;
 };
 
+export type SpeechFilterCut = {
+  start: number;
+  end: number;
+  duration: number;
+  reason: string;
+  transcript: string;
+  confidence: number;
+};
+
+export type SpeechFilterArtifact = {
+  project_id: string;
+  track_id: string;
+  filename: string;
+  status: "completed" | "error";
+  summary: string;
+  cuts: SpeechFilterCut[];
+  generated_at: string;
+  source_word_count: number;
+  model: string;
+  error_message?: string | null;
+};
+
 export type ProjectTrack = {
   id: string;
   type: string;

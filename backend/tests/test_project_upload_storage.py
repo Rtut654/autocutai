@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -130,6 +131,157 @@ def test_create_project_queues_transcript_backfill(tmp_path, monkeypatch):
     payload = response.json()["project"]
     assert payload["tracks"][0]["metadata"]["transcript_status"] == "pending"
     assert calls == [(payload["id"], user_id)]
+
+
+def test_create_project_prefers_media_creation_time_for_recorded_at(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+    from backend.app.services.video_processor import VideoProcessor
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    async def fake_get_video_info(self, video_path: str):
+        return {
+            "streams": [
+                {
+                    "tags": {
+                        "creation_time": "2026-04-24T17:03:00.000000Z",
+                    }
+                }
+            ],
+            "format": {
+                "duration": "41.0",
+                "tags": {},
+            },
+        }
+
+    monkeypatch.setattr(VideoProcessor, "get_video_info", fake_get_video_info)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "recorded@example.com",
+            "password": "password123",
+            "full_name": "Recorded User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+
+    response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Recorded Time Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["project"]
+    assert payload["tracks"][0]["recorded_at"] == "2026-04-24T17:03:00Z"
+
+
+def test_get_project_keeps_missing_transcribable_track_pending(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "pending@example.com",
+            "password": "password123",
+            "full_name": "Pending User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Pending Transcript Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project_id = create_response.json()["project"]["id"]
+
+    project_file = project_service.get_project_file(user_id, project_id, create=False)
+    stored = json.loads(project_file.read_text(encoding="utf-8"))
+    stored["tracks"][0]["transcription"] = None
+    stored["tracks"][0]["metadata"]["transcript_status"] = "pending"
+    project_file.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    project_service.projects.clear()
+
+    response = client.get(
+        f"/api/projects/{project_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["project"]
+    assert payload["tracks"][0]["metadata"]["transcript_status"] == "pending"
+
+
+def test_get_project_queues_backfill_for_pending_track(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    calls = []
+
+    async def fake_backfill(project_id: str, user_id: str | None = None):
+        calls.append((project_id, user_id))
+        return None
+
+    monkeypatch.setattr(project_service, "backfill_missing_transcripts", fake_backfill)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "kick@example.com",
+            "password": "password123",
+            "full_name": "Kick User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Kick Transcript Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project_id = create_response.json()["project"]["id"]
+    calls.clear()
+
+    response = client.get(
+        f"/api/projects/{project_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(project_id, user_id)]
 
 
 def test_create_project_requires_authenticated_user(tmp_path, monkeypatch):
@@ -267,6 +419,201 @@ def test_transcribe_missing_route_marks_legacy_tracks_pending(tmp_path, monkeypa
     assert calls == [(project_id, user_id)]
 
 
+def test_get_project_sanitizes_existing_hallucinated_transcript(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    projects_dir = tmp_path / "projects"
+    temp_dir = tmp_path / "temp"
+    projects_dir.mkdir()
+    temp_dir.mkdir()
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", projects_dir)
+    monkeypatch.setattr(project_service, "temp_dir", temp_dir)
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "sanitize-existing@example.com",
+            "password": "password123",
+            "full_name": "Sanitize Existing User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Sanitize Existing Transcript"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project_id = create_response.json()["project"]["id"]
+
+    project_file = projects_dir / user_id / project_id / "project.json"
+    stored = json.loads(project_file.read_text(encoding="utf-8"))
+    stored["tracks"][0]["duration"] = 10.0
+    stored["tracks"][0]["transcription"] = {
+        "text": "Thanks for watching!",
+        "words": [],
+        "language": "en",
+        "segments": [
+            {
+                "start": 10.0,
+                "end": 10.0,
+                "text": "Thanks for watching!",
+                "words": [],
+            }
+        ],
+    }
+    stored["tracks"][0]["has_voice"] = True
+    stored["tracks"][0]["metadata"]["transcript_status"] = "completed"
+    project_file.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    project_service.projects.clear()
+
+    response = client.get(
+        f"/api/projects/{project_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["project"]
+    assert payload["tracks"][0]["transcription"] is None
+    assert payload["tracks"][0]["has_voice"] is False
+    assert payload["tracks"][0]["metadata"]["transcript_status"] == "pending"
+
+
+def test_get_project_refreshes_existing_recorded_at_from_media_metadata_and_sorts_tracks(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+    from backend.app.services.video_processor import VideoProcessor
+
+    projects_dir = tmp_path / "projects"
+    temp_dir = tmp_path / "temp"
+    projects_dir.mkdir()
+    temp_dir.mkdir()
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", projects_dir)
+    monkeypatch.setattr(project_service, "temp_dir", temp_dir)
+    project_service.projects.clear()
+
+    async def fake_backfill(project_id: str, user_id: str | None = None):
+        return None
+
+    async def fake_get_video_info(self, video_path: str):
+        name = Path(video_path).name
+        creation_time = {
+            "IMG_9585.MOV": "2026-04-24T10:03:00.000000Z",
+            "IMG_9579.MOV": "2026-04-24T10:02:00.000000Z",
+        }[name]
+        return {
+            "streams": [{"tags": {"creation_time": creation_time}}],
+            "format": {"duration": "41.0", "tags": {"creation_time": creation_time}},
+        }
+
+    monkeypatch.setattr(project_service, "backfill_missing_transcripts", fake_backfill)
+    monkeypatch.setattr(VideoProcessor, "get_video_info", fake_get_video_info)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "refresh-recorded@example.com",
+            "password": "password123",
+            "full_name": "Refresh Recorded User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Refresh Recorded Times"},
+        files=[
+            ("files", ("IMG_9585.MOV", b"video-one", "video/quicktime")),
+            ("files", ("IMG_9579.MOV", b"video-two", "video/quicktime")),
+        ],
+    )
+    assert create_response.status_code == 200
+    project_id = create_response.json()["project"]["id"]
+
+    project_file = projects_dir / user_id / project_id / "project.json"
+    stored = json.loads(project_file.read_text(encoding="utf-8"))
+    stored["tracks"][0]["recorded_at"] = "2026-04-25T20:28:00Z"
+    stored["tracks"][1]["recorded_at"] = "2026-04-25T20:29:00Z"
+    project_file.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    project_service.projects.clear()
+
+    response = client.get(
+        f"/api/projects/{project_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["project"]
+    assert [track["filename"] for track in payload["tracks"]] == ["IMG_9579.MOV", "IMG_9585.MOV"]
+    assert payload["tracks"][0]["recorded_at"] == "2026-04-24T10:02:00Z"
+    assert payload["tracks"][1]["recorded_at"] == "2026-04-24T10:03:00Z"
+
+
+def test_add_tracks_skips_duplicate_uploads(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    projects_dir = tmp_path / "projects"
+    temp_dir = tmp_path / "temp"
+    projects_dir.mkdir()
+    temp_dir.mkdir()
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", projects_dir)
+    monkeypatch.setattr(project_service, "temp_dir", temp_dir)
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "dedupe@example.com",
+            "password": "password123",
+            "full_name": "Dedupe User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Duplicate Upload Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+
+    add_response = client.post(
+        f"/api/projects/{project['id']}/tracks",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+
+    assert add_response.status_code == 200
+    payload = add_response.json()["project"]
+    assert len(payload["tracks"]) == 1
+    assert add_response.json()["message"] == "All selected clips were already uploaded"
+
+
 def test_download_uses_resolved_output_path(tmp_path, monkeypatch):
     from backend.app.main import app
     from backend.app.services.auth_service import auth_service
@@ -317,3 +664,398 @@ def test_download_uses_resolved_output_path(tmp_path, monkeypatch):
     assert download_response.status_code == 200
     assert download_response.content == b"final-video"
     assert download_response.headers["content-type"].startswith("video/mp4")
+
+
+def test_track_speech_filter_route_persists_per_track_edit_json(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.models.project import SpeechFilterArtifact, SpeechFilterCut
+    from backend.app.services.ai_service import ai_service
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    async def fake_suggest_speech_filter_cuts(**kwargs):
+        return SpeechFilterArtifact(
+            project_id=kwargs["project_id"],
+            track_id=kwargs["track_id"],
+            filename=kwargs["filename"],
+            status="completed",
+            summary="2 suggested cuts, about 1.1s total.",
+            cuts=[
+                SpeechFilterCut(
+                    start=0.45,
+                    end=0.62,
+                    duration=0.17,
+                    reason="filler_word",
+                    transcript="um",
+                    confidence=0.93,
+                ),
+                SpeechFilterCut(
+                    start=1.10,
+                    end=2.03,
+                    duration=0.93,
+                    reason="long_pause",
+                    transcript="",
+                    confidence=0.98,
+                ),
+            ],
+            generated_at=datetime(2026, 4, 26),
+            source_word_count=8,
+            model="test-model",
+        )
+
+    monkeypatch.setattr(ai_service, "suggest_speech_filter_cuts", fake_suggest_speech_filter_cuts)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "speech-filter@example.com",
+            "password": "password123",
+            "full_name": "Speech Filter User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Speech Filter Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+    project_id = project["id"]
+    track_id = project["tracks"][0]["id"]
+
+    project_file = project_service.get_project_file(user_id, project_id, create=False)
+    stored = json.loads(project_file.read_text(encoding="utf-8"))
+    stored["tracks"][0]["duration"] = 6.0
+    stored["tracks"][0]["transcription"] = {
+        "text": "hello um hello there",
+        "words": [
+            {"word": "hello", "start": 0.0, "end": 0.4},
+            {"word": "um", "start": 0.45, "end": 0.62},
+            {"word": "hello", "start": 0.9, "end": 1.25},
+            {"word": "there", "start": 2.03, "end": 2.45},
+        ],
+        "language": "en",
+        "segments": [],
+    }
+    stored["tracks"][0]["metadata"]["transcript_status"] = "completed"
+    project_file.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    project_service.projects.clear()
+
+    filter_response = client.post(
+        f"/api/projects/{project_id}/tracks/{track_id}/speech-filter",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert filter_response.status_code == 200
+    payload = filter_response.json()
+    assert payload["status"] == "completed"
+    assert payload["model"] == "test-model"
+    assert len(payload["cuts"]) == 2
+
+    edit_file = project_service.get_track_edit_file(user_id, project_id, track_id)
+    assert edit_file.exists()
+    stored_artifact = json.loads(edit_file.read_text(encoding="utf-8"))
+    assert stored_artifact["track_id"] == track_id
+    assert stored_artifact["cuts"][0]["reason"] == "filler_word"
+
+    refreshed_project = json.loads(project_file.read_text(encoding="utf-8"))
+    metadata = refreshed_project["tracks"][0]["metadata"]
+    assert metadata["speech_filter_status"] == "completed"
+    assert metadata["speech_filter_cut_count"] == 2
+    assert metadata["speech_filter_path"] == str(edit_file)
+
+
+def test_get_track_speech_filter_returns_saved_artifact(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.models.project import SpeechFilterArtifact, SpeechFilterCut
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "speech-filter-get@example.com",
+            "password": "password123",
+            "full_name": "Speech Filter Get User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Speech Filter Existing Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+    project_id = project["id"]
+    track_id = project["tracks"][0]["id"]
+
+    artifact = SpeechFilterArtifact(
+        project_id=project_id,
+        track_id=track_id,
+        filename="IMG_6157.MOV",
+        status="completed",
+        summary="1 suggested cut, about 0.2s total.",
+        cuts=[
+            SpeechFilterCut(
+                start=0.4,
+                end=0.6,
+                duration=0.2,
+                reason="filler_word",
+                transcript="uh",
+                confidence=0.91,
+            )
+        ],
+        generated_at=datetime(2026, 4, 26),
+        source_word_count=4,
+        model="heuristic",
+    )
+    edit_file = project_service.get_track_edit_file(user_id, project_id, track_id)
+    edit_file.parent.mkdir(parents=True, exist_ok=True)
+    edit_file.write_text(json.dumps(artifact.model_dump(mode="json"), indent=2), encoding="utf-8")
+
+    get_response = client.get(
+        f"/api/projects/{project_id}/tracks/{track_id}/speech-filter",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert get_response.status_code == 200
+    payload = get_response.json()
+    assert payload["track_id"] == track_id
+    assert payload["cuts"][0]["transcript"] == "uh"
+
+
+def test_patch_track_speech_filter_updates_saved_artifact(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.models.project import SpeechFilterArtifact, SpeechFilterCut
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "speech-filter-patch@example.com",
+            "password": "password123",
+            "full_name": "Speech Filter Patch User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Speech Filter Patch Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+    project_id = project["id"]
+    track_id = project["tracks"][0]["id"]
+
+    artifact = SpeechFilterArtifact(
+        project_id=project_id,
+        track_id=track_id,
+        filename="IMG_6157.MOV",
+        status="completed",
+        summary="1 suggested cut, about 0.2s total.",
+        cuts=[
+            SpeechFilterCut(
+                start=0.4,
+                end=0.6,
+                duration=0.2,
+                reason="filler_word",
+                transcript="uh",
+                confidence=0.91,
+            )
+        ],
+        generated_at=datetime(2026, 4, 26),
+        source_word_count=4,
+        model="heuristic",
+    )
+    edit_file = project_service.get_track_edit_file(user_id, project_id, track_id)
+    edit_file.parent.mkdir(parents=True, exist_ok=True)
+    edit_file.write_text(json.dumps(artifact.model_dump(mode="json"), indent=2), encoding="utf-8")
+
+    patch_response = client.patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/speech-filter",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "cuts": [
+                {
+                    "start": 1.0,
+                    "end": 1.6,
+                    "duration": 0.6,
+                    "reason": "manual_adjustment",
+                    "transcript": "retry phrase",
+                    "confidence": 1.0,
+                }
+            ]
+        },
+    )
+
+    assert patch_response.status_code == 200
+    payload = patch_response.json()
+    assert payload["cuts"][0]["start"] == 1.0
+    assert payload["cuts"][0]["end"] == 1.6
+
+    stored = json.loads(edit_file.read_text(encoding="utf-8"))
+    assert stored["cuts"][0]["reason"] == "manual_adjustment"
+    assert stored["cuts"][0]["transcript"] == "retry phrase"
+
+
+def test_speech_filter_heuristic_detects_rephrased_restart_after_pause():
+    from backend.app.models.transcription import WordTimestamp
+    from backend.app.services.ai_service import ai_service
+
+    words = [
+        WordTimestamp(word="So", start=44.42, end=44.84),
+        WordTimestamp(word="the", start=44.84, end=45.00),
+        WordTimestamp(word="statement", start=45.00, end=45.44),
+        WordTimestamp(word="is", start=45.44, end=45.96),
+        WordTimestamp(word="usually", start=45.96, end=46.48),
+        WordTimestamp(word="followed", start=46.48, end=46.96),
+        WordTimestamp(word="by", start=46.96, end=47.46),
+        WordTimestamp(word="a", start=47.46, end=47.72),
+        WordTimestamp(word="question.", start=47.72, end=48.18),
+        WordTimestamp(word="So", start=51.74, end=52.00),
+        WordTimestamp(word="again", start=52.00, end=52.28),
+        WordTimestamp(word="when", start=52.28, end=53.42),
+        WordTimestamp(word="you", start=53.42, end=53.64),
+        WordTimestamp(word="have", start=53.64, end=54.10),
+        WordTimestamp(word="a", start=54.10, end=54.96),
+        WordTimestamp(word="problem", start=54.96, end=55.32),
+        WordTimestamp(word="it", start=55.32, end=55.66),
+        WordTimestamp(word="usually", start=55.66, end=56.10),
+        WordTimestamp(word="follows", start=56.10, end=56.56),
+        WordTimestamp(word="with", start=56.56, end=56.88),
+        WordTimestamp(word="the", start=56.88, end=57.04),
+        WordTimestamp(word="solution.", start=57.04, end=57.42),
+    ]
+
+    cuts = ai_service._heuristic_speech_filter_cuts(words, 60.0, min_gap_seconds=1.0)
+    reasons = {cut.reason for cut in cuts}
+
+    assert "long_pause" in reasons
+    assert "rephrased_restart" in reasons
+    repeated = next(cut for cut in cuts if cut.reason == "rephrased_restart")
+    assert repeated.start == 51.74
+    assert repeated.end == 57.42
+
+
+def test_speech_filter_heuristic_includes_leading_and_trailing_silence():
+    from backend.app.models.transcription import WordTimestamp
+    from backend.app.services.ai_service import ai_service
+
+    words = [
+        WordTimestamp(word="Here", start=6.664, end=7.38),
+        WordTimestamp(word="are", start=7.38, end=7.56),
+        WordTimestamp(word="speaker.", start=111.64, end=111.94),
+    ]
+
+    cuts = ai_service._heuristic_speech_filter_cuts(words, 117.0, min_gap_seconds=1.0)
+    reasons = {cut.reason for cut in cuts}
+
+    assert "leading_silence" in reasons
+    assert "trailing_silence" in reasons
+    leading = next(cut for cut in cuts if cut.reason == "leading_silence")
+    trailing = next(cut for cut in cuts if cut.reason == "trailing_silence")
+    assert leading.start == 0.0
+    assert leading.end == 6.664
+    assert trailing.start == 111.94
+    assert trailing.end == 117.0
+
+
+def test_find_gaps_includes_leading_and_trailing_edges():
+    from backend.app.models.transcription import WordTimestamp
+    from backend.app.services.pipeline_service import find_gaps
+
+    words = [
+        WordTimestamp(word="Hello", start=6.664, end=7.38),
+        WordTimestamp(word="world", start=7.38, end=7.56),
+        WordTimestamp(word="done", start=111.64, end=111.94),
+    ]
+
+    gaps = find_gaps(words, 1.0, clip_duration=117.0)
+
+    assert gaps[0].start == 0.0
+    assert gaps[0].end == 6.664
+    assert gaps[-1].start == 111.94
+    assert gaps[-1].end == 117.0
+
+
+def test_align_transcription_to_detected_silence_repairs_broken_edge_timestamps():
+    from backend.app.services.project_service import project_service
+
+    sanitized = {
+        "text": "Here are the most important strategies",
+        "language": "en",
+        "words": [
+            {"word": "Here", "start": 0.0, "end": 7.38, "confidence": 0.639},
+            {"word": "are", "start": 7.38, "end": 7.56, "confidence": 0.974},
+            {"word": "speaker.", "start": 111.64, "end": 117.0, "confidence": 0.986},
+        ],
+        "segments": [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 13.2,
+                "text": "Here are ...",
+                "words": [
+                    {"word": "Here", "start": 0.0, "end": 7.38, "confidence": 0.639},
+                    {"word": "are", "start": 7.38, "end": 7.56, "confidence": 0.974},
+                ],
+            },
+            {
+                "id": 1,
+                "start": 111.24,
+                "end": 117.0,
+                "text": "speaker.",
+                "words": [
+                    {"word": "speaker.", "start": 111.64, "end": 117.0, "confidence": 0.986},
+                ],
+            },
+        ],
+    }
+    silence_ranges = [
+        (0.0, 1.149),
+        (1.181, 1.513),
+        (1.614, 2.460),
+        (2.705, 2.968),
+        (3.416, 6.664),
+        (111.943, 116.615),
+    ]
+
+    aligned = project_service._align_transcription_to_detected_silence(sanitized, silence_ranges, 117.0)
+
+    assert aligned["words"][0]["start"] == 6.664
+    assert aligned["segments"][0]["start"] == 6.664
+    assert aligned["words"][-1]["end"] == 111.943
+    assert aligned["segments"][-1]["end"] == 111.943

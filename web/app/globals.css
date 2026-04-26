@@ -485,6 +485,7 @@ input, select {
 }
 
 .clipMediaWrap {
+  position: relative;
   padding: 12px;
   padding-bottom: 0;
 }
@@ -556,6 +557,50 @@ input, select {
   padding: 14px 16px 16px;
 }
 
+.clipViewControls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 6px;
+}
+
+.clipViewToggle {
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 1px solid #cfdced;
+  border-radius: 999px;
+  background: #f8fbff;
+  color: #4d6279;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.clipViewToggleActive {
+  border-color: #9dc5ea;
+  background: #ecf6ff;
+  color: #135b95;
+}
+
+.clipDayGroups {
+  display: grid;
+  gap: 18px;
+}
+
+.clipDaySection {
+  display: grid;
+  gap: 12px;
+}
+
+.clipDayHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e4edf6;
+}
+
 .clipFileName {
   font-size: 18px;
   line-height: 1.2;
@@ -585,9 +630,21 @@ input, select {
   border-color: #afd0ef;
 }
 
+.clipTagButton {
+  appearance: none;
+  cursor: pointer;
+}
+
 .clipTagMuted {
   color: #66778c;
   background: #f8fafc;
+}
+
+.clipTagWarn {
+  cursor: pointer;
+  color: #b45309;
+  background: #fffbeb;
+  border-color: #f8cf72;
 }
 
 .clipTagProcessing {
@@ -595,6 +652,11 @@ input, select {
   color: #d97706;
   background: #fffbeb;
   border-color: #fde68a;
+}
+
+.clipTranscriptStack {
+  display: grid;
+  gap: 10px;
 }
 
 .clipTranscriptDetails {
@@ -638,6 +700,70 @@ input, select {
 .clipTranscriptText {
   margin: 0;
   line-height: 1.5;
+}
+
+.clipSpeechFilter {
+  display: grid;
+  gap: 10px;
+}
+
+.clipSpeechFilterDetails {
+  display: grid;
+  gap: 10px;
+}
+
+.clipSpeechFilterDetails summary {
+  list-style: none;
+}
+
+.clipSpeechFilterDetails summary::-webkit-details-marker {
+  display: none;
+}
+
+.clipSpeechFilterPanel {
+  border: 1px solid #f0dfb1;
+  border-radius: 16px;
+  background: #fffaf0;
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.clipSpeechFilterSummary {
+  margin: 0;
+}
+
+.clipSpeechFilterList {
+  display: grid;
+  gap: 10px;
+}
+
+.clipSpeechFilterRow {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid #f3e5bf;
+}
+
+.clipSpeechFilterHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: #8a4b08;
+}
+
+.clipSpeechFilterSnippet {
+  color: #5f6f83;
+  line-height: 1.45;
+}
+
+.clipSpeechFilterError {
+  margin: 0;
+  font-size: 13px;
+  color: #b91c1c;
 }
 
 .previewModalBackdrop {
@@ -689,6 +815,185 @@ input, select {
   border-radius: 18px;
   background: #0f1523;
   object-fit: contain;
+}
+
+.speechEditor {
+  display: grid;
+  gap: 14px;
+}
+
+.speechEditorVideoShell {
+  position: relative;
+  border-radius: 18px;
+  overflow: hidden;
+  background: #0f1523;
+  border: 1px solid #dbe5ef;
+}
+
+.speechEditorVideo {
+  width: 100%;
+  max-height: 62vh;
+  display: block;
+  background: #0f1523;
+}
+
+.speechEditorVideoNotice {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(185, 28, 28, 0.86);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.speechEditorControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.speechEditorTime {
+  color: #51667d;
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+
+.speechEditorTimelineWrap {
+  display: grid;
+  gap: 8px;
+}
+
+.speechEditorTimeline {
+  position: relative;
+  height: 54px;
+  border-radius: 16px;
+  background: #f5f9fd;
+  border: 1px solid #dbe5ef;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.speechEditorTimelineBase {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 8px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: #d8e4ef;
+}
+
+.speechEditorTimelinePlayed {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 8px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: #89b6e2;
+}
+
+.speechEditorCut {
+  position: absolute;
+  top: 9px;
+  height: 36px;
+  border: 1px solid rgba(220, 38, 38, 0.44);
+  border-radius: 10px;
+  background: rgba(239, 68, 68, 0.24);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+  cursor: pointer;
+  display: block;
+  padding: 0;
+}
+
+.speechEditorCutSelected {
+  background: rgba(239, 68, 68, 0.34);
+  border-color: rgba(185, 28, 28, 0.8);
+}
+
+.speechEditorCutLabel {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 12px;
+  font-weight: 800;
+  color: #8f2020;
+}
+
+.speechEditorHandle {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 10px;
+  background: rgba(153, 27, 27, 0.92);
+}
+
+.speechEditorHandleStart {
+  left: -1px;
+  border-radius: 10px 0 0 10px;
+}
+
+.speechEditorHandleEnd {
+  right: -1px;
+  border-radius: 0 10px 10px 0;
+}
+
+.speechEditorPlayhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #163b63;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.8);
+}
+
+.speechEditorCutsPanel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 18px;
+  background: #fbfdff;
+  border: 1px solid #dbe5ef;
+}
+
+.speechEditorSummary {
+  display: grid;
+  gap: 4px;
+}
+
+.speechEditorCutList {
+  display: grid;
+  gap: 10px;
+}
+
+.speechEditorCutRow {
+  appearance: none;
+  text-align: left;
+  display: grid;
+  gap: 4px;
+  border: 1px solid #dbe5ef;
+  border-radius: 14px;
+  background: #fff;
+  padding: 12px 14px;
+  cursor: pointer;
+}
+
+.speechEditorCutRowSelected {
+  border-color: #e89f9f;
+  background: #fff6f6;
+}
+
+.speechEditorError {
+  color: #b91c1c;
+  font-size: 13px;
 }
 
 @media (max-width: 1360px) {

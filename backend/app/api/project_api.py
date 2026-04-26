@@ -24,12 +24,24 @@ from ..models.project import (
     ProjectResponse,
     ProjectSettings,
     ProjectUpdateRequest,
+    SpeechFilterArtifact,
+    SpeechFilterUpdateRequest,
 )
 from ..services.project_service import project_service
 from ..services.video_processor import video_processor
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+
+def _is_duplicate_track_upload(project, filename: str, size: int) -> bool:
+    normalized_name = Path(filename).name.lower()
+    for track in project.tracks:
+        existing_name = str(track.filename or "").strip().lower()
+        existing_size = track.metadata.get("size")
+        if existing_name == normalized_name and existing_size == size:
+            return True
+    return False
 
 
 def _resolve_existing_project_path(path_value: str | None, project_id: str, current_user_id: str) -> Path:
@@ -141,10 +153,16 @@ async def list_projects(
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
-async def get_project(project_id: str, current_user=Depends(get_current_user)):
+async def get_project(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+):
     project = await project_service.get_project(project_id, user_id=current_user.id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project_service.project_has_missing_transcripts(project):
+        background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
     return ProjectResponse(project=project, message="Project retrieved successfully")
 
 
@@ -304,11 +322,16 @@ async def add_tracks_to_project(
         raise HTTPException(status_code=404, detail="Project not found")
 
     saved_files: List[str] = []
+    skipped_duplicates = 0
     for upload in files:
         if not upload.filename:
             raise HTTPException(status_code=400, detail="Each file needs a filename")
+        payload = await upload.read()
+        if _is_duplicate_track_upload(project, upload.filename, len(payload)):
+            skipped_duplicates += 1
+            continue
         destination = project_service.reserve_project_video_path(current_user.id, project_id, upload.filename)
-        destination.write_bytes(await upload.read())
+        destination.write_bytes(payload)
         saved_files.append(str(destination))
 
     capture_times = None
@@ -339,6 +362,10 @@ async def add_tracks_to_project(
     await project_service._save_project(project)
     if project_service.project_has_missing_transcripts(project):
         background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
+    if not saved_files and skipped_duplicates:
+        return ProjectResponse(project=project, message="All selected clips were already uploaded")
+    if skipped_duplicates:
+        return ProjectResponse(project=project, message=f"Tracks added successfully ({skipped_duplicates} duplicates skipped)")
     return ProjectResponse(project=project, message="Tracks added successfully")
 
 
@@ -361,6 +388,58 @@ async def transcribe_missing_project_tracks(
         return ProjectResponse(project=project, message="Transcript processing started")
 
     return ProjectResponse(project=project, message="All transcripts already available")
+
+
+@router.get("/{project_id}/tracks/{track_id}/speech-filter", response_model=SpeechFilterArtifact)
+async def get_track_speech_filter(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    artifact = await project_service.get_track_speech_filter(project_id, track_id, user_id=current_user.id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Speech filter suggestions not found")
+    return artifact
+
+
+@router.post("/{project_id}/tracks/{track_id}/speech-filter", response_model=SpeechFilterArtifact)
+async def generate_track_speech_filter(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return await project_service.generate_track_speech_filter(project_id, track_id, user_id=current_user.id)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate speech filter suggestions: {exc}") from exc
+
+
+@router.patch("/{project_id}/tracks/{track_id}/speech-filter", response_model=SpeechFilterArtifact)
+async def update_track_speech_filter(
+    project_id: str,
+    track_id: str,
+    request: SpeechFilterUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return await project_service.update_track_speech_filter(
+            project_id,
+            track_id,
+            [cut.model_dump() for cut in request.cuts],
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update speech filter suggestions: {exc}") from exc
 
 
 @router.get("/{project_id}/tracks/{track_id}/media")
@@ -393,7 +472,12 @@ async def download_project_track_media(project_id: str, track_id: str, current_u
         except RuntimeError as exc:
             logger.warning("Falling back to original track media for %s: %s", track.id, exc)
 
-    return FileResponse(served_path, media_type=media_type or "application/octet-stream", filename=served_filename)
+    return FileResponse(
+        served_path,
+        media_type=media_type or "application/octet-stream",
+        filename=served_filename,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
 
 
 @router.get("/{project_id}/subtitles")

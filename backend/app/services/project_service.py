@@ -6,7 +6,7 @@ import json
 import logging
 import shutil
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +16,7 @@ from ..models.project import (
     Project,
     ProjectCreateRequest,
     ProjectUpdateRequest,
+    SpeechFilterArtifact,
     TrackType,
     VideoTrack,
 )
@@ -24,6 +25,7 @@ from ..services.pipeline_service import (
     build_subtitle_cues,
     find_gaps,
     normalize_words,
+    sanitize_transcription_payload,
     write_subtitles_srt,
     write_word_level_srt,
 )
@@ -36,7 +38,7 @@ logger = logging.getLogger(__name__)
 class ProjectService:
     """Service for managing video editing projects."""
 
-    def __init__(self, projects_dir: str = "backend/projects", temp_dir: str = "temp"):
+    def __init__(self, projects_dir: str = "projects", temp_dir: str = "temp"):
         self.projects_dir = Path(projects_dir)
         self.temp_dir = Path(temp_dir)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
@@ -143,9 +145,18 @@ class ProjectService:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
+    def get_project_edits_dir(self, user_id: str, project_id: str) -> Path:
+        directory = self.get_project_dir(user_id, project_id, create=True) / "edits"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def get_track_edit_file(self, user_id: str, project_id: str, track_id: str) -> Path:
+        return self.get_project_edits_dir(user_id, project_id) / f"{track_id}.json"
+
     async def get_project(self, project_id: str, user_id: Optional[str] = None) -> Optional[Project]:
         cached = self.projects.get(project_id)
         if cached and (not user_id or cached.user_id == user_id):
+            await self._sanitize_existing_project_state(cached)
             return cached
 
         candidate_files: List[Path] = []
@@ -157,6 +168,7 @@ class ProjectService:
         for project_file in candidate_files:
             if project_file.exists():
                 project = await self._load_project(project_file)
+                await self._sanitize_existing_project_state(project)
                 self.projects[project_id] = project
                 if not user_id or project.user_id == user_id:
                     return project
@@ -225,9 +237,219 @@ class ProjectService:
 
         for project_file in candidate_files:
             project = await self._load_project(project_file)
+            await self._sanitize_existing_project_state(project)
             self.projects[project.id] = project
             projects.append(project)
         return sorted(projects, key=lambda p: p.updated_at, reverse=True)
+
+    async def _sanitize_existing_project_state(self, project: Project) -> bool:
+        changed = False
+        processor = VideoProcessor()
+        for track in project.tracks:
+            refreshed_recorded_at = await self._refresh_track_recorded_at_from_media_info(
+                project,
+                track,
+                processor=processor,
+            )
+            if refreshed_recorded_at:
+                changed = True
+
+            if not self._track_is_transcribable(track):
+                continue
+
+            sanitized = sanitize_transcription_payload(track.transcription or {}, track.duration)
+            silence_source = str(track.metadata.get("audio_path") or track.file_path or "")
+            if silence_source:
+                try:
+                    silence_ranges = await processor.detect_silence_ranges(silence_source)
+                    sanitized = self._align_transcription_to_detected_silence(
+                        sanitized,
+                        silence_ranges,
+                        track.duration,
+                    )
+                except Exception:
+                    pass
+            words = normalize_words(sanitized.get("words") or [])
+            sanitized_transcription = (
+                {
+                    "text": sanitized.get("text", ""),
+                    "words": [word.model_dump() for word in words],
+                    "language": sanitized.get("language", "en"),
+                    "segments": sanitized.get("segments", []),
+                }
+                if (sanitized.get("text") or words)
+                else None
+            )
+            next_has_voice = bool(words)
+            next_gap_ranges = find_gaps(words, project.settings.min_gap_seconds, clip_duration=track.duration)
+            existing_status = self._get_track_transcript_status(track)
+            if sanitized_transcription:
+                next_status = "completed"
+            elif existing_status in {"pending", "processing", "error"}:
+                next_status = existing_status
+            else:
+                next_status = "pending"
+
+            if track.transcription != sanitized_transcription:
+                track.transcription = sanitized_transcription
+                changed = True
+            if track.has_voice != next_has_voice:
+                track.has_voice = next_has_voice
+                changed = True
+            if track.local_gap_ranges != next_gap_ranges:
+                track.local_gap_ranges = next_gap_ranges
+                changed = True
+            if track.metadata.get("transcript_status") != next_status:
+                self._set_track_transcript_status(track, next_status)
+                changed = True
+
+            transcript_path = track.metadata.get("transcript_path")
+            if transcript_path and isinstance(transcript_path, str):
+                candidate = Path(transcript_path)
+                if candidate.exists():
+                    desired_text = (track.transcription or {}).get("text", "")
+                    existing_text = candidate.read_text(encoding="utf-8")
+                    if existing_text != desired_text:
+                        candidate.write_text(desired_text, encoding="utf-8")
+                        changed = True
+
+        sorted_tracks = self._sorted_tracks(project.tracks)
+        if project.tracks != sorted_tracks:
+            project.tracks = sorted_tracks
+            changed = True
+
+        if changed:
+            project.updated_at = datetime.utcnow()
+            await self._save_project(project)
+        return changed
+
+    async def _refresh_track_recorded_at_from_media_info(
+        self,
+        project: Project,
+        track: VideoTrack,
+        *,
+        processor: VideoProcessor,
+    ) -> bool:
+        if not project.user_id:
+            return False
+        if str(track.file_path).startswith("client://"):
+            return False
+
+        media_path = self._resolve_project_media_path(project, track.file_path)
+        if media_path is None:
+            return False
+
+        try:
+            info = await processor.get_video_info(str(media_path))
+        except Exception:
+            return False
+
+        streams = info.get("streams", [])
+        fmt = info.get("format", {})
+        extracted = self._extract_recorded_at_from_media_info(streams, fmt)
+        if extracted is None:
+            return False
+
+        current = track.recorded_at
+        if current is not None:
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            else:
+                current = current.astimezone(timezone.utc)
+
+        if current == extracted:
+            return False
+
+        track.recorded_at = extracted
+        return True
+
+    def _resolve_project_media_path(self, project: Project, path_value: str | None) -> Optional[Path]:
+        if not path_value or not project.user_id:
+            return None
+
+        candidates = [
+            Path(path_value),
+            Path.cwd() / path_value,
+            Path.cwd().parent / path_value,
+            self.get_project_dir(project.user_id, project.id, create=True) / Path(path_value).name,
+            self.get_project_video_dir(project.user_id, project.id) / Path(path_value).name,
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    @classmethod
+    def _align_transcription_to_detected_silence(
+        cls,
+        sanitized: Dict[str, Any],
+        silence_ranges: List[tuple[float, float]],
+        clip_duration: float,
+    ) -> Dict[str, Any]:
+        words = [dict(word) for word in (sanitized.get("words") or [])]
+        segments = [dict(segment) for segment in (sanitized.get("segments") or [])]
+        if not words:
+            return sanitized
+
+        next_anchor = float(words[1].get("start", words[0].get("end", 0.0))) if len(words) > 1 else clip_duration
+        leading_onset = cls._infer_leading_speech_onset(silence_ranges, next_anchor)
+        first_start = float(words[0].get("start", 0.0))
+        first_end = float(words[0].get("end", 0.0))
+        first_duration = max(0.0, first_end - first_start)
+        should_fix_leading = (
+            first_start <= 0.05
+            or (
+                leading_onset is not None
+                and leading_onset > first_start + 0.25
+                and first_duration > 2.0
+            )
+        )
+        if leading_onset is not None and should_fix_leading:
+            if leading_onset < float(words[0].get("end", 0.0)) - 0.05:
+                words[0]["start"] = round(leading_onset, 3)
+                if segments:
+                    segments[0]["start"] = round(max(float(segments[0].get("start", 0.0)), leading_onset), 3)
+                    if segments[0].get("words"):
+                        segment_words = [dict(word) for word in segments[0]["words"]]
+                        segment_words[0]["start"] = round(leading_onset, 3)
+                        segments[0]["words"] = segment_words
+
+        previous_anchor = float(words[-2].get("end", words[-1].get("start", 0.0))) if len(words) > 1 else 0.0
+        trailing_cutoff = cls._infer_trailing_speech_end(silence_ranges, previous_anchor, clip_duration)
+        if trailing_cutoff is not None and float(words[-1].get("end", 0.0)) > trailing_cutoff + 0.05:
+            if trailing_cutoff > float(words[-1].get("start", 0.0)) + 0.05:
+                words[-1]["end"] = round(trailing_cutoff, 3)
+                if segments:
+                    segments[-1]["end"] = round(min(float(segments[-1].get("end", clip_duration)), trailing_cutoff), 3)
+                    if segments[-1].get("words"):
+                        segment_words = [dict(word) for word in segments[-1]["words"]]
+                        segment_words[-1]["end"] = round(trailing_cutoff, 3)
+                        segments[-1]["words"] = segment_words
+
+        sanitized["words"] = words
+        sanitized["segments"] = segments
+        return sanitized
+
+    @staticmethod
+    def _infer_leading_speech_onset(silence_ranges: List[tuple[float, float]], next_anchor: float) -> Optional[float]:
+        if next_anchor <= 0.5:
+            return None
+        candidates = [end for _, end in silence_ranges if end < next_anchor - 0.05]
+        return max(candidates) if candidates else None
+
+    @staticmethod
+    def _infer_trailing_speech_end(
+        silence_ranges: List[tuple[float, float]],
+        previous_anchor: float,
+        clip_duration: float,
+    ) -> Optional[float]:
+        candidates = [
+            start
+            for start, end in silence_ranges
+            if start > previous_anchor + 0.05 and end <= clip_duration + 0.25
+        ]
+        return min(candidates) if candidates else None
 
     async def process_project(self, project_id: str, user_id: Optional[str] = None) -> Project:
         project = await self.get_project(project_id, user_id=user_id)
@@ -255,6 +477,169 @@ class ProjectService:
             await self._save_project(project)
 
         return project
+
+    async def get_track_speech_filter(
+        self,
+        project_id: str,
+        track_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Optional[SpeechFilterArtifact]:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project or not project.user_id:
+            return None
+
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track:
+            return None
+
+        artifact_path = self.get_track_edit_file(project.user_id, project.id, track_id)
+        if not artifact_path.exists():
+            return None
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        return SpeechFilterArtifact(**payload)
+
+    async def generate_track_speech_filter(
+        self,
+        project_id: str,
+        track_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> SpeechFilterArtifact:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project or not project.user_id:
+            raise ValueError("Project not found")
+
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track:
+            raise ValueError("Track not found")
+
+        words = normalize_words((track.transcription or {}).get("words", []))
+        if not words:
+            raise ValueError("Transcript is required before speech filtering")
+
+        track.metadata["speech_filter_status"] = "processing"
+        project.updated_at = datetime.utcnow()
+        await self._save_project(project)
+
+        try:
+            artifact = await ai_service.suggest_speech_filter_cuts(
+                project_id=project.id,
+                track_id=track.id,
+                filename=track.filename,
+                words=words,
+                duration=float(track.duration or 0.0),
+                min_gap_seconds=float(project.settings.min_gap_seconds or 1.0),
+            )
+        except Exception as exc:
+            track.metadata["speech_filter_status"] = "error"
+            track.metadata["speech_filter_error"] = str(exc)
+            project.updated_at = datetime.utcnow()
+            await self._save_project(project)
+            raise
+
+        return await self._persist_track_speech_filter(project, track, artifact)
+
+    async def update_track_speech_filter(
+        self,
+        project_id: str,
+        track_id: str,
+        cuts: List[Dict[str, Any]] | List[Any],
+        *,
+        user_id: Optional[str] = None,
+    ) -> SpeechFilterArtifact:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project or not project.user_id:
+            raise ValueError("Project not found")
+
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track:
+            raise ValueError("Track not found")
+
+        existing = await self.get_track_speech_filter(project_id, track_id, user_id=user_id)
+        model_name = existing.model if existing else str(track.metadata.get("speech_filter_model") or "manual")
+        normalized_cuts = self._normalize_manual_speech_filter_cuts(cuts, track.duration)
+        artifact = SpeechFilterArtifact(
+            project_id=project.id,
+            track_id=track.id,
+            filename=track.filename,
+            status="completed",
+            summary=self._summarize_speech_filter_cuts(normalized_cuts),
+            cuts=normalized_cuts,
+            source_word_count=len(normalize_words((track.transcription or {}).get("words", []))),
+            model=model_name,
+        )
+        return await self._persist_track_speech_filter(project, track, artifact)
+
+    async def _persist_track_speech_filter(
+        self,
+        project: Project,
+        track: VideoTrack,
+        artifact: SpeechFilterArtifact,
+    ) -> SpeechFilterArtifact:
+        if not project.user_id:
+            raise ValueError("Project owner missing")
+
+        artifact_path = self.get_track_edit_file(project.user_id, project.id, track.id)
+        artifact_path.write_text(json.dumps(artifact.model_dump(mode="json"), indent=2), encoding="utf-8")
+
+        track.metadata["speech_filter_status"] = artifact.status
+        track.metadata["speech_filter_path"] = str(artifact_path)
+        track.metadata["speech_filter_cut_count"] = len(artifact.cuts)
+        track.metadata["speech_filter_model"] = artifact.model
+        track.metadata["speech_filter_generated_at"] = artifact.generated_at.isoformat()
+        track.metadata.pop("speech_filter_error", None)
+        project.updated_at = datetime.utcnow()
+        await self._save_project(project)
+        self.projects[project.id] = project
+        return artifact
+
+    @staticmethod
+    def _summarize_speech_filter_cuts(cuts: List[Any]) -> str:
+        if not cuts:
+            return "No suggested cuts."
+        total = sum(max(0.0, float(cut.duration)) for cut in cuts)
+        return f"{len(cuts)} suggested cut{'s' if len(cuts) != 1 else ''}, about {total:.1f}s total."
+
+    @staticmethod
+    def _normalize_manual_speech_filter_cuts(cuts: List[Dict[str, Any]] | List[Any], duration: float) -> List[Any]:
+        normalized = []
+        for raw in cuts:
+            start = max(0.0, float(getattr(raw, "start", None) if hasattr(raw, "start") else raw.get("start", 0.0)))
+            end = min(float(duration), float(getattr(raw, "end", None) if hasattr(raw, "end") else raw.get("end", 0.0)))
+            if end <= start:
+                continue
+            reason = getattr(raw, "reason", None) if hasattr(raw, "reason") else raw.get("reason", "manual_adjustment")
+            transcript = getattr(raw, "transcript", None) if hasattr(raw, "transcript") else raw.get("transcript", "")
+            confidence = getattr(raw, "confidence", None) if hasattr(raw, "confidence") else raw.get("confidence", 1.0)
+            normalized.append(
+                {
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "duration": round(end - start, 3),
+                    "reason": str(reason or "manual_adjustment"),
+                    "transcript": str(transcript or "").strip(),
+                    "confidence": max(0.0, min(1.0, float(confidence or 1.0))),
+                }
+            )
+        normalized.sort(key=lambda item: (item["start"], item["end"]))
+        merged: List[Dict[str, Any]] = []
+        for item in normalized:
+            if merged and item["start"] < merged[-1]["end"] - 0.01:
+                merged[-1]["end"] = max(merged[-1]["end"], item["end"])
+                merged[-1]["duration"] = round(merged[-1]["end"] - merged[-1]["start"], 3)
+                if item["confidence"] > merged[-1]["confidence"]:
+                    merged[-1]["confidence"] = item["confidence"]
+                if item["reason"] not in merged[-1]["reason"]:
+                    merged[-1]["reason"] = f"{merged[-1]['reason']}+{item['reason']}"
+                if item["transcript"]:
+                    merged[-1]["transcript"] = " ".join(
+                        part for part in [merged[-1]["transcript"], item["transcript"]] if part
+                    ).strip()
+                continue
+            merged.append(item)
+        from ..models.project import SpeechFilterCut
+        return [SpeechFilterCut(**item) for item in merged]
 
     @staticmethod
     def _track_is_transcribable(track: VideoTrack) -> bool:
@@ -353,7 +738,7 @@ class ProjectService:
             track_type = TrackType.VIDEO
 
         stat = file_path_obj.stat()
-        inferred_recorded_at = recorded_at or datetime.fromtimestamp(stat.st_mtime)
+        inferred_recorded_at = recorded_at
 
         metadata: Dict[str, Any] = {
             "filename": file_path_obj.name,
@@ -372,11 +757,16 @@ class ProjectService:
                 streams = info.get("streams", [])
                 fmt = info.get("format", {})
                 duration = float(fmt.get("duration", duration))
+                if inferred_recorded_at is None:
+                    inferred_recorded_at = self._extract_recorded_at_from_media_info(streams, fmt)
                 location = self._extract_location_from_streams(streams, fmt)
                 if location:
                     metadata["location"] = location
             except Exception:
                 pass
+
+        if inferred_recorded_at is None:
+            inferred_recorded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
 
         return VideoTrack(
             id=str(uuid.uuid4()),
@@ -391,10 +781,17 @@ class ProjectService:
 
     @staticmethod
     def _sorted_tracks(tracks: List[VideoTrack]) -> List[VideoTrack]:
+        def _sort_timestamp(value: Optional[datetime]) -> float:
+            if value is None:
+                return float("-inf")
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc).timestamp()
+            return value.timestamp()
+
         ordered = sorted(
             tracks,
             key=lambda t: (
-                t.recorded_at or datetime.min,
+                _sort_timestamp(t.recorded_at),
                 t.position,
                 t.filename,
             ),
@@ -468,38 +865,33 @@ class ProjectService:
             audio_data = handle.read()
         transcription_filename = Path(audio_path).name
         raw_transcription = await transcribe_audio(audio_data, transcription_filename, "en")
-
-        words = normalize_words(
-            raw_transcription.get("words")
-            or [
-                word
-                for segment in raw_transcription.get("segments", [])
-                for word in segment.get("words", [])
-            ]
-        )
+        sanitized = sanitize_transcription_payload(raw_transcription, track.duration)
+        try:
+            silence_ranges = await processor.detect_silence_ranges(audio_path)
+            sanitized = self._align_transcription_to_detected_silence(sanitized, silence_ranges, track.duration)
+        except Exception:
+            pass
+        words = normalize_words(sanitized.get("words", []))
 
         track.has_voice = len(words) > 0
-        track.transcription = {
-            "text": raw_transcription.get("text") or raw_transcription.get("transcript") or "",
-            "words": [word.model_dump() for word in words],
-            "language": raw_transcription.get("language", "en"),
-            "segments": raw_transcription.get("segments", []),
-        }
-        track.local_gap_ranges = find_gaps(words, project.settings.min_gap_seconds)
+        track.transcription = (
+            {
+                "text": sanitized.get("text", ""),
+                "words": [word.model_dump() for word in words],
+                "language": sanitized.get("language", "en"),
+                "segments": sanitized.get("segments", []),
+            }
+            if words or sanitized.get("text")
+            else None
+        )
+        track.local_gap_ranges = find_gaps(words, project.settings.min_gap_seconds, clip_duration=track.duration)
         transcript_text_path = self._reserve_named_output(transcript_dir, Path(track.filename).stem, ".txt")
-        transcript_text_path.write_text(track.transcription["text"], encoding="utf-8")
+        transcript_text_path.write_text((track.transcription or {}).get("text", ""), encoding="utf-8")
         track.metadata["transcript_path"] = str(transcript_text_path)
 
     def _create_track_from_hybrid_input(self, track: HybridTrackInput, position: int) -> VideoTrack:
-        transcription = track.transcription or {}
-        words = normalize_words(
-            transcription.get("words")
-            or [
-                word
-                for segment in transcription.get("segments", [])
-                for word in segment.get("words", [])
-            ]
-        )
+        transcription = sanitize_transcription_payload(track.transcription or {}, float(track.duration or 0.0))
+        words = normalize_words(transcription.get("words") or [])
 
         duration = float(track.duration or 0.0)
         if duration <= 0 and words:
@@ -511,7 +903,7 @@ class ProjectService:
             "proxy_reference": track.proxy_reference,
             "source_reference": track.source_reference,
             "shot_boundaries": track.shot_boundaries,
-            "transcript_status": "completed" if transcription else "not_applicable",
+            "transcript_status": "completed" if (transcription.get("text") or words) else "not_applicable",
         }
         metadata.update(track.metadata)
 
@@ -523,14 +915,16 @@ class ProjectService:
             duration=duration,
             position=position,
             metadata=metadata,
-            transcription={
-                "text": transcription.get("text") or transcription.get("transcript") or "",
-                "words": [word.model_dump() for word in words],
-                "language": transcription.get("language", "en"),
-                "segments": transcription.get("segments", []),
-            }
-            if transcription
-            else None,
+            transcription=(
+                {
+                    "text": transcription.get("text") or "",
+                    "words": [word.model_dump() for word in words],
+                    "language": transcription.get("language", "en"),
+                    "segments": transcription.get("segments", []),
+                }
+                if (transcription.get("text") or words)
+                else None
+            ),
             has_voice=bool(words),
             recorded_at=track.recorded_at or datetime.utcnow(),
             local_gap_ranges=[],
@@ -550,12 +944,12 @@ class ProjectService:
                 combined_words.append(
                     word.model_copy(update={"start": word.start + timeline_offset, "end": word.end + timeline_offset})
                 )
-            track.local_gap_ranges = find_gaps(track_words, project.settings.min_gap_seconds)
+            track.local_gap_ranges = find_gaps(track_words, project.settings.min_gap_seconds, clip_duration=track.duration)
             timeline_offset += track.duration
 
         combined_words = sorted(combined_words, key=lambda w: w.start)
         transcript = " ".join(word.word for word in combined_words).strip()
-        gap_ranges = find_gaps(combined_words, project.settings.min_gap_seconds)
+        gap_ranges = find_gaps(combined_words, project.settings.min_gap_seconds, clip_duration=timeline_offset)
 
         if not project.user_id:
             raise ValueError("Project owner missing")
@@ -654,6 +1048,48 @@ class ProjectService:
                 location = _extract_from_tags(tags)
                 if location:
                     return location
+
+        fmt_tags = fmt.get("tags", {})
+        if fmt_tags:
+            return _extract_from_tags(fmt_tags)
+        return None
+
+    @staticmethod
+    def _extract_recorded_at_from_media_info(
+        streams: List[Dict[str, Any]],
+        fmt: Dict[str, Any],
+    ) -> Optional[datetime]:
+        def _parse_datetime(value: Any) -> Optional[datetime]:
+            if not value:
+                return None
+            text = str(value).strip()
+            if not text:
+                return None
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+
+        def _extract_from_tags(tags: Dict[str, Any]) -> Optional[datetime]:
+            for key in (
+                "creation_time",
+                "com.apple.quicktime.creationdate",
+                "com.apple.quicktime.creation_time",
+            ):
+                parsed = _parse_datetime(tags.get(key))
+                if parsed is not None:
+                    return parsed
+            return None
+
+        for stream in streams:
+            tags = stream.get("tags", {})
+            if tags:
+                parsed = _extract_from_tags(tags)
+                if parsed is not None:
+                    return parsed
 
         fmt_tags = fmt.get("tags", {})
         if fmt_tags:

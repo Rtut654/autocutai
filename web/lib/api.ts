@@ -5,6 +5,7 @@ import {
   ProjectListResponse,
   ProjectResponse,
   RenderManifestResponse,
+  SpeechFilterArtifact,
   SubscriptionPlan,
   TimelineResponse,
   User,
@@ -321,5 +322,14 @@ export const api = {
   },
   async requestMissingTranscripts(projectId: string, token?: string) {
     return request<ProjectResponse>(`/api/projects/${projectId}/transcribe-missing`, "POST", token);
+  },
+  async getTrackSpeechFilter(projectId: string, trackId: string, token?: string) {
+    return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "GET", token);
+  },
+  async generateTrackSpeechFilter(projectId: string, trackId: string, token?: string) {
+    return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "POST", token, {});
+  },
+  async updateTrackSpeechFilter(projectId: string, trackId: string, cuts: SpeechFilterArtifact["cuts"], token?: string) {
+    return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "PATCH", token, { cuts });
   },
 };

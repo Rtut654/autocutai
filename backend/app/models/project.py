@@ -77,6 +77,38 @@ class GapRange(BaseModel):
     reason: str = Field(default="silence_gap", description="Reason this interval is removable")
 
 
+class SpeechFilterCut(BaseModel):
+    """A suggested transcript-driven cut range within one track."""
+
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    duration: float = Field(..., description="Cut duration in seconds")
+    reason: str = Field(..., description="Why this region is suggested for removal")
+    transcript: str = Field(default="", description="Words covered by this cut")
+    confidence: float = Field(default=0.5, description="Confidence score from 0 to 1")
+
+
+class SpeechFilterArtifact(BaseModel):
+    """Persisted speech-filter suggestions for a single track."""
+
+    project_id: str = Field(..., description="Project ID")
+    track_id: str = Field(..., description="Track ID")
+    filename: str = Field(..., description="Original filename")
+    status: Literal["completed", "error"] = Field(..., description="Generation result")
+    summary: str = Field(default="", description="Human-readable summary of the suggested cuts")
+    cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Suggested removable ranges")
+    generated_at: datetime = Field(default_factory=datetime.utcnow, description="Artifact creation timestamp")
+    source_word_count: int = Field(default=0, description="Number of words evaluated")
+    model: str = Field(default="heuristic", description="Model/provider used to generate the suggestions")
+    error_message: Optional[str] = Field(default=None, description="Error detail if generation failed")
+
+
+class SpeechFilterUpdateRequest(BaseModel):
+    """Manual edits to persisted speech-filter suggestions."""
+
+    cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Edited removable ranges")
+
+
 class InsertionSuggestion(BaseModel):
     """Recommended insertions to support narration moments."""
 

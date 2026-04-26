@@ -38,6 +38,28 @@ def test_google_login_persists_picture_and_sets_web_cookies(tmp_path):
     assert payload["provider"] == "google"
 
 
+def test_google_login_uses_provider_user_id_as_stable_user_id(tmp_path):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+
+    client = TestClient(app)
+
+    login_response = client.post(
+        "/api/auth/google_login",
+        json={
+            "email": "stable@example.com",
+            "name": "Stable User",
+            "provider_user_id": "103385296343735012789",
+        },
+    )
+
+    assert login_response.status_code == 200
+    assert login_response.json()["user_id"] == "103385296343735012789"
+
+
 def test_refresh_rotates_session_from_cookie(tmp_path):
     from backend.app.main import app
     from backend.app.services.auth_service import auth_service

@@ -7,6 +7,7 @@ from backend.app.models.project import GapRange, TrackType, VideoTrack
 from backend.app.pipeline.audio_track import transcribe_clip
 from backend.app.pipeline.edit_llm import generate_edit_plan
 from backend.app.pipeline.visual_track import describe_uncertain_frames
+from backend.app.services.pipeline_service import sanitize_transcription_payload
 from backend.app.services.video_processor import VideoProcessor
 
 
@@ -193,3 +194,48 @@ def test_combine_tracks_uses_original_files_without_segment_artifacts(monkeypatc
     assert "segment_" not in manifest
     assert "trimmed_" not in manifest
     assert not manifest_path.exists()
+
+
+def test_sanitize_transcription_payload_drops_known_whisper_hallucination_at_clip_end():
+    sanitized = sanitize_transcription_payload(
+        {
+            "text": "Thanks for watching!",
+            "segments": [
+                {
+                    "start": 10.0,
+                    "end": 10.0,
+                    "text": "Thanks for watching!",
+                    "words": [],
+                }
+            ],
+        },
+        clip_duration=10.0,
+    )
+
+    assert sanitized["text"] == ""
+    assert sanitized["words"] == []
+    assert sanitized["segments"] == []
+
+
+def test_sanitize_transcription_payload_keeps_real_short_speech():
+    sanitized = sanitize_transcription_payload(
+        {
+            "text": "keep going",
+            "segments": [
+                {
+                    "start": 2.0,
+                    "end": 2.8,
+                    "text": "keep going",
+                    "words": [
+                        {"text": "keep", "start": 2.0, "end": 2.3},
+                        {"text": "going", "start": 2.35, "end": 2.8},
+                    ],
+                }
+            ],
+        },
+        clip_duration=10.0,
+    )
+
+    assert sanitized["text"] == "keep going"
+    assert [word["word"] for word in sanitized["words"]] == ["keep", "going"]
+    assert sanitized["segments"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
@@ -99,6 +100,47 @@ class VideoProcessor:
         ]
         await self._run_ffmpeg_command(cmd)
         return str(target)
+
+    async def detect_silence_ranges(
+        self,
+        source_path: str | Path,
+        *,
+        noise_db: float = -35.0,
+        min_silence_duration: float = 0.25,
+    ) -> List[tuple[float, float]]:
+        """Detect silence intervals from the audio track of the given media source."""
+        cmd = [
+            self.ffmpeg_path,
+            "-i",
+            str(source_path),
+            "-af",
+            f"silencedetect=noise={noise_db}dB:d={min_silence_duration}",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is required but was not found in PATH") from exc
+
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(stderr.decode() if stderr else "ffmpeg silence detection failed")
+
+        text = stderr.decode("utf-8", errors="replace")
+        silence_starts = [float(value) for value in re.findall(r"silence_start:\s*([0-9.]+)", text)]
+        silence_ends = [float(value) for value in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+
+        ranges: List[tuple[float, float]] = []
+        for start, end in zip(silence_starts, silence_ends):
+            if end > start:
+                ranges.append((start, end))
+        return ranges
 
     async def _process_track(self, track: VideoTrack, project: Project) -> VideoTrack:
         return track
