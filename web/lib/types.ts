@@ -108,6 +108,9 @@ export type VisualPlanPart = {
   scene_objects?: string[];
   placement?: string | null;
   density?: "light" | "medium" | null;
+  palette?: string | null;
+  variant?: string | null;
+  motion_profile?: string | null;
   background_style?: "transparent" | null;
   asset_status: "planned" | "ready" | "error";
   asset_url?: string | null;

@@ -481,6 +481,9 @@ class AIService:
             title = str(item.get("title") or "").strip() or None
             placement = str(item.get("placement") or "").strip() or None
             density = str(item.get("density") or "").strip() or None
+            palette = str(item.get("palette") or "").strip() or None
+            variant = str(item.get("variant") or "").strip() or None
+            motion_profile = str(item.get("motion_profile") or "").strip() or None
             background_style = str(item.get("background_style") or "transparent").strip() or "transparent"
             keywords = item.get("keywords") if isinstance(item.get("keywords"), list) else []
             scene_objects = item.get("scene_objects") if isinstance(item.get("scene_objects"), list) else []
@@ -499,12 +502,15 @@ class AIService:
                     scene_objects=[str(value).strip() for value in scene_objects if str(value).strip()][:6],
                     placement=placement,
                     density=density,
+                    palette=palette,
+                    variant=variant,
+                    motion_profile=motion_profile,
                     background_style=background_style,
                     asset_status=VisualAssetStatus.PLANNED,
                 )
             )
         parts.sort(key=lambda part: (part.start, part.end))
-        return parts
+        return self._diversify_adjacent_animation_kinds(parts)
 
     def _heuristic_visual_plan_parts(
         self,
@@ -534,11 +540,14 @@ class AIService:
                     scene_objects=self._heuristic_scene_objects(text, use_image=use_image),
                     placement=self._heuristic_visual_placement(index=len(parts)),
                     density="light",
+                    palette=self._heuristic_palette(index=len(parts)),
+                    variant=self._heuristic_variant(index=len(parts)),
+                    motion_profile=self._heuristic_motion_profile(index=len(parts)),
                     background_style="transparent",
                     asset_status=VisualAssetStatus.PLANNED,
                 )
             )
-        return parts
+        return self._diversify_adjacent_animation_kinds(parts)
 
     @staticmethod
     def _build_visual_plan_prompt(
@@ -553,22 +562,29 @@ class AIService:
             '{start:number,end:number,text:string,visual_type:"animation"|"web_image",'
             'prompt:string,search_query:string|null,animation_kind:string|null,title:string|null,'
             'keywords:string[],scene_objects:string[],placement:string|null,density:"light"|"medium"|null,'
-            'background_style:"transparent"|null}.'
+            'palette:string|null,variant:string|null,motion_profile:string|null,background_style:"transparent"|null}.'
         )
         rules = (
             "Rules: split into logical thought units around 3-4 seconds. "
             "Prefer animation unless a concrete real-world object/place is better shown by image. "
             "Animations must be transparent overlay concepts, small in-frame, no giant cards, no paragraph text. "
             "Use only a short title and 1-3 keywords. "
-            "Valid animation_kind examples: conversation_flow, step_sequence, compare_problem_solution, object_spotlight, concept_network, process_arrow. "
-            "Valid placement examples: top_left, top_right, lower_left, lower_right, upper_center. "
-            "background_style should be transparent."
+            "Choose animation_kind from a broad library and avoid repeating the same kind in adjacent parts unless the narration truly repeats the same concept. "
+            "Prefer semantic specificity over generic abstractions. "
+            "Valid animation_kind examples: conversation_flow, question_answer, step_sequence, checklist_reveal, compare_problem_solution, object_spotlight, concept_network, process_arrow, timeline_sequence, decision_split, chart_pop, map_pointer, idea_burst, before_after_split, loop_cycle, hierarchy_stack. "
+            "Valid placement examples: top_left, top_right, lower_left, lower_right, upper_center, lower_center. "
+            "Valid palette examples: cool, mint, sunset, mono, neon, editorial, berry, amber. "
+            "Valid motion_profile examples: calm, punchy, drift, elastic, crisp. "
+            "Use variant to differentiate composition within the same family, for example v1-v6. "
+            "background_style must be transparent."
         )
         examples = (
             "Example 1:\n"
-            '{"parts":[{"start":1.2,"end":4.4,"text":"First listen to the customer problem.","visual_type":"animation","prompt":"Two-person conversation overlay with message flow","search_query":null,"animation_kind":"conversation_flow","title":"Listen first","keywords":["Listen","Problem"],"scene_objects":["speaker_a","speaker_b","message_arc"],"placement":"upper_left","density":"light","background_style":"transparent"}]}\n'
+            '{"parts":[{"start":1.2,"end":4.4,"text":"First listen to the customer problem.","visual_type":"animation","prompt":"Two-person conversation overlay with message flow","search_query":null,"animation_kind":"conversation_flow","title":"Listen first","keywords":["Listen","Problem"],"scene_objects":["speaker_a","speaker_b","message_arc"],"placement":"upper_left","density":"light","palette":"cool","variant":"v2","motion_profile":"calm","background_style":"transparent"}]}\n'
             "Example 2:\n"
-            '{"parts":[{"start":7.0,"end":10.5,"text":"Open the laptop dashboard and review the chart.","visual_type":"web_image","prompt":"Editorial laptop dashboard image","search_query":"laptop dashboard analytics chart editorial","animation_kind":null,"title":"Review chart","keywords":["Dashboard","Chart"],"scene_objects":["laptop","chart"],"placement":"lower_right","density":"light","background_style":"transparent"}]}'
+            '{"parts":[{"start":7.0,"end":10.5,"text":"Open the laptop dashboard and review the chart.","visual_type":"web_image","prompt":"Editorial laptop dashboard image","search_query":"laptop dashboard analytics chart editorial","animation_kind":null,"title":"Review chart","keywords":["Dashboard","Chart"],"scene_objects":["laptop","chart"],"placement":"lower_right","density":"light","palette":"editorial","variant":"v1","motion_profile":"crisp","background_style":"transparent"}]}\n'
+            "Example 3:\n"
+            '{"parts":[{"start":10.6,"end":13.9,"text":"Then compare the bad option against the better one.","visual_type":"animation","prompt":"Before-vs-after split overlay with contrasting paths","search_query":null,"animation_kind":"before_after_split","title":"Bad vs better","keywords":["Before","After"],"scene_objects":["left_option","right_option","divider"],"placement":"upper_center","density":"light","palette":"berry","variant":"v4","motion_profile":"punchy","background_style":"transparent"}]}'
         )
         return (
             "You are a motion designer planning narration-synced overlays for a talking-head video.\n"
@@ -580,6 +596,41 @@ class AIService:
             + "\n\n"
             + examples
         )
+
+    @staticmethod
+    def _diversify_adjacent_animation_kinds(parts: Sequence[VisualPlanPart]) -> List[VisualPlanPart]:
+        alternatives = {
+            "conversation_flow": ("question_answer", "concept_network"),
+            "question_answer": ("conversation_flow", "concept_network"),
+            "step_sequence": ("checklist_reveal", "timeline_sequence", "process_arrow"),
+            "checklist_reveal": ("step_sequence", "process_arrow"),
+            "compare_problem_solution": ("decision_split", "before_after_split"),
+            "before_after_split": ("compare_problem_solution", "decision_split"),
+            "object_spotlight": ("chart_pop", "map_pointer", "concept_network"),
+            "concept_network": ("process_arrow", "idea_burst"),
+            "process_arrow": ("timeline_sequence", "checklist_reveal"),
+            "timeline_sequence": ("process_arrow", "step_sequence"),
+            "decision_split": ("compare_problem_solution", "before_after_split"),
+            "chart_pop": ("object_spotlight", "process_arrow"),
+            "map_pointer": ("object_spotlight", "concept_network"),
+            "idea_burst": ("concept_network", "chart_pop"),
+        }
+        diversified: List[VisualPlanPart] = []
+        recent_kinds: List[str] = []
+        for part in parts:
+            if part.visual_type != VisualAssetKind.ANIMATION or not part.animation_kind:
+                diversified.append(part)
+                continue
+            chosen_kind = part.animation_kind
+            if recent_kinds[-2:].count(chosen_kind) >= 1:
+                for candidate in alternatives.get(chosen_kind, ()):
+                    if candidate not in recent_kinds[-2:]:
+                        chosen_kind = candidate
+                        break
+            diversified_part = part if chosen_kind == part.animation_kind else part.model_copy(update={"animation_kind": chosen_kind})
+            diversified.append(diversified_part)
+            recent_kinds.append(chosen_kind)
+        return diversified
 
     @staticmethod
     def _heuristic_visual_prompt(text: str, *, use_image: bool) -> str:
@@ -633,15 +684,46 @@ class AIService:
     @staticmethod
     def _heuristic_animation_kind(text: str) -> str:
         lowered = text.lower()
+        if "before" in lowered or "after" in lowered:
+            return "before_after_split"
         if "conversation" in lowered or "listen" in lowered or "speaker" in lowered:
             return "conversation_flow"
+        if "question" in lowered or "answer" in lowered:
+            return "question_answer"
+        if "checklist" in lowered or "list" in lowered:
+            return "checklist_reveal"
         if "step" in lowered or "first" in lowered or "then" in lowered:
             return "step_sequence"
+        if "timeline" in lowered:
+            return "timeline_sequence"
+        if "decision" in lowered or "choice" in lowered:
+            return "decision_split"
         if "problem" in lowered and "solution" in lowered:
             return "compare_problem_solution"
+        if any(marker in lowered for marker in ("chart", "graph", "metric")):
+            return "chart_pop"
+        if any(marker in lowered for marker in ("map", "city", "country", "place")):
+            return "map_pointer"
         if any(marker in lowered for marker in ("phone", "laptop", "map", "chart", "camera")):
             return "object_spotlight"
+        if any(marker in lowered for marker in ("process", "flow", "pipeline")):
+            return "process_arrow"
         return "concept_network"
+
+    @staticmethod
+    def _heuristic_palette(*, index: int) -> str:
+        palettes = ("cool", "mint", "sunset", "mono", "neon", "editorial", "berry", "amber")
+        return palettes[index % len(palettes)]
+
+    @staticmethod
+    def _heuristic_variant(*, index: int) -> str:
+        variants = ("v1", "v2", "v3", "v4", "v5", "v6")
+        return variants[index % len(variants)]
+
+    @staticmethod
+    def _heuristic_motion_profile(*, index: int) -> str:
+        profiles = ("calm", "punchy", "drift", "elastic", "crisp")
+        return profiles[index % len(profiles)]
 
     @staticmethod
     def _heuristic_image_query(text: str) -> str | None:

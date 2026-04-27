@@ -150,67 +150,144 @@ type VisualAnimationSpec = {
   headline: string;
   chips: string[];
   align: "left" | "right";
-  motif: "conversation" | "steps" | "path" | "spark";
+  palette: "cool" | "mint" | "sunset" | "mono" | "neon" | "editorial" | "berry" | "amber";
+  variant: "v1" | "v2" | "v3" | "v4" | "v5" | "v6";
+  motionProfile: "calm" | "punchy" | "drift" | "elastic" | "crisp";
+  motif:
+    | "conversation_flow"
+    | "question_answer"
+    | "step_sequence"
+    | "checklist_reveal"
+    | "compare_problem_solution"
+    | "object_spotlight"
+    | "concept_network"
+    | "process_arrow"
+    | "timeline_sequence"
+    | "decision_split"
+    | "chart_pop"
+    | "map_pointer"
+    | "idea_burst";
 };
+
+function hashString(value: string): number {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function paletteFromPart(part: VisualPlanPart, seed: number): VisualAnimationSpec["palette"] {
+  const palettes: VisualAnimationSpec["palette"][] = ["cool", "mint", "sunset", "mono", "neon", "editorial", "berry", "amber"];
+  const raw = String(part.palette || "").toLowerCase() as VisualAnimationSpec["palette"];
+  return palettes.includes(raw) ? raw : palettes[seed % palettes.length];
+}
+
+function variantFromPart(part: VisualPlanPart, seed: number): VisualAnimationSpec["variant"] {
+  const variants: VisualAnimationSpec["variant"][] = ["v1", "v2", "v3", "v4", "v5", "v6"];
+  const raw = String(part.variant || "").toLowerCase() as VisualAnimationSpec["variant"];
+  return variants.includes(raw) ? raw : variants[seed % variants.length];
+}
+
+function motionProfileFromPart(part: VisualPlanPart, seed: number): VisualAnimationSpec["motionProfile"] {
+  const profiles: VisualAnimationSpec["motionProfile"][] = ["calm", "punchy", "drift", "elastic", "crisp"];
+  const raw = String(part.motion_profile || "").toLowerCase() as VisualAnimationSpec["motionProfile"];
+  return profiles.includes(raw) ? raw : profiles[seed % profiles.length];
+}
+
+function paletteColors(palette: VisualAnimationSpec["palette"]) {
+  switch (palette) {
+    case "mint":
+      return { primary: "rgba(131,255,218,0.92)", secondary: "rgba(151,193,255,0.82)", accent: "rgba(255,255,255,0.95)", soft: "rgba(131,255,218,0.18)", dark: "rgba(8,26,22,0.84)" };
+    case "sunset":
+      return { primary: "rgba(255,173,113,0.94)", secondary: "rgba(255,126,147,0.82)", accent: "rgba(255,250,240,0.95)", soft: "rgba(255,173,113,0.18)", dark: "rgba(43,22,14,0.84)" };
+    case "mono":
+      return { primary: "rgba(255,255,255,0.92)", secondary: "rgba(182,188,202,0.82)", accent: "rgba(255,255,255,0.96)", soft: "rgba(255,255,255,0.1)", dark: "rgba(20,24,32,0.84)" };
+    case "neon":
+      return { primary: "rgba(124,255,208,0.96)", secondary: "rgba(216,130,255,0.82)", accent: "rgba(255,255,255,0.98)", soft: "rgba(124,255,208,0.16)", dark: "rgba(18,12,30,0.84)" };
+    case "editorial":
+      return { primary: "rgba(224,207,176,0.94)", secondary: "rgba(151,193,255,0.78)", accent: "rgba(255,255,255,0.92)", soft: "rgba(224,207,176,0.16)", dark: "rgba(34,29,23,0.84)" };
+    case "berry":
+      return { primary: "rgba(255,126,147,0.94)", secondary: "rgba(174,140,255,0.8)", accent: "rgba(255,247,250,0.96)", soft: "rgba(255,126,147,0.18)", dark: "rgba(43,16,26,0.84)" };
+    case "amber":
+      return { primary: "rgba(255,205,92,0.96)", secondary: "rgba(255,173,113,0.82)", accent: "rgba(255,252,240,0.96)", soft: "rgba(255,205,92,0.18)", dark: "rgba(45,31,12,0.84)" };
+    default:
+      return { primary: "rgba(151,193,255,0.94)", secondary: "rgba(131,255,218,0.82)", accent: "rgba(255,255,255,0.95)", soft: "rgba(151,193,255,0.18)", dark: "rgba(15,23,42,0.84)" };
+  }
+}
+
+function resolveAlign(part: VisualPlanPart, partIndex: number): "left" | "right" {
+  const placement = String(part.placement || "").toLowerCase();
+  if (placement.includes("right")) return "right";
+  if (placement.includes("left")) return "left";
+  return partIndex % 2 === 0 ? "left" : "right";
+}
+
+function inferMotif(part: VisualPlanPart): VisualAnimationSpec["motif"] {
+  const text = (part.text || "").trim();
+  const prompt = (part.prompt || "").trim();
+  const source = `${prompt} ${text}`.toLowerCase();
+
+  if (source.includes("question") || source.includes("answer")) return "question_answer";
+  if (source.includes("conversation") || source.includes("listen") || source.includes("speaker")) return "conversation_flow";
+  if (source.includes("checklist") || source.includes("list")) return "checklist_reveal";
+  if (source.includes("first") || source.includes("step") || source.includes("then")) return "step_sequence";
+  if (source.includes("timeline") || source.includes("before") || source.includes("after")) return "timeline_sequence";
+  if (source.includes("decision") || source.includes("choice")) return "decision_split";
+  if (source.includes("problem") && source.includes("solution")) return "compare_problem_solution";
+  if (source.includes("chart") || source.includes("graph") || source.includes("metric")) return "chart_pop";
+  if (source.includes("map") || source.includes("city") || source.includes("place") || source.includes("country")) return "map_pointer";
+  if (source.includes("phone") || source.includes("laptop") || source.includes("camera") || source.includes("object")) return "object_spotlight";
+  if (source.includes("process") || source.includes("flow") || source.includes("pipeline")) return "process_arrow";
+  if (source.includes("network") || source.includes("connect")) return "concept_network";
+  return "idea_burst";
+}
+
+function themeForMotif(motif: VisualAnimationSpec["motif"]): VisualAnimationSpec["theme"] {
+  if (motif === "compare_problem_solution" || motif === "decision_split") return "problem";
+  if (motif === "step_sequence" || motif === "checklist_reveal" || motif === "timeline_sequence" || motif === "process_arrow") {
+    return "steps";
+  }
+  if (motif === "chart_pop" || motif === "object_spotlight" || motif === "map_pointer") return "solution";
+  return "insight";
+}
+
+function kickerForMotif(motif: VisualAnimationSpec["motif"]): string {
+  switch (motif) {
+    case "conversation_flow": return "Conversation";
+    case "question_answer": return "Q&A";
+    case "step_sequence": return "Sequence";
+    case "checklist_reveal": return "Checklist";
+    case "compare_problem_solution": return "Problem -> fix";
+    case "object_spotlight": return "Spotlight";
+    case "concept_network": return "Concept map";
+    case "process_arrow": return "Process";
+    case "timeline_sequence": return "Timeline";
+    case "decision_split": return "Decision";
+    case "chart_pop": return "Metrics";
+    case "map_pointer": return "Location";
+    default: return "Visual emphasis";
+  }
+}
 
 function buildAnimationSpec(part: VisualPlanPart, partIndex: number): VisualAnimationSpec {
   const text = (part.text || "").trim();
   const prompt = (part.prompt || "").trim();
-  const source = `${prompt} ${text}`.toLowerCase();
-  const chips = extractKeywords(text || prompt, 3);
-  const headline = (chips.slice(0, 2).join(" / ") || compactSentence(text || prompt, 3)).replace(/\.\.\.$/, "");
-
-  if (source.includes("conversation") || source.includes("listen") || source.includes("speaker")) {
-    return {
-      theme: "insight",
-      kicker: "Conversation",
-      headline,
-      chips: chips.length ? chips.slice(0, 2) : ["Listen", "Reply"],
-      align: partIndex % 2 === 0 ? "left" : "right",
-      motif: "conversation",
-    };
-  }
-
-  if (source.includes("first") || source.includes("step") || source.includes("then")) {
-    return {
-      theme: "steps",
-      kicker: "Sequence",
-      headline,
-      chips: chips.length ? chips.slice(0, 2) : ["Step", "Next"],
-      align: partIndex % 2 === 0 ? "left" : "right",
-      motif: "steps",
-    };
-  }
-
-  if (source.includes("problem") && source.includes("solution")) {
-    return {
-      theme: "problem",
-      kicker: "Problem -> fix",
-      headline,
-      chips: chips.length ? chips.slice(0, 2) : ["Problem", "Solution"],
-      align: partIndex % 2 === 0 ? "left" : "right",
-      motif: "path",
-    };
-  }
-
-  if (source.includes("solution") || source.includes("strategy") || source.includes("important")) {
-    return {
-      theme: "solution",
-      kicker: "Key takeaway",
-      headline,
-      chips: chips.length ? chips.slice(0, 2) : ["Strategy", "Action"],
-      align: partIndex % 2 === 0 ? "right" : "left",
-      motif: "path",
-    };
-  }
+  const seed = hashString(`${part.animation_kind || ""}|${part.title || ""}|${part.text || ""}|${partIndex}`);
+  const motif = (part.animation_kind as VisualAnimationSpec["motif"] | undefined) || inferMotif(part);
+  const chips = (part.keywords?.filter(Boolean)?.slice(0, 3) || extractKeywords(text || prompt, 3));
+  const headline = (String(part.title || "").trim() || chips.slice(0, 2).join(" / ") || compactSentence(text || prompt, 3)).replace(/\.\.\.$/, "");
 
   return {
-    theme: "insight",
-    kicker: "Visual emphasis",
+    theme: themeForMotif(motif),
+    kicker: kickerForMotif(motif),
     headline,
     chips: chips.length ? chips.slice(0, 2) : ["Focus", "Point"],
-    align: partIndex % 2 === 0 ? "left" : "right",
-    motif: "spark",
+    align: resolveAlign(part, partIndex),
+    palette: paletteFromPart(part, seed),
+    variant: variantFromPart(part, seed),
+    motionProfile: motionProfileFromPart(part, seed),
+    motif,
   };
 }
 
@@ -221,43 +298,67 @@ function AnimatedMotif({
   spec: VisualAnimationSpec;
   progress: number;
 }) {
+  const colors = paletteColors(spec.palette);
   const orbit = easeInOutCubic(clamp(progress, 0, 1));
-  const pulse = 0.96 + Math.sin(progress * Math.PI * 2) * 0.035;
+  const pulseBase = spec.motionProfile === "punchy" ? 0.05 : spec.motionProfile === "calm" ? 0.02 : 0.035;
+  const pulse = 0.96 + Math.sin(progress * Math.PI * 2) * pulseBase;
   const draw = easeOutCubic(clamp(progress / 0.7, 0, 1));
+  const variantIndex = Number(spec.variant.slice(1)) || 1;
+  const mirrored = variantIndex % 2 === 0;
+  const shift = (variantIndex - 3) * 6;
 
-  if (spec.motif === "conversation") {
+  if (spec.motif === "conversation_flow") {
     return (
       <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
-        <g transform={`translate(${12 * (1 - orbit)} ${18 * (1 - orbit)})`} opacity={0.92}>
-          <rect x="34" y="22" width="112" height="56" rx="18" fill="rgba(125,177,255,0.18)" stroke="rgba(156,195,255,0.72)" strokeWidth="3" />
-          <path d="M74 78 L64 98 L96 82" fill="rgba(125,177,255,0.18)" stroke="rgba(156,195,255,0.72)" strokeWidth="3" strokeLinejoin="round" />
+        <g transform={mirrored ? "translate(320 0) scale(-1 1)" : undefined}>
+        <g transform={`translate(${12 * (1 - orbit) + shift} ${18 * (1 - orbit)})`} opacity={0.92}>
+          <rect x="34" y="22" width="112" height="56" rx="18" fill={colors.soft} stroke={colors.primary} strokeWidth="3" />
+          <path d="M74 78 L64 98 L96 82" fill={colors.soft} stroke={colors.primary} strokeWidth="3" strokeLinejoin="round" />
         </g>
         <g transform={`translate(${220 - 14 * (1 - orbit)} ${58 + 16 * (1 - orbit)})`} opacity={0.9}>
-          <rect x="-84" y="0" width="102" height="48" rx="16" fill="rgba(113,255,211,0.16)" stroke="rgba(131,255,218,0.78)" strokeWidth="3" />
-          <path d="M-20 48 L-2 68 L-28 56" fill="rgba(113,255,211,0.16)" stroke="rgba(131,255,218,0.78)" strokeWidth="3" strokeLinejoin="round" />
+          <rect x="-84" y="0" width="102" height="48" rx="16" fill={colors.soft} stroke={colors.secondary} strokeWidth="3" />
+          <path d="M-20 48 L-2 68 L-28 56" fill={colors.soft} stroke={colors.secondary} strokeWidth="3" strokeLinejoin="round" />
         </g>
         <g transform={`translate(72 126) scale(${pulse.toFixed(4)})`}>
-          <circle cx="0" cy="0" r="22" fill="rgba(255,255,255,0.9)" />
-          <rect x="-18" y="26" width="52" height="34" rx="17" fill="rgba(255,255,255,0.9)" />
+          <circle cx="0" cy="0" r="22" fill={colors.accent} />
+          <rect x="-18" y="26" width="52" height="34" rx="17" fill={colors.accent} />
         </g>
         <g transform={`translate(238 126) scale(${(1.02 - (pulse - 0.96)).toFixed(4)})`}>
-          <circle cx="0" cy="0" r="22" fill="rgba(255,255,255,0.9)" />
-          <rect x="-34" y="26" width="52" height="34" rx="17" fill="rgba(255,255,255,0.9)" />
+          <circle cx="0" cy="0" r="22" fill={colors.accent} />
+          <rect x="-34" y="26" width="52" height="34" rx="17" fill={colors.accent} />
         </g>
         <path
           d="M120 132 C146 110, 174 110, 202 132"
           fill="none"
-          stroke="rgba(255,255,255,0.85)"
+          stroke={colors.accent}
           strokeWidth="6"
           strokeLinecap="round"
           strokeDasharray="120"
           strokeDashoffset={120 - 120 * draw}
         />
+        </g>
       </svg>
     );
   }
 
-  if (spec.motif === "steps") {
+  if (spec.motif === "question_answer") {
+    const local = easeOutCubic(clamp(progress / 0.35, 0, 1));
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        <g transform={`translate(${38} ${38}) scale(${(0.82 + local * 0.18).toFixed(4)})`} opacity={local}>
+          <circle cx="42" cy="42" r="34" fill={colors.soft} stroke={colors.primary} strokeWidth="4" />
+          <text x="42" y="54" fill={colors.accent} fontSize="46" fontWeight="900" textAnchor="middle">?</text>
+        </g>
+        <g transform={`translate(${182} ${82}) scale(${(0.82 + local * 0.18).toFixed(4)})`} opacity={local}>
+          <circle cx="42" cy="42" r="34" fill={colors.soft} stroke={colors.secondary} strokeWidth="4" />
+          <path d="M22 44 L36 58 L62 28" fill="none" stroke={colors.accent} strokeWidth="8" strokeLinecap="round" strokeLinejoin="round" />
+        </g>
+        <path d="M102 80 C132 72, 156 72, 184 102" fill="none" stroke={colors.accent} strokeWidth="7" strokeLinecap="round" strokeDasharray="120" strokeDashoffset={120 - 120 * draw} />
+      </svg>
+    );
+  }
+
+  if (spec.motif === "step_sequence") {
     return (
       <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
         {[0, 1, 2].map((index) => {
@@ -282,7 +383,24 @@ function AnimatedMotif({
     );
   }
 
-  if (spec.motif === "path") {
+  if (spec.motif === "checklist_reveal") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        {[0, 1, 2].map((index) => {
+          const local = easeOutCubic(clamp((progress - index * 0.09) / 0.22, 0, 1));
+          return (
+            <g key={index} transform={`translate(44 ${40 + index * 42})`} opacity={local}>
+              <rect x="0" y="-10" width="34" height="34" rx="10" fill="rgba(111,255,211,0.18)" stroke="rgba(131,255,218,0.9)" strokeWidth="3" />
+              <path d="M10 7 L16 14 L25 1" fill="none" stroke="rgba(255,255,255,0.94)" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" />
+              <rect x="52" y="-1" width={120 - index * 18} height="10" rx="5" fill="rgba(255,255,255,0.85)" />
+            </g>
+          );
+        })}
+      </svg>
+    );
+  }
+
+  if (spec.motif === "compare_problem_solution") {
     return (
       <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
         <circle cx="68" cy="108" r="30" fill="rgba(255,108,133,0.18)" stroke="rgba(255,126,147,0.84)" strokeWidth="4" />
@@ -303,28 +421,130 @@ function AnimatedMotif({
     );
   }
 
+  if (spec.motif === "decision_split") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        <path d="M160 32 L160 94" fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth="8" strokeLinecap="round" />
+        <path d="M160 94 L100 140" fill="none" stroke="rgba(255,126,147,0.86)" strokeWidth="8" strokeLinecap="round" strokeDasharray="90" strokeDashoffset={90 - 90 * draw} />
+        <path d="M160 94 L222 140" fill="none" stroke="rgba(126,244,203,0.86)" strokeWidth="8" strokeLinecap="round" strokeDasharray="90" strokeDashoffset={90 - 90 * draw} />
+        <circle cx="160" cy="26" r="16" fill="rgba(151,193,255,0.94)" />
+        <circle cx="96" cy="144" r="22" fill="rgba(255,126,147,0.2)" stroke="rgba(255,126,147,0.88)" strokeWidth="4" />
+        <circle cx="226" cy="144" r="22" fill="rgba(126,244,203,0.2)" stroke="rgba(126,244,203,0.88)" strokeWidth="4" />
+      </svg>
+    );
+  }
+
+  if (spec.motif === "timeline_sequence") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        <path d="M38 92 L282 92" fill="none" stroke="rgba(255,255,255,0.72)" strokeWidth="8" strokeLinecap="round" />
+        {[0, 1, 2, 3].map((index) => {
+          const local = easeOutCubic(clamp((progress - index * 0.08) / 0.2, 0, 1));
+          return (
+            <g key={index} transform={`translate(${56 + index * 62} 92)`} opacity={local}>
+              <circle cx="0" cy="0" r="16" fill={index % 2 === 0 ? "rgba(151,193,255,0.96)" : "rgba(126,244,203,0.92)"} />
+              <rect x="-20" y={index % 2 === 0 ? -46 : 28} width="40" height="12" rx="6" fill="rgba(255,255,255,0.84)" />
+            </g>
+          );
+        })}
+      </svg>
+    );
+  }
+
+  if (spec.motif === "object_spotlight") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        <circle cx="160" cy="92" r={44 + orbit * 12} fill="rgba(255,255,255,0.08)" stroke="rgba(151,193,255,0.86)" strokeWidth="3" />
+        <path d="M160 26 L160 56" fill="none" stroke="rgba(255,255,255,0.85)" strokeWidth="7" strokeLinecap="round" />
+        <rect x="122" y="58" width="76" height="68" rx="16" fill="rgba(255,255,255,0.92)" />
+        <circle cx="160" cy="92" r="18" fill="rgba(151,193,255,0.94)" />
+        <rect x="138" y="132" width="44" height="12" rx="6" fill="rgba(255,255,255,0.7)" />
+      </svg>
+    );
+  }
+
+  if (spec.motif === "process_arrow") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        <rect x="32" y="72" width="64" height="36" rx="14" fill="rgba(255,255,255,0.88)" />
+        <rect x="126" y="72" width="64" height="36" rx="14" fill="rgba(151,193,255,0.92)" />
+        <rect x="222" y="72" width="64" height="36" rx="14" fill="rgba(126,244,203,0.9)" />
+        <path d="M96 90 L126 90" fill="none" stroke="rgba(255,255,255,0.88)" strokeWidth="7" strokeLinecap="round" strokeDasharray="36" strokeDashoffset={36 - 36 * draw} />
+        <path d="M190 90 L222 90" fill="none" stroke="rgba(255,255,255,0.88)" strokeWidth="7" strokeLinecap="round" strokeDasharray="38" strokeDashoffset={38 - 38 * draw} />
+      </svg>
+    );
+  }
+
+  if (spec.motif === "chart_pop") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        {[0, 1, 2, 3].map((index) => {
+          const local = easeOutCubic(clamp((progress - index * 0.06) / 0.18, 0, 1));
+          const heights = [44, 74, 58, 96];
+          return (
+            <rect
+              key={index}
+              x={58 + index * 46}
+              y={132 - heights[index] * local}
+              width="26"
+              height={heights[index] * local}
+              rx="8"
+              fill={index === 3 ? "rgba(126,244,203,0.94)" : "rgba(151,193,255,0.92)"}
+            />
+          );
+        })}
+        <path d="M48 132 L272 132" fill="none" stroke="rgba(255,255,255,0.7)" strokeWidth="6" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (spec.motif === "map_pointer") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        <path d="M44 44 C72 20, 124 18, 156 42 S236 54, 274 34 L274 126 C248 146, 200 154, 160 136 S76 122, 44 144 Z" fill="rgba(255,255,255,0.08)" stroke="rgba(151,193,255,0.72)" strokeWidth="3" />
+        <path d="M160 54 C174 54, 186 66, 186 80 C186 102, 160 126, 160 126 C160 126, 134 102, 134 80 C134 66, 146 54, 160 54 Z" fill="rgba(126,244,203,0.94)" />
+        <circle cx="160" cy="80" r="9" fill="rgba(15,23,42,0.84)" />
+        <circle cx={160 + orbit * 28} cy={80 - orbit * 8} r="10" fill="rgba(255,255,255,0.92)" opacity="0.85" />
+      </svg>
+    );
+  }
+
+  if (spec.motif === "concept_network") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        {[[72,96],[134,54],[190,96],[250,62],[224,132]].map(([x, y], index) => {
+          const local = easeOutCubic(clamp((progress - index * 0.05) / 0.22, 0, 1));
+          return (
+            <g key={index} transform={`translate(${x} ${y}) scale(${(0.65 + local * 0.35).toFixed(4)})`} opacity={local}>
+              <circle cx="0" cy="0" r={index === 2 ? 22 : 15} fill={index === 2 ? "rgba(126,244,203,0.92)" : "rgba(151,193,255,0.94)"} />
+            </g>
+          );
+        })}
+        {["M72 96 L134 54","M134 54 L190 96","M190 96 L250 62","M190 96 L224 132","M72 96 L190 96"].map((d, index) => (
+          <path key={index} d={d} fill="none" stroke="rgba(255,255,255,0.72)" strokeWidth="5" strokeLinecap="round" strokeDasharray="90" strokeDashoffset={90 - 90 * draw} />
+        ))}
+      </svg>
+    );
+  }
+
+  if (spec.motif === "idea_burst") {
+    return (
+      <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
+        <circle cx="160" cy="92" r="28" fill="rgba(255,255,255,0.94)" />
+        {[0, 1, 2, 3, 4, 5].map((index) => {
+          const angle = (Math.PI * 2 * index) / 6;
+          const x = 160 + Math.cos(angle) * (34 + orbit * 22);
+          const y = 92 + Math.sin(angle) * (34 + orbit * 22);
+          return <circle key={index} cx={x} cy={y} r={8 + (index % 2) * 3} fill={index % 2 === 0 ? "rgba(151,193,255,0.92)" : "rgba(126,244,203,0.86)"} />;
+        })}
+      </svg>
+    );
+  }
+
   return (
     <svg className="visualOverlayIllustration" viewBox="0 0 320 180" aria-hidden="true">
-      {[0, 1, 2, 3, 4].map((index) => {
-        const local = easeOutCubic(clamp((progress - index * 0.06) / 0.24, 0, 1));
-        const x = [70, 124, 160, 206, 252][index];
-        const y = [110, 78, 120, 70, 110][index];
-        const r = [18, 11, 22, 10, 16][index];
-        return (
-          <g key={index} transform={`translate(${x} ${y}) scale(${(0.5 + local * 0.5).toFixed(4)})`} opacity={local}>
-            <circle cx="0" cy="0" r={r} fill={index % 2 === 0 ? "rgba(255,255,255,0.92)" : "rgba(151,193,255,0.95)"} />
-          </g>
-        );
-      })}
-      <path
-        d="M84 114 C112 88, 138 88, 160 114 S206 140, 236 100"
-        fill="none"
-        stroke="rgba(255,255,255,0.72)"
-        strokeWidth="5"
-        strokeLinecap="round"
-        strokeDasharray="180"
-        strokeDashoffset={180 - 180 * draw}
-      />
+      <circle cx="160" cy="92" r="24" fill="rgba(255,255,255,0.94)" />
+      <path d="M160 50 L160 20 M202 64 L228 42 M202 122 L232 138 M118 122 L90 146 M118 64 L92 42" fill="none" stroke="rgba(151,193,255,0.86)" strokeWidth="7" strokeLinecap="round" strokeDasharray="48" strokeDashoffset={48 - 48 * draw} />
     </svg>
   );
 }

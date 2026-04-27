@@ -10,6 +10,7 @@ backvenv/
 
 # macOS
 .DS_Store
+.env
 
 # Mobile/Web heavy generated folders
 mobile/node_modules/
