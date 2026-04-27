@@ -9,6 +9,7 @@ import {
   SubscriptionPlan,
   TimelineResponse,
   User,
+  VisualPlanArtifact,
 } from "./types";
 import { clearStoredSession, getStoredSession, setStoredSession } from "./session";
 
@@ -331,5 +332,17 @@ export const api = {
   },
   async updateTrackSpeechFilter(projectId: string, trackId: string, cuts: SpeechFilterArtifact["cuts"], token?: string) {
     return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "PATCH", token, { cuts });
+  },
+  async reorderProjectTracks(projectId: string, trackIds: string[], token?: string) {
+    return request<ProjectResponse>(`/api/projects/${projectId}/tracks/reorder`, "PATCH", token, { track_ids: trackIds });
+  },
+  async getTrackVisualPlan(projectId: string, trackId: string, token?: string) {
+    return request<VisualPlanArtifact>(`/api/projects/${projectId}/tracks/${trackId}/visual-plan`, "GET", token);
+  },
+  async generateTrackVisualPlan(projectId: string, trackId: string, token?: string) {
+    return request<VisualPlanArtifact>(`/api/projects/${projectId}/tracks/${trackId}/visual-plan`, "POST", token, {}, 240000);
+  },
+  getTrackVisualAssetUrl(projectId: string, trackId: string, partIndex: number) {
+    return `${getApiBase()}/api/projects/${projectId}/tracks/${trackId}/visual-assets/${partIndex}`;
   },
 };

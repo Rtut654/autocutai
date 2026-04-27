@@ -23,12 +23,15 @@ from ..models.project import (
     ProjectListResponse,
     ProjectResponse,
     ProjectSettings,
+    TrackReorderRequest,
     ProjectUpdateRequest,
     SpeechFilterArtifact,
     SpeechFilterUpdateRequest,
+    VisualPlanArtifact,
 )
 from ..services.project_service import project_service
 from ..services.video_processor import video_processor
+from ..services.visual_worker_service import visual_worker_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -356,7 +359,7 @@ async def add_tracks_to_project(
         )
         project.tracks.append(track)
 
-    project.tracks = project_service._sorted_tracks(project.tracks)
+    project.tracks = project_service._ordered_tracks(project.tracks, project.settings.edit_mode)
     project_service.mark_missing_transcripts_pending(project)
     project.updated_at = datetime.now()
     await project_service._save_project(project)
@@ -367,6 +370,29 @@ async def add_tracks_to_project(
     if skipped_duplicates:
         return ProjectResponse(project=project, message=f"Tracks added successfully ({skipped_duplicates} duplicates skipped)")
     return ProjectResponse(project=project, message="Tracks added successfully")
+
+
+@router.patch("/{project_id}/tracks/reorder", response_model=ProjectResponse)
+async def reorder_project_tracks(
+    project_id: str,
+    request: TrackReorderRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        project = await project_service.reorder_project_tracks(
+            project_id,
+            request.track_ids,
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "Project not found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return ProjectResponse(project=project, message="Track order updated")
 
 
 @router.post("/{project_id}/transcribe-missing", response_model=ProjectResponse)
@@ -440,6 +466,65 @@ async def update_track_speech_filter(
         raise HTTPException(status_code=400, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to update speech filter suggestions: {exc}") from exc
+
+
+@router.get("/{project_id}/tracks/{track_id}/visual-plan", response_model=VisualPlanArtifact)
+async def get_track_visual_plan(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    artifact = await visual_worker_service.get_track_visual_plan(project_id, track_id, user_id=current_user.id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Visual plan not found")
+    return artifact
+
+
+@router.post("/{project_id}/tracks/{track_id}/visual-plan", response_model=VisualPlanArtifact)
+async def generate_track_visual_plan(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return await visual_worker_service.generate_track_visual_plan(project_id, track_id, user_id=current_user.id)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate visual plan: {exc}") from exc
+
+
+@router.get("/{project_id}/tracks/{track_id}/visual-assets/{part_index}")
+async def get_track_visual_asset(
+    project_id: str,
+    track_id: str,
+    part_index: int,
+    current_user=Depends(get_current_user),
+):
+    artifact = await visual_worker_service.get_track_visual_plan(project_id, track_id, user_id=current_user.id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Visual plan not found")
+    if part_index < 0 or part_index >= len(artifact.parts):
+        raise HTTPException(status_code=404, detail="Visual asset not found")
+
+    part = artifact.parts[part_index]
+    if not part.local_path:
+        raise HTTPException(status_code=404, detail="Visual asset not ready")
+
+    asset_path = Path(part.local_path)
+    if not asset_path.exists():
+        raise HTTPException(status_code=404, detail="Visual asset not found")
+
+    media_type, _ = mimetypes.guess_type(asset_path.name)
+    return FileResponse(
+        asset_path,
+        media_type=media_type or "application/octet-stream",
+        filename=asset_path.name,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
 
 
 @router.get("/{project_id}/tracks/{track_id}/media")

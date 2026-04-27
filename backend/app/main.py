@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+import dotenv
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Load local runtime env before importing modules that read env at import time.
+dotenv.load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from .api.auth_api import router as auth_router
 from .api.project_api import router as project_router

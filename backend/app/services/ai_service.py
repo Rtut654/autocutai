@@ -5,11 +5,22 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Iterable, List, Sequence
 
+import dotenv
 import httpx
 
-from ..models.project import InsertionSuggestion, SpeechFilterArtifact, SpeechFilterCut, ZoomPreviewBeat
+from ..models.project import (
+    InsertionSuggestion,
+    SpeechFilterArtifact,
+    SpeechFilterCut,
+    VisualAssetKind,
+    VisualAssetStatus,
+    VisualPlanArtifact,
+    VisualPlanPart,
+    ZoomPreviewBeat,
+)
 from ..models.transcription import WordTimestamp
 
 CONTENT_STOPWORDS = {
@@ -22,6 +33,8 @@ CONTENT_STOPWORDS = {
 
 RESTART_MARKERS = {"so", "again", "well", "actually", "basically", "okay", "ok", "right", "like", "now"}
 
+dotenv.load_dotenv(Path(__file__).resolve().parents[3] / ".env")
+
 
 class AIService:
     def __init__(self) -> None:
@@ -29,6 +42,7 @@ class AIService:
         self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.speech_filter_model = os.getenv("OPENAI_SPEECH_FILTER_MODEL", self.model)
+        self.visual_plan_model = os.getenv("OPENAI_VISUAL_PLAN_MODEL", self.model)
 
     async def suggest_insertions(self, words: List[WordTimestamp], max_items: int = 8) -> List[InsertionSuggestion]:
         if not words:
@@ -338,6 +352,313 @@ class AIService:
         if not units:
             units.append((words[0].start, min(duration, words[-1].end), " ".join(word.word for word in words)))
         return units
+
+    def _build_visual_planning_units(
+        self,
+        words: Sequence[WordTimestamp],
+        duration: float,
+        *,
+        transcript_segments: Sequence[dict] | None = None,
+    ) -> List[tuple[float, float, str]]:
+        units = [
+            (beat.start, beat.end, beat.text)
+            for beat in self._heuristic_zoom_beats(words, duration, transcript_segments=transcript_segments)
+        ]
+        if not units:
+            units = self._build_zoom_units_from_words(words, duration)
+        return units[:40]
+
+    async def suggest_visual_plan(
+        self,
+        *,
+        project_id: str,
+        track_id: str,
+        filename: str,
+        words: Sequence[WordTimestamp],
+        transcript_segments: Sequence[dict] | None = None,
+        duration: float,
+    ) -> VisualPlanArtifact:
+        heuristic_parts = self._heuristic_visual_plan_parts(words, duration, transcript_segments=transcript_segments)
+        heuristic_artifact = VisualPlanArtifact(
+            project_id=project_id,
+            track_id=track_id,
+            filename=filename,
+            status="completed",
+            summary=self._build_visual_plan_summary(heuristic_parts),
+            parts=heuristic_parts,
+            source_word_count=len(words),
+            model="heuristic",
+        )
+
+        if not words or not self.api_key:
+            return heuristic_artifact
+
+        planning_units = self._build_visual_planning_units(words, duration, transcript_segments=transcript_segments)
+        prompt_lines = [f"{idx + 1}. {start:.2f}-{end:.2f}: {text}" for idx, (start, end, text) in enumerate(planning_units)]
+        segment_hint_lines = []
+        for idx, segment in enumerate(transcript_segments or []):
+            if not isinstance(segment, dict):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                seg_start = float(segment.get("start", 0.0) or 0.0)
+                seg_end = float(segment.get("end", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            segment_hint_lines.append(f"{idx + 1}. {seg_start:.2f}-{seg_end:.2f}: {text}")
+
+        prompt = self._build_visual_plan_prompt(
+            filename=filename,
+            duration=duration,
+            prompt_lines=prompt_lines,
+            segment_hint_lines=segment_hint_lines,
+        )
+
+        payload = {
+            "model": self.visual_plan_model,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "You are a motion designer planning script-synced explainer visuals."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                response = await client.post(f"{self.base_url}/chat/completions", json=payload, headers=headers)
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+            data = json.loads(content)
+            raw_parts = data.get("parts") if isinstance(data, dict) else None
+            parts = self._sanitize_visual_plan_parts(raw_parts, words, duration)
+            if not parts:
+                return heuristic_artifact
+            return VisualPlanArtifact(
+                project_id=project_id,
+                track_id=track_id,
+                filename=filename,
+                status="completed",
+                summary=self._build_visual_plan_summary(parts),
+                parts=parts,
+                source_word_count=len(words),
+                model=self.visual_plan_model,
+            )
+        except Exception:
+            return heuristic_artifact
+
+    def _sanitize_visual_plan_parts(
+        self,
+        raw_parts: object,
+        words: Sequence[WordTimestamp],
+        duration: float,
+    ) -> List[VisualPlanPart]:
+        if not isinstance(raw_parts, list):
+            return []
+        parts: List[VisualPlanPart] = []
+        for item in raw_parts:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = max(0.0, float(item["start"]))
+                end = min(float(duration), float(item["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end - start < 1.0 or end <= start:
+                continue
+            visual_type_raw = str(item.get("visual_type") or VisualAssetKind.ANIMATION.value)
+            try:
+                visual_type = VisualAssetKind(visual_type_raw)
+            except ValueError:
+                visual_type = VisualAssetKind.ANIMATION
+            text = str(item.get("text") or self._transcript_snippet(words, start, end)).strip()
+            prompt = str(item.get("prompt") or text).strip()
+            search_query = item.get("search_query")
+            animation_kind = str(item.get("animation_kind") or "").strip() or None
+            title = str(item.get("title") or "").strip() or None
+            placement = str(item.get("placement") or "").strip() or None
+            density = str(item.get("density") or "").strip() or None
+            background_style = str(item.get("background_style") or "transparent").strip() or "transparent"
+            keywords = item.get("keywords") if isinstance(item.get("keywords"), list) else []
+            scene_objects = item.get("scene_objects") if isinstance(item.get("scene_objects"), list) else []
+            parts.append(
+                VisualPlanPart(
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    duration=round(end - start, 3),
+                    text=text,
+                    visual_type=visual_type,
+                    prompt=prompt,
+                    search_query=str(search_query).strip() if search_query else None,
+                    animation_kind=animation_kind,
+                    title=title,
+                    keywords=[str(value).strip() for value in keywords if str(value).strip()][:4],
+                    scene_objects=[str(value).strip() for value in scene_objects if str(value).strip()][:6],
+                    placement=placement,
+                    density=density,
+                    background_style=background_style,
+                    asset_status=VisualAssetStatus.PLANNED,
+                )
+            )
+        parts.sort(key=lambda part: (part.start, part.end))
+        return parts
+
+    def _heuristic_visual_plan_parts(
+        self,
+        words: Sequence[WordTimestamp],
+        duration: float,
+        *,
+        transcript_segments: Sequence[dict] | None = None,
+    ) -> List[VisualPlanPart]:
+        beats = self._heuristic_zoom_beats(words, duration, transcript_segments=transcript_segments)
+        parts: List[VisualPlanPart] = []
+        for beat in beats:
+            text = beat.text.strip()
+            search_query = self._heuristic_image_query(text)
+            use_image = bool(search_query)
+            parts.append(
+                VisualPlanPart(
+                    start=beat.start,
+                    end=beat.end,
+                    duration=beat.duration,
+                    text=text,
+                    visual_type=VisualAssetKind.WEB_IMAGE if use_image else VisualAssetKind.ANIMATION,
+                    prompt=self._heuristic_visual_prompt(text, use_image=use_image),
+                    search_query=search_query,
+                    animation_kind=None if use_image else self._heuristic_animation_kind(text),
+                    title=self._heuristic_visual_title(text),
+                    keywords=self._heuristic_visual_keywords(text),
+                    scene_objects=self._heuristic_scene_objects(text, use_image=use_image),
+                    placement=self._heuristic_visual_placement(index=len(parts)),
+                    density="light",
+                    background_style="transparent",
+                    asset_status=VisualAssetStatus.PLANNED,
+                )
+            )
+        return parts
+
+    @staticmethod
+    def _build_visual_plan_prompt(
+        *,
+        filename: str,
+        duration: float,
+        prompt_lines: Sequence[str],
+        segment_hint_lines: Sequence[str],
+    ) -> str:
+        schema = (
+            'Return JSON object {"parts":[...]} only. Each part must include: '
+            '{start:number,end:number,text:string,visual_type:"animation"|"web_image",'
+            'prompt:string,search_query:string|null,animation_kind:string|null,title:string|null,'
+            'keywords:string[],scene_objects:string[],placement:string|null,density:"light"|"medium"|null,'
+            'background_style:"transparent"|null}.'
+        )
+        rules = (
+            "Rules: split into logical thought units around 3-4 seconds. "
+            "Prefer animation unless a concrete real-world object/place is better shown by image. "
+            "Animations must be transparent overlay concepts, small in-frame, no giant cards, no paragraph text. "
+            "Use only a short title and 1-3 keywords. "
+            "Valid animation_kind examples: conversation_flow, step_sequence, compare_problem_solution, object_spotlight, concept_network, process_arrow. "
+            "Valid placement examples: top_left, top_right, lower_left, lower_right, upper_center. "
+            "background_style should be transparent."
+        )
+        examples = (
+            "Example 1:\n"
+            '{"parts":[{"start":1.2,"end":4.4,"text":"First listen to the customer problem.","visual_type":"animation","prompt":"Two-person conversation overlay with message flow","search_query":null,"animation_kind":"conversation_flow","title":"Listen first","keywords":["Listen","Problem"],"scene_objects":["speaker_a","speaker_b","message_arc"],"placement":"upper_left","density":"light","background_style":"transparent"}]}\n'
+            "Example 2:\n"
+            '{"parts":[{"start":7.0,"end":10.5,"text":"Open the laptop dashboard and review the chart.","visual_type":"web_image","prompt":"Editorial laptop dashboard image","search_query":"laptop dashboard analytics chart editorial","animation_kind":null,"title":"Review chart","keywords":["Dashboard","Chart"],"scene_objects":["laptop","chart"],"placement":"lower_right","density":"light","background_style":"transparent"}]}'
+        )
+        return (
+            "You are a motion designer planning narration-synced overlays for a talking-head video.\n"
+            f"{schema}\n{rules}\n\n"
+            f"Clip: {filename}\nDuration: {duration:.2f}s\n\n"
+            + ("Transcript segment hints:\n" + "\n".join(segment_hint_lines) + "\n\n" if segment_hint_lines else "")
+            + "Word timeline:\n"
+            + "\n".join(prompt_lines)
+            + "\n\n"
+            + examples
+        )
+
+    @staticmethod
+    def _heuristic_visual_prompt(text: str, *, use_image: bool) -> str:
+        if use_image:
+            return f"Find a clean supporting editorial image for: {text}"
+        return f"Create a simple kinetic text / explainer animation for: {text}"
+
+    @classmethod
+    def _heuristic_visual_title(cls, text: str) -> str:
+        keywords = cls._heuristic_visual_keywords(text)
+        if keywords:
+            return " / ".join(keywords[:2])
+        cleaned = re.sub(r"[^\w\s]", " ", text)
+        return " ".join(cleaned.split()[:3]).strip().title()
+
+    @classmethod
+    def _heuristic_visual_keywords(cls, text: str) -> List[str]:
+        tokens = []
+        for raw in re.sub(r"[^\w\s-]", " ", text).split():
+            token = raw.strip()
+            if len(token) < 4:
+                continue
+            lowered = token.lower()
+            if lowered in CONTENT_STOPWORDS:
+                continue
+            titled = token.capitalize()
+            if titled not in tokens:
+                tokens.append(titled)
+            if len(tokens) >= 3:
+                break
+        return tokens
+
+    @classmethod
+    def _heuristic_scene_objects(cls, text: str, *, use_image: bool) -> List[str]:
+        lowered = text.lower()
+        if "conversation" in lowered or "listen" in lowered or "speaker" in lowered:
+            return ["speaker_a", "speaker_b", "message_arc"]
+        if "step" in lowered or "first" in lowered or "then" in lowered:
+            return ["step_blocks", "path_arrow"]
+        if "problem" in lowered and "solution" in lowered:
+            return ["problem_icon", "solution_icon", "transition_path"]
+        if use_image:
+            return cls._heuristic_visual_keywords(text)
+        return ["focus_shape", "accent_nodes"]
+
+    @staticmethod
+    def _heuristic_visual_placement(*, index: int) -> str:
+        placements = ("upper_left", "upper_right", "lower_left", "lower_right")
+        return placements[index % len(placements)]
+
+    @staticmethod
+    def _heuristic_animation_kind(text: str) -> str:
+        lowered = text.lower()
+        if "conversation" in lowered or "listen" in lowered or "speaker" in lowered:
+            return "conversation_flow"
+        if "step" in lowered or "first" in lowered or "then" in lowered:
+            return "step_sequence"
+        if "problem" in lowered and "solution" in lowered:
+            return "compare_problem_solution"
+        if any(marker in lowered for marker in ("phone", "laptop", "map", "chart", "camera")):
+            return "object_spotlight"
+        return "concept_network"
+
+    @staticmethod
+    def _heuristic_image_query(text: str) -> str | None:
+        lowered = text.lower()
+        concrete_markers = ("phone", "laptop", "map", "chart", "city", "mountain", "table", "book", "camera")
+        if any(marker in lowered for marker in concrete_markers):
+            cleaned = re.sub(r"[^\w\s]", " ", text)
+            return " ".join(cleaned.split()[:8]).strip() or None
+        return None
+
+    @staticmethod
+    def _build_visual_plan_summary(parts: Sequence[VisualPlanPart]) -> str:
+        if not parts:
+            return "No visual enhancements suggested."
+        animation_count = sum(1 for part in parts if part.visual_type == VisualAssetKind.ANIMATION)
+        image_count = sum(1 for part in parts if part.visual_type == VisualAssetKind.WEB_IMAGE)
+        return f"{len(parts)} visual parts planned: {animation_count} animations, {image_count} web images."
 
     def _sanitize_speech_filter_cuts(
         self,

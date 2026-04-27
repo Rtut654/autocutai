@@ -1231,3 +1231,334 @@ def test_create_track_from_file_sets_orientation_and_dimensions(tmp_path, monkey
     assert track.width == 1080
     assert track.height == 1920
     assert track.orientation == TrackOrientation.VERTICAL
+
+
+def test_project_tracks_default_to_natural_filename_order(tmp_path, monkeypatch):
+    from backend.app.models.project import ProjectCreateRequest, ProjectSettings
+    from backend.app.services.project_service import project_service
+
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    first = tmp_path / "IMG_6158.MOV"
+    second = tmp_path / "IMG_6157.MOV"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+
+    request = ProjectCreateRequest(
+        name="Natural sort",
+        description=None,
+        track_files=[str(first), str(second)],
+        settings=ProjectSettings(),
+    )
+
+    project = asyncio.run(project_service.create_project_with_id("project-natural", request, user_id="user-1"))
+
+    assert [track.filename for track in project.tracks] == ["IMG_6157.MOV", "IMG_6158.MOV"]
+    assert [track.position for track in project.tracks] == [0, 1]
+
+
+def test_reorder_project_tracks_persists_manual_order(tmp_path, monkeypatch):
+    from backend.app.models.project import EditMode, ProjectCreateRequest, ProjectSettings
+    from backend.app.services.project_service import project_service
+
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    paths = []
+    for name in ["IMG_6157.MOV", "IMG_6158.MOV", "IMG_6160.MOV"]:
+        path = tmp_path / name
+        path.write_bytes(name.encode("utf-8"))
+        paths.append(str(path))
+
+    request = ProjectCreateRequest(
+        name="Manual reorder",
+        description=None,
+        track_files=paths,
+        settings=ProjectSettings(),
+    )
+    project = asyncio.run(project_service.create_project_with_id("project-manual", request, user_id="user-1"))
+    target_order = [project.tracks[2].id, project.tracks[0].id, project.tracks[1].id]
+
+    reordered = asyncio.run(project_service.reorder_project_tracks(project.id, target_order, user_id="user-1"))
+
+    assert reordered is not None
+    assert reordered.settings.edit_mode == EditMode.MANUAL
+    assert [track.id for track in reordered.tracks] == target_order
+    assert [track.position for track in reordered.tracks] == [0, 1, 2]
+
+
+def test_reorder_tracks_route_updates_project_positions(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "reorder@example.com",
+            "password": "password123",
+            "full_name": "Reorder User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Reorder Test"},
+        files=[
+            ("files", ("IMG_6158.MOV", b"video-two", "video/quicktime")),
+            ("files", ("IMG_6157.MOV", b"video-one", "video/quicktime")),
+        ],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+    assert [track["filename"] for track in project["tracks"]] == ["IMG_6157.MOV", "IMG_6158.MOV"]
+
+    reordered_ids = [project["tracks"][1]["id"], project["tracks"][0]["id"]]
+    reorder_response = client.patch(
+        f"/api/projects/{project['id']}/tracks/reorder",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"track_ids": reordered_ids},
+    )
+
+    assert reorder_response.status_code == 200
+    payload = reorder_response.json()["project"]
+    assert [track["id"] for track in payload["tracks"]] == reordered_ids
+    assert [track["position"] for track in payload["tracks"]] == [0, 1]
+
+
+def test_track_visual_plan_route_persists_separate_worker_artifact(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.models.project import VisualAssetKind, VisualAssetStatus, VisualPlanArtifact, VisualPlanPart
+    from backend.app.services.ai_service import ai_service
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+    from backend.app.services.visual_worker_service import visual_worker_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    async def fake_suggest_visual_plan(**kwargs):
+        return VisualPlanArtifact(
+            project_id=kwargs["project_id"],
+            track_id=kwargs["track_id"],
+            filename=kwargs["filename"],
+            status="completed",
+            summary="2 visual parts planned: 1 animations, 1 web images.",
+            parts=[
+                VisualPlanPart(
+                    start=0.0,
+                    end=3.2,
+                    duration=3.2,
+                    text="Show the workflow overview",
+                    visual_type=VisualAssetKind.ANIMATION,
+                    prompt="Animated workflow blocks with arrows",
+                    asset_status=VisualAssetStatus.PLANNED,
+                ),
+                VisualPlanPart(
+                    start=3.2,
+                    end=6.5,
+                    duration=3.3,
+                    text="Reference a laptop on desk",
+                    visual_type=VisualAssetKind.WEB_IMAGE,
+                    prompt="Editorial laptop on desk image",
+                    search_query="laptop on desk editorial",
+                    asset_status=VisualAssetStatus.PLANNED,
+                ),
+            ],
+            generated_at=datetime(2026, 4, 26),
+            source_word_count=12,
+            model="visual-test-model",
+        )
+
+    async def fake_materialize(user_id, project_id, artifact):
+        return artifact
+
+    monkeypatch.setattr(ai_service, "suggest_visual_plan", fake_suggest_visual_plan)
+    monkeypatch.setattr(visual_worker_service, "_materialize_web_images", fake_materialize)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "visual-worker@example.com",
+            "password": "password123",
+            "full_name": "Visual Worker User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Visual Worker Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+    project_id = project["id"]
+    track_id = project["tracks"][0]["id"]
+
+    project_file = project_service.get_project_file(user_id, project_id, create=False)
+    stored = json.loads(project_file.read_text(encoding="utf-8"))
+    stored["tracks"][0]["transcription"] = {
+        "text": "Show the workflow overview. Reference a laptop on desk.",
+        "words": [
+            {"word": "Show", "start": 0.0, "end": 0.3},
+            {"word": "workflow", "start": 0.3, "end": 0.7},
+            {"word": "laptop", "start": 3.3, "end": 3.7},
+        ],
+        "language": "en",
+        "segments": [],
+    }
+    stored["tracks"][0]["metadata"]["transcript_status"] = "completed"
+    project_file.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    project_service.projects.clear()
+
+    visual_response = client.post(
+        f"/api/projects/{project_id}/tracks/{track_id}/visual-plan",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert visual_response.status_code == 200
+    payload = visual_response.json()
+    assert payload["model"] == "visual-test-model"
+    assert len(payload["parts"]) == 2
+    assert payload["parts"][1]["visual_type"] == "web_image"
+
+    artifact_path = tmp_path / "projects" / user_id / project_id / "visual_worker" / f"{track_id}.json"
+    assert artifact_path.exists()
+
+    refreshed = json.loads(project_file.read_text(encoding="utf-8"))
+    metadata = refreshed["tracks"][0]["metadata"]
+    assert metadata["visual_worker_status"] == "completed"
+    assert metadata["visual_worker_part_count"] == 2
+    assert metadata["visual_worker_path"] == str(artifact_path)
+
+
+def test_get_track_visual_plan_returns_saved_worker_artifact(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.models.project import VisualAssetKind, VisualAssetStatus, VisualPlanArtifact, VisualPlanPart
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "visual-worker-get@example.com",
+            "password": "password123",
+            "full_name": "Visual Worker Get User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Visual Worker Existing Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    project = create_response.json()["project"]
+    project_id = project["id"]
+    track_id = project["tracks"][0]["id"]
+
+    artifact = VisualPlanArtifact(
+        project_id=project_id,
+        track_id=track_id,
+        filename="IMG_6157.MOV",
+        status="completed",
+        summary="1 visual parts planned: 1 animations, 0 web images.",
+        parts=[
+            VisualPlanPart(
+                start=0.0,
+                end=3.0,
+                duration=3.0,
+                text="Animate the main concept",
+                visual_type=VisualAssetKind.ANIMATION,
+                prompt="Simple explainer animation",
+                asset_status=VisualAssetStatus.READY,
+            )
+        ],
+        generated_at=datetime(2026, 4, 26),
+        source_word_count=4,
+        model="visual-heuristic",
+    )
+    artifact_path = tmp_path / "projects" / user_id / project_id / "visual_worker" / f"{track_id}.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(json.dumps(artifact.model_dump(mode="json"), indent=2), encoding="utf-8")
+
+    get_response = client.get(
+        f"/api/projects/{project_id}/tracks/{track_id}/visual-plan",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert get_response.status_code == 200
+    payload = get_response.json()
+    assert payload["parts"][0]["visual_type"] == "animation"
+    assert payload["parts"][0]["text"] == "Animate the main concept"
+
+
+def test_visual_plan_sanitizer_preserves_structured_animation_metadata():
+    from backend.app.services.ai_service import ai_service
+    from backend.app.models.transcription import WordTimestamp
+
+    words = [
+        WordTimestamp(word="Listen", start=0.0, end=0.4),
+        WordTimestamp(word="to", start=0.4, end=0.6),
+        WordTimestamp(word="the", start=0.6, end=0.7),
+        WordTimestamp(word="customer", start=0.7, end=1.2),
+        WordTimestamp(word="problem", start=1.2, end=1.7),
+    ]
+
+    parts = ai_service._sanitize_visual_plan_parts(
+        [
+            {
+                "start": 0.0,
+                "end": 3.5,
+                "text": "Listen to the customer problem.",
+                "visual_type": "animation",
+                "prompt": "Two-person conversation overlay with message flow",
+                "search_query": None,
+                "animation_kind": "conversation_flow",
+                "title": "Listen first",
+                "keywords": ["Listen", "Problem"],
+                "scene_objects": ["speaker_a", "speaker_b", "message_arc"],
+                "placement": "upper_left",
+                "density": "light",
+                "background_style": "transparent",
+            }
+        ],
+        words,
+        4.0,
+    )
+
+    assert len(parts) == 1
+    part = parts[0]
+    assert part.animation_kind == "conversation_flow"
+    assert part.title == "Listen first"
+    assert part.keywords == ["Listen", "Problem"]
+    assert part.scene_objects == ["speaker_a", "speaker_b", "message_arc"]
+    assert part.placement == "upper_left"
+    assert part.density == "light"
+    assert part.background_style == "transparent"

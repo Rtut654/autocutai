@@ -134,6 +134,58 @@ class SpeechFilterUpdateRequest(BaseModel):
     cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Edited removable ranges")
 
 
+class VisualAssetKind(str, Enum):
+    ANIMATION = "animation"
+    WEB_IMAGE = "web_image"
+
+
+class VisualAssetStatus(str, Enum):
+    PLANNED = "planned"
+    READY = "ready"
+    ERROR = "error"
+
+
+class VisualPlanPart(BaseModel):
+    """A timed visual enhancement aligned to narration."""
+
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    duration: float = Field(..., description="Duration in seconds")
+    text: str = Field(default="", description="Narration text this visual supports")
+    visual_type: VisualAssetKind = Field(default=VisualAssetKind.ANIMATION, description="Animation or image")
+    prompt: str = Field(default="", description="Creative brief for the worker")
+    search_query: Optional[str] = Field(default=None, description="Optional search query for external image sourcing")
+    animation_kind: Optional[str] = Field(default=None, description="Explicit animation motif/category for overlay rendering")
+    title: Optional[str] = Field(default=None, description="Short visual title, usually 1 to 4 words")
+    keywords: List[str] = Field(default_factory=list, description="Short on-screen keywords or tags")
+    scene_objects: List[str] = Field(default_factory=list, description="Named visual objects to render in the scene")
+    placement: Optional[str] = Field(default=None, description="Preferred placement in frame, such as top_left or lower_right")
+    density: Optional[str] = Field(default=None, description="Visual density, usually light or medium")
+    background_style: Optional[str] = Field(default="transparent", description="Background treatment, default transparent")
+    asset_status: VisualAssetStatus = Field(default=VisualAssetStatus.PLANNED, description="Worker result status")
+    asset_url: Optional[str] = Field(default=None, description="Source URL for downloaded image if used")
+    local_path: Optional[str] = Field(default=None, description="Local cached asset path if available")
+    transition_in: Optional[str] = Field(default=None, description="Reserved for future transition style")
+    transition_out: Optional[str] = Field(default=None, description="Reserved for future transition style")
+    sfx: Optional[str] = Field(default=None, description="Reserved for future sound effect cue")
+
+
+class VisualPlanArtifact(BaseModel):
+    """Separate visual worker artifact for script-following animations/images."""
+
+    project_id: str = Field(..., description="Project ID")
+    track_id: str = Field(..., description="Track ID")
+    filename: str = Field(..., description="Original filename")
+    status: Literal["completed", "error"] = Field(..., description="Generation result")
+    summary: str = Field(default="", description="Human-readable summary")
+    parts: List[VisualPlanPart] = Field(default_factory=list, description="Timed visual enhancement plan")
+    generated_at: datetime = Field(default_factory=datetime.utcnow, description="Artifact creation timestamp")
+    source_word_count: int = Field(default=0, description="Number of words evaluated")
+    model: str = Field(default="heuristic", description="Planner model/provider")
+    worker: str = Field(default="visual_enhancement_worker", description="Worker identity")
+    error_message: Optional[str] = Field(default=None, description="Error detail if generation failed")
+
+
 class InsertionSuggestion(BaseModel):
     """Recommended insertions to support narration moments."""
 
@@ -248,6 +300,12 @@ class ProjectUpdateRequest(BaseModel):
     description: Optional[str] = Field(None, description="Project description")
     settings: Optional[ProjectSettings] = Field(None, description="Project settings")
     tracks: Optional[List[VideoTrack]] = Field(None, description="Project tracks")
+
+
+class TrackReorderRequest(BaseModel):
+    """Persisted manual clip order."""
+
+    track_ids: List[str] = Field(..., description="Track IDs in the desired order")
 
 
 class ProjectResponse(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..models.project import (
+    EditMode,
     HybridProjectAnalyzeRequest,
     HybridTrackInput,
     Project,
@@ -82,7 +84,7 @@ class ProjectService:
             user_id=user_id,
         )
 
-        project.tracks = self._sorted_tracks(project.tracks)
+        project.tracks = self._ordered_tracks(project.tracks, project.settings.edit_mode)
         await self._save_project(project)
         self.projects[project_id] = project
         return project
@@ -101,7 +103,7 @@ class ProjectService:
             id=project_id,
             name=request.name,
             description=request.description,
-            tracks=self._sorted_tracks(tracks),
+            tracks=self._ordered_tracks(tracks, request.settings.edit_mode),
             settings=request.settings,
             user_id=user_id,
             status="processing",
@@ -194,9 +196,32 @@ class ProjectService:
         if request.tracks is not None:
             project.tracks = request.tracks
 
+        project.tracks = self._ordered_tracks(project.tracks, project.settings.edit_mode)
         project.updated_at = datetime.utcnow()
         await self._save_project(project)
         self.projects[project_id] = project
+        return project
+
+    async def reorder_project_tracks(
+        self,
+        project_id: str,
+        track_ids: List[str],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Optional[Project]:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project:
+            return None
+
+        current_by_id = {track.id: track for track in project.tracks}
+        if len(track_ids) != len(project.tracks) or set(track_ids) != set(current_by_id.keys()):
+            raise ValueError("Track reorder payload must include every project track exactly once")
+
+        project.settings.edit_mode = EditMode.MANUAL
+        project.tracks = self._normalize_track_positions([current_by_id[track_id] for track_id in track_ids])
+        project.updated_at = datetime.utcnow()
+        await self._save_project(project)
+        self.projects[project.id] = project
         return project
 
     async def delete_project(self, project_id: str, user_id: Optional[str] = None) -> bool:
@@ -322,7 +347,7 @@ class ProjectService:
                         candidate.write_text(desired_text, encoding="utf-8")
                         changed = True
 
-        sorted_tracks = self._sorted_tracks(project.tracks)
+        sorted_tracks = self._ordered_tracks(project.tracks, project.settings.edit_mode)
         if project.tracks != sorted_tracks:
             project.tracks = sorted_tracks
             changed = True
@@ -505,7 +530,7 @@ class ProjectService:
         await self._save_project(project)
 
         try:
-            project.tracks = self._sorted_tracks(project.tracks)
+            project.tracks = self._ordered_tracks(project.tracks, project.settings.edit_mode)
             await self._transcribe_tracks(project)
             await self._build_pipeline(project)
             output_path = await self._generate_final_video(project)
@@ -832,25 +857,49 @@ class ProjectService:
         )
 
     @staticmethod
-    def _sorted_tracks(tracks: List[VideoTrack]) -> List[VideoTrack]:
-        def _sort_timestamp(value: Optional[datetime]) -> float:
-            if value is None:
-                return float("-inf")
-            if value.tzinfo is None:
-                return value.replace(tzinfo=timezone.utc).timestamp()
-            return value.timestamp()
+    def _filename_natural_key(value: str) -> tuple[Any, ...]:
+        parts = re.split(r"(\d+)", value.lower())
+        key: List[Any] = []
+        for part in parts:
+            if not part:
+                continue
+            key.append(int(part) if part.isdigit() else part)
+        return tuple(key)
 
+    @classmethod
+    def _normalize_track_positions(cls, tracks: List[VideoTrack]) -> List[VideoTrack]:
+        for idx, track in enumerate(tracks):
+            track.position = idx
+        return tracks
+
+    @classmethod
+    def _filename_sorted_tracks(cls, tracks: List[VideoTrack]) -> List[VideoTrack]:
         ordered = sorted(
             tracks,
             key=lambda t: (
-                _sort_timestamp(t.recorded_at),
+                cls._filename_natural_key(t.filename or ""),
                 t.position,
-                t.filename,
             ),
         )
-        for idx, track in enumerate(ordered):
-            track.position = idx
-        return ordered
+        return cls._normalize_track_positions(ordered)
+
+    @classmethod
+    def _position_sorted_tracks(cls, tracks: List[VideoTrack]) -> List[VideoTrack]:
+        ordered = sorted(
+            tracks,
+            key=lambda t: (
+                t.position,
+                cls._filename_natural_key(t.filename or ""),
+            ),
+        )
+        return cls._normalize_track_positions(ordered)
+
+    @classmethod
+    def _ordered_tracks(cls, tracks: List[VideoTrack], edit_mode: EditMode | str) -> List[VideoTrack]:
+        mode = edit_mode.value if isinstance(edit_mode, EditMode) else str(edit_mode)
+        if mode == EditMode.MANUAL.value:
+            return cls._position_sorted_tracks(tracks)
+        return cls._filename_sorted_tracks(tracks)
 
     async def _transcribe_tracks(self, project: Project) -> None:
         await self._transcribe_project_tracks(project, persist=False, continue_on_error=False)
@@ -1350,7 +1399,7 @@ class ProjectService:
     async def _save_project(self, project: Project) -> None:
         if not project.user_id:
             raise ValueError("Project owner missing")
-        project_file = self.get_project_file(project.user_id, project.id)
+        project_file = self.get_project_file(project.user_id, project.id, create=True)
         payload = project.model_dump(mode="json")
         project_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

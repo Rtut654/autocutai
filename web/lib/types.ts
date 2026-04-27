@@ -94,6 +94,43 @@ export type SpeechFilterArtifact = {
   error_message?: string | null;
 };
 
+export type VisualPlanPart = {
+  start: number;
+  end: number;
+  duration: number;
+  text: string;
+  visual_type: "animation" | "web_image";
+  prompt: string;
+  search_query?: string | null;
+  animation_kind?: string | null;
+  title?: string | null;
+  keywords?: string[];
+  scene_objects?: string[];
+  placement?: string | null;
+  density?: "light" | "medium" | null;
+  background_style?: "transparent" | null;
+  asset_status: "planned" | "ready" | "error";
+  asset_url?: string | null;
+  local_path?: string | null;
+  transition_in?: string | null;
+  transition_out?: string | null;
+  sfx?: string | null;
+};
+
+export type VisualPlanArtifact = {
+  project_id: string;
+  track_id: string;
+  filename: string;
+  status: "completed" | "error";
+  summary: string;
+  parts: VisualPlanPart[];
+  generated_at: string;
+  source_word_count: number;
+  model: string;
+  worker: string;
+  error_message?: string | null;
+};
+
 export type ProjectTrack = {
   id: string;
   type: string;
