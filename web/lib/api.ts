@@ -7,6 +7,7 @@ import {
   RenderManifestResponse,
   SpeechFilterArtifact,
   SubscriptionPlan,
+  TrackRenderResponse,
   TimelineResponse,
   User,
   VisualPlanArtifact,
@@ -341,6 +342,18 @@ export const api = {
   },
   async generateTrackVisualPlan(projectId: string, trackId: string, token?: string) {
     return request<VisualPlanArtifact>(`/api/projects/${projectId}/tracks/${trackId}/visual-plan`, "POST", token, {}, 240000);
+  },
+  async renderTrack(projectId: string, trackId: string, cuts: SpeechFilterArtifact["cuts"], token?: string) {
+    return request<TrackRenderResponse>(
+      `/api/projects/${projectId}/tracks/${trackId}/render`,
+      "POST",
+      token,
+      { cuts },
+      240000,
+    );
+  },
+  getTrackRenderAssetUrl(projectId: string, trackId: string, versionId: string) {
+    return `${getApiBase()}/api/projects/${projectId}/tracks/${trackId}/renders/${versionId}`;
   },
   getTrackVisualAssetUrl(projectId: string, trackId: string, partIndex: number) {
     return `${getApiBase()}/api/projects/${projectId}/tracks/${trackId}/visual-assets/${partIndex}`;

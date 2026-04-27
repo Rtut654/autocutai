@@ -285,6 +285,94 @@ def test_get_project_queues_backfill_for_pending_track(tmp_path, monkeypatch):
     assert calls == [(project_id, user_id)]
 
 
+def test_render_track_version_persists_version_and_downloads(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+    from backend.app.services.video_processor import VideoProcessor
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    async def fake_get_video_info(self, video_path: str):
+        return {
+            "streams": [],
+            "format": {"duration": "12.0", "tags": {}},
+        }
+
+    async def fake_render_source_segments(self, source_path, segments, output_path):
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(b"rendered-track-version")
+        return str(output_path)
+
+    monkeypatch.setattr(VideoProcessor, "get_video_info", fake_get_video_info)
+    monkeypatch.setattr(VideoProcessor, "render_source_segments", fake_render_source_segments)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "render@example.com",
+            "password": "password123",
+            "full_name": "Render User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Render Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+    project_id = project["id"]
+    track_id = project["tracks"][0]["id"]
+
+    render_response = client.post(
+        f"/api/projects/{project_id}/tracks/{track_id}/render",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "cuts": [
+                {
+                    "start": 1.0,
+                    "end": 2.5,
+                    "duration": 1.5,
+                    "reason": "filler_words",
+                    "transcript": "uh",
+                    "confidence": 0.9,
+                }
+            ]
+        },
+    )
+    assert render_response.status_code == 200
+    version = render_response.json()["version"]
+    assert version["label"].count(".") >= 3
+    assert version["filename"] == f"{version['label']}.mp4"
+    assert version["cut_count"] == 1
+    assert version["duration_after"] == 10.5
+
+    project_response = client.get(
+        f"/api/projects/{project_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert project_response.status_code == 200
+    refreshed_track = project_response.json()["project"]["tracks"][0]
+    assert len(refreshed_track["render_versions"]) == 1
+    assert refreshed_track["render_versions"][0]["id"] == version["id"]
+
+    download_response = client.get(
+        f"/api/projects/{project_id}/tracks/{track_id}/renders/{version['id']}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert download_response.status_code == 200
+    assert download_response.content == b"rendered-track-version"
+
+
 def test_create_project_requires_authenticated_user(tmp_path, monkeypatch):
     from backend.app.main import app
     from backend.app.services.auth_service import auth_service
@@ -1546,7 +1634,11 @@ def test_visual_plan_sanitizer_preserves_structured_animation_metadata():
                 "scene_objects": ["speaker_a", "speaker_b", "message_arc"],
                 "placement": "upper_left",
                 "density": "light",
+                "palette": "cool",
+                "variant": "v2",
+                "motion_profile": "calm",
                 "background_style": "transparent",
+                "sfx": "whoosh_soft",
             }
         ],
         words,
@@ -1561,4 +1653,8 @@ def test_visual_plan_sanitizer_preserves_structured_animation_metadata():
     assert part.scene_objects == ["speaker_a", "speaker_b", "message_arc"]
     assert part.placement == "upper_left"
     assert part.density == "light"
+    assert part.palette == "cool"
+    assert part.variant == "v2"
+    assert part.motion_profile == "calm"
     assert part.background_style == "transparent"
+    assert part.sfx == "whoosh_soft"

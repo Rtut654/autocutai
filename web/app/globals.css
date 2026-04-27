@@ -789,7 +789,7 @@ input, select {
 }
 
 .previewModal {
-  width: min(920px, 100%);
+  width: min(1080px, 100%);
   max-height: min(90vh, 920px);
   overflow: auto;
   border-radius: 24px;
@@ -804,13 +804,60 @@ input, select {
 .previewModalHead {
   display: flex;
   gap: 12px;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
+  flex-wrap: nowrap;
+}
+
+.previewModalActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  flex-wrap: nowrap;
+}
+
+.previewModalVersionLabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.previewModalVersionLabelText {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  transform: translateY(-14px);
+}
+
+.previewModalVersionSelect {
+  min-width: 168px;
+  max-width: 190px;
+  padding: 8px 36px 8px 14px;
+  height: 44px;
+  border-radius: 999px;
+  border: 1px solid #c4d6ea;
+  background: #fff;
+  color: #183153;
+  font: inherit;
+  flex: 0 0 auto;
+}
+
+.previewModalNoVersion {
+  align-self: center;
+  padding: 10px 0 10px 2px;
+  flex: 0 0 auto;
 }
 
 .previewModalClose {
   width: 42px;
   height: 42px;
+  flex: 0 0 auto;
   border-radius: 999px;
   border: 1px solid #dbe5ef;
   background: #fff;
@@ -831,6 +878,33 @@ input, select {
 .speechEditor {
   display: grid;
   gap: 14px;
+}
+
+.speechEditorStatusText {
+  margin-top: -4px;
+}
+
+.speechEditorRenderBar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.speechEditorVersionLabel {
+  display: grid;
+  gap: 4px;
+}
+
+.speechEditorVersionSelect {
+  min-width: 180px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid #c4d6ea;
+  background: #fff;
+  color: #183153;
+  font: inherit;
 }
 
 .speechEditorVideoShell {
@@ -874,6 +948,31 @@ input, select {
   color: #fff;
   font-size: 13px;
   font-weight: 700;
+}
+
+.speechEditorSubtitleWrap {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 22px;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.speechEditorSubtitle {
+  max-width: min(88%, 520px);
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.68);
+  color: #fff;
+  font-size: clamp(14px, 1.6vw, 20px);
+  line-height: 1.18;
+  font-weight: 800;
+  text-align: center;
+  text-wrap: balance;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.2);
 }
 
 .speechEditorZoomNotice {
@@ -980,6 +1079,47 @@ input, select {
   gap: 6px;
 }
 
+.visualOverlayLayoutSplit {
+  gap: 10px;
+}
+
+.visualOverlayLayoutSplit .visualOverlayLabels {
+  gap: 8px;
+}
+
+.visualOverlayLayoutSplit .visualOverlayChipRow {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.visualOverlayLayoutFooter {
+  justify-content: end;
+  gap: 10px;
+}
+
+.visualOverlayLayoutFooter .visualOverlayLabels {
+  width: 100%;
+  justify-items: stretch;
+}
+
+.visualOverlayLayoutFooter .visualOverlayPrompt {
+  max-width: 100%;
+}
+
+.visualOverlayLayoutFooter .visualOverlayChipRow {
+  justify-content: flex-start;
+}
+
+.visualOverlayLayoutBadge {
+  width: min(28%, 150px);
+  gap: 6px;
+}
+
+.visualOverlayLayoutBadge .visualOverlayPrompt {
+  max-width: 10ch;
+  font-size: clamp(12px, 1vw, 16px);
+}
+
 .visualOverlayKicker {
   display: inline-flex;
   padding: 5px 9px;
@@ -1048,6 +1188,26 @@ input, select {
 }
 
 @media (max-width: 640px) {
+  .previewModalHead {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .previewModalActions {
+    width: 100%;
+    justify-content: flex-start;
+    white-space: normal;
+    flex-wrap: wrap;
+  }
+
+  .previewModalVersionSelect {
+    min-width: 150px;
+  }
+
+  .previewModalVersionLabelText {
+    transform: none;
+  }
+
   .visualOverlayAnimationLeft,
   .visualOverlayAnimationRight {
     justify-content: center;
@@ -1061,6 +1221,19 @@ input, select {
   .visualOverlayPrompt {
     font-size: clamp(13px, 3.6vw, 18px);
   }
+
+  .speechEditorSubtitleWrap {
+    left: 12px;
+    right: 12px;
+    bottom: 14px;
+  }
+
+  .speechEditorSubtitle {
+    max-width: 100%;
+    font-size: clamp(13px, 3.9vw, 17px);
+    padding: 8px 12px;
+  }
+
 }
 
 .speechEditorControls {

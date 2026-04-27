@@ -62,6 +62,10 @@ class VideoTrack(BaseModel):
     local_gap_ranges: List["GapRange"] = Field(
         default_factory=list, description="Track-local pause ranges to remove"
     )
+    render_versions: List["TrackRenderVersion"] = Field(
+        default_factory=list,
+        description="Rendered output versions for this track",
+    )
     status: Literal["visible", "hidden"] = Field(default="visible", description="Visibility within the project")
     excluded: bool = Field(default=False, description="Soft-deleted from project (file kept on disk)")
 
@@ -187,6 +191,33 @@ class VisualPlanArtifact(BaseModel):
     model: str = Field(default="heuristic", description="Planner model/provider")
     worker: str = Field(default="visual_enhancement_worker", description="Worker identity")
     error_message: Optional[str] = Field(default=None, description="Error detail if generation failed")
+
+
+class TrackRenderVersion(BaseModel):
+    """A persisted rendered clip version for one track."""
+
+    id: str = Field(..., description="Unique render version ID")
+    label: str = Field(..., description="Human-readable version label")
+    filename: str = Field(..., description="Rendered filename")
+    file_path: str = Field(..., description="Absolute or project-relative render path")
+    created_at: datetime = Field(default_factory=datetime.utcnow, description="Creation timestamp")
+    source: Literal["speech_filter"] = Field(default="speech_filter", description="Source edit pipeline")
+    cut_count: int = Field(default=0, description="Number of cuts applied in this render")
+    duration_before: float = Field(default=0.0, description="Original clip duration")
+    duration_after: float = Field(default=0.0, description="Rendered clip duration")
+
+
+class TrackRenderRequest(BaseModel):
+    """Request payload for rendering the current track edit state."""
+
+    cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Current editable cut ranges")
+
+
+class TrackRenderResponse(BaseModel):
+    """Response payload after rendering a new track version."""
+
+    version: TrackRenderVersion = Field(..., description="Created render version")
+    message: str = Field(..., description="Response message")
 
 
 class InsertionSuggestion(BaseModel):

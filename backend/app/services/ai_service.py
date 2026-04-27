@@ -485,6 +485,7 @@ class AIService:
             variant = str(item.get("variant") or "").strip() or None
             motion_profile = str(item.get("motion_profile") or "").strip() or None
             background_style = str(item.get("background_style") or "transparent").strip() or "transparent"
+            sfx = str(item.get("sfx") or "").strip() or None
             keywords = item.get("keywords") if isinstance(item.get("keywords"), list) else []
             scene_objects = item.get("scene_objects") if isinstance(item.get("scene_objects"), list) else []
             parts.append(
@@ -506,6 +507,7 @@ class AIService:
                     variant=variant,
                     motion_profile=motion_profile,
                     background_style=background_style,
+                    sfx=sfx,
                     asset_status=VisualAssetStatus.PLANNED,
                 )
             )
@@ -544,6 +546,7 @@ class AIService:
                     variant=self._heuristic_variant(index=len(parts)),
                     motion_profile=self._heuristic_motion_profile(index=len(parts)),
                     background_style="transparent",
+                    sfx=self._heuristic_sfx(text, use_image=use_image, index=len(parts)),
                     asset_status=VisualAssetStatus.PLANNED,
                 )
             )
@@ -562,7 +565,7 @@ class AIService:
             '{start:number,end:number,text:string,visual_type:"animation"|"web_image",'
             'prompt:string,search_query:string|null,animation_kind:string|null,title:string|null,'
             'keywords:string[],scene_objects:string[],placement:string|null,density:"light"|"medium"|null,'
-            'palette:string|null,variant:string|null,motion_profile:string|null,background_style:"transparent"|null}.'
+            'palette:string|null,variant:string|null,motion_profile:string|null,background_style:"transparent"|null,sfx:string|null}.'
         )
         rules = (
             "Rules: split into logical thought units around 3-4 seconds. "
@@ -575,16 +578,18 @@ class AIService:
             "Valid placement examples: top_left, top_right, lower_left, lower_right, upper_center, lower_center. "
             "Valid palette examples: cool, mint, sunset, mono, neon, editorial, berry, amber. "
             "Valid motion_profile examples: calm, punchy, drift, elastic, crisp. "
+            "Valid sfx examples: ui_click_soft, ui_click_snap, whoosh_soft, whoosh_rise, pop_air. "
             "Use variant to differentiate composition within the same family, for example v1-v6. "
-            "background_style must be transparent."
+            "background_style must be transparent. "
+            "Choose one subtle transition sound cue for each part."
         )
         examples = (
             "Example 1:\n"
-            '{"parts":[{"start":1.2,"end":4.4,"text":"First listen to the customer problem.","visual_type":"animation","prompt":"Two-person conversation overlay with message flow","search_query":null,"animation_kind":"conversation_flow","title":"Listen first","keywords":["Listen","Problem"],"scene_objects":["speaker_a","speaker_b","message_arc"],"placement":"upper_left","density":"light","palette":"cool","variant":"v2","motion_profile":"calm","background_style":"transparent"}]}\n'
+            '{"parts":[{"start":1.2,"end":4.4,"text":"First listen to the customer problem.","visual_type":"animation","prompt":"Two-person conversation overlay with message flow","search_query":null,"animation_kind":"conversation_flow","title":"Listen first","keywords":["Listen","Problem"],"scene_objects":["speaker_a","speaker_b","message_arc"],"placement":"upper_left","density":"light","palette":"cool","variant":"v2","motion_profile":"calm","background_style":"transparent","sfx":"whoosh_soft"}]}\n'
             "Example 2:\n"
-            '{"parts":[{"start":7.0,"end":10.5,"text":"Open the laptop dashboard and review the chart.","visual_type":"web_image","prompt":"Editorial laptop dashboard image","search_query":"laptop dashboard analytics chart editorial","animation_kind":null,"title":"Review chart","keywords":["Dashboard","Chart"],"scene_objects":["laptop","chart"],"placement":"lower_right","density":"light","palette":"editorial","variant":"v1","motion_profile":"crisp","background_style":"transparent"}]}\n'
+            '{"parts":[{"start":7.0,"end":10.5,"text":"Open the laptop dashboard and review the chart.","visual_type":"web_image","prompt":"Editorial laptop dashboard image","search_query":"laptop dashboard analytics chart editorial","animation_kind":null,"title":"Review chart","keywords":["Dashboard","Chart"],"scene_objects":["laptop","chart"],"placement":"lower_right","density":"light","palette":"editorial","variant":"v1","motion_profile":"crisp","background_style":"transparent","sfx":"ui_click_soft"}]}\n'
             "Example 3:\n"
-            '{"parts":[{"start":10.6,"end":13.9,"text":"Then compare the bad option against the better one.","visual_type":"animation","prompt":"Before-vs-after split overlay with contrasting paths","search_query":null,"animation_kind":"before_after_split","title":"Bad vs better","keywords":["Before","After"],"scene_objects":["left_option","right_option","divider"],"placement":"upper_center","density":"light","palette":"berry","variant":"v4","motion_profile":"punchy","background_style":"transparent"}]}'
+            '{"parts":[{"start":10.6,"end":13.9,"text":"Then compare the bad option against the better one.","visual_type":"animation","prompt":"Before-vs-after split overlay with contrasting paths","search_query":null,"animation_kind":"before_after_split","title":"Bad vs better","keywords":["Before","After"],"scene_objects":["left_option","right_option","divider"],"placement":"upper_center","density":"light","palette":"berry","variant":"v4","motion_profile":"punchy","background_style":"transparent","sfx":"whoosh_rise"}]}'
         )
         return (
             "You are a motion designer planning narration-synced overlays for a talking-head video.\n"
@@ -724,6 +729,21 @@ class AIService:
     def _heuristic_motion_profile(*, index: int) -> str:
         profiles = ("calm", "punchy", "drift", "elastic", "crisp")
         return profiles[index % len(profiles)]
+
+    @classmethod
+    def _heuristic_sfx(cls, text: str, *, use_image: bool, index: int) -> str:
+        if use_image:
+            return "ui_click_soft" if index % 2 == 0 else "whoosh_soft"
+        kind = cls._heuristic_animation_kind(text)
+        if kind in {"question_answer", "checklist_reveal", "chart_pop", "object_spotlight"}:
+            return "ui_click_snap"
+        if kind in {"before_after_split", "compare_problem_solution", "decision_split"}:
+            return "whoosh_rise"
+        if kind in {"conversation_flow", "process_arrow", "timeline_sequence"}:
+            return "whoosh_soft"
+        if kind in {"idea_burst", "concept_network"}:
+            return "pop_air"
+        return "ui_click_soft"
 
     @staticmethod
     def _heuristic_image_query(text: str) -> str | None:

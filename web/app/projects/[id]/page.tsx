@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { api } from "../../../lib/api";
 import { getStoredSession, setLastProjectId } from "../../../lib/session";
-import type { ProjectDetail, ProjectTrack, SpeechFilterArtifact, SpeechFilterCut, TranscriptSegment, VisualPlanArtifact, VisualPlanPart, ZoomPreviewBeat } from "../../../lib/types";
+import type { ProjectDetail, ProjectTrack, SpeechFilterArtifact, SpeechFilterCut, TrackRenderVersion, TranscriptSegment, VisualPlanArtifact, VisualPlanPart, ZoomPreviewBeat } from "../../../lib/types";
 
 type TranscriptStatus = "pending" | "processing" | "completed" | "error" | "not_applicable";
 const MEDIA_BLOB_CACHE_NAME = "bestshotai-track-media-v1";
@@ -150,6 +150,7 @@ type VisualAnimationSpec = {
   headline: string;
   chips: string[];
   align: "left" | "right";
+  layout: "stack" | "split" | "badge" | "footer";
   palette: "cool" | "mint" | "sunset" | "mono" | "neon" | "editorial" | "berry" | "amber";
   variant: "v1" | "v2" | "v3" | "v4" | "v5" | "v6";
   motionProfile: "calm" | "punchy" | "drift" | "elastic" | "crisp";
@@ -168,6 +169,13 @@ type VisualAnimationSpec = {
     | "map_pointer"
     | "idea_burst";
 };
+
+type VisualSfxKind =
+  | "ui_click_soft"
+  | "ui_click_snap"
+  | "whoosh_soft"
+  | "whoosh_rise"
+  | "pop_air";
 
 function hashString(value: string): number {
   let hash = 0;
@@ -270,6 +278,13 @@ function kickerForMotif(motif: VisualAnimationSpec["motif"]): string {
   }
 }
 
+function layoutForMotif(motif: VisualAnimationSpec["motif"], variant: VisualAnimationSpec["variant"]): VisualAnimationSpec["layout"] {
+  if (motif === "chart_pop" || motif === "map_pointer" || motif === "object_spotlight") return "badge";
+  if (motif === "conversation_flow" || motif === "question_answer" || motif === "decision_split") return "split";
+  if (motif === "timeline_sequence" || motif === "process_arrow" || motif === "checklist_reveal") return "footer";
+  return variant === "v5" || variant === "v6" ? "split" : "stack";
+}
+
 function buildAnimationSpec(part: VisualPlanPart, partIndex: number): VisualAnimationSpec {
   const text = (part.text || "").trim();
   const prompt = (part.prompt || "").trim();
@@ -277,6 +292,9 @@ function buildAnimationSpec(part: VisualPlanPart, partIndex: number): VisualAnim
   const motif = (part.animation_kind as VisualAnimationSpec["motif"] | undefined) || inferMotif(part);
   const chips = (part.keywords?.filter(Boolean)?.slice(0, 3) || extractKeywords(text || prompt, 3));
   const headline = (String(part.title || "").trim() || chips.slice(0, 2).join(" / ") || compactSentence(text || prompt, 3)).replace(/\.\.\.$/, "");
+  const palette = paletteFromPart(part, seed);
+  const variant = variantFromPart(part, seed);
+  const motionProfile = motionProfileFromPart(part, seed);
 
   return {
     theme: themeForMotif(motif),
@@ -284,11 +302,98 @@ function buildAnimationSpec(part: VisualPlanPart, partIndex: number): VisualAnim
     headline,
     chips: chips.length ? chips.slice(0, 2) : ["Focus", "Point"],
     align: resolveAlign(part, partIndex),
-    palette: paletteFromPart(part, seed),
-    variant: variantFromPart(part, seed),
-    motionProfile: motionProfileFromPart(part, seed),
+    layout: layoutForMotif(motif, variant),
+    palette,
+    variant,
+    motionProfile,
     motif,
   };
+}
+
+function inferVisualSfx(part: VisualPlanPart, spec: VisualAnimationSpec): VisualSfxKind {
+  const explicit = String(part.sfx || "").trim().toLowerCase() as VisualSfxKind;
+  if (["ui_click_soft", "ui_click_snap", "whoosh_soft", "whoosh_rise", "pop_air"].includes(explicit)) {
+    return explicit;
+  }
+  if (part.visual_type === "web_image") {
+    return spec.motionProfile === "crisp" ? "ui_click_snap" : "whoosh_soft";
+  }
+  if (spec.motif === "question_answer" || spec.motif === "checklist_reveal" || spec.motif === "chart_pop" || spec.motif === "object_spotlight") {
+    return spec.motionProfile === "punchy" ? "ui_click_snap" : "ui_click_soft";
+  }
+  if (spec.motif === "compare_problem_solution" || spec.motif === "decision_split" || spec.motif === "timeline_sequence") {
+    return "whoosh_rise";
+  }
+  if (spec.motif === "conversation_flow" || spec.motif === "process_arrow" || spec.motif === "map_pointer") {
+    return "whoosh_soft";
+  }
+  return spec.motionProfile === "elastic" ? "pop_air" : "ui_click_soft";
+}
+
+function createNoiseBuffer(context: AudioContext, durationSeconds: number): AudioBuffer {
+  const length = Math.max(1, Math.floor(context.sampleRate * durationSeconds));
+  const buffer = context.createBuffer(1, length, context.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let index = 0; index < length; index += 1) {
+    data[index] = Math.random() * 2 - 1;
+  }
+  return buffer;
+}
+
+function playVisualSfx(context: AudioContext, kind: VisualSfxKind): void {
+  const now = context.currentTime + 0.01;
+  const compressor = context.createDynamicsCompressor();
+  compressor.threshold.value = -24;
+  compressor.knee.value = 18;
+  compressor.ratio.value = 8;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.18;
+  compressor.connect(context.destination);
+
+  const master = context.createGain();
+  master.connect(compressor);
+  master.gain.setValueAtTime(0.0001, now);
+  master.gain.exponentialRampToValueAtTime(0.42, now + 0.012);
+  master.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+
+  if (kind === "ui_click_soft" || kind === "ui_click_snap" || kind === "pop_air") {
+    const osc = context.createOscillator();
+    const tone = context.createGain();
+    osc.type = kind === "pop_air" ? "triangle" : "square";
+    osc.frequency.setValueAtTime(kind === "ui_click_snap" ? 1480 : kind === "pop_air" ? 820 : 980, now);
+    osc.frequency.exponentialRampToValueAtTime(kind === "ui_click_snap" ? 620 : kind === "pop_air" ? 520 : 700, now + (kind === "pop_air" ? 0.12 : 0.05));
+    tone.gain.setValueAtTime(0.0001, now);
+    tone.gain.exponentialRampToValueAtTime(kind === "ui_click_snap" ? 0.28 : 0.2, now + 0.008);
+    tone.gain.exponentialRampToValueAtTime(0.0001, now + (kind === "pop_air" ? 0.14 : 0.055));
+    osc.connect(tone);
+    tone.connect(master);
+    osc.start(now);
+    osc.stop(now + (kind === "pop_air" ? 0.16 : 0.07));
+  }
+
+  if (kind === "whoosh_soft" || kind === "whoosh_rise" || kind === "pop_air") {
+    const noise = context.createBufferSource();
+    noise.buffer = createNoiseBuffer(context, kind === "pop_air" ? 0.12 : 0.32);
+    const filter = context.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.setValueAtTime(kind === "whoosh_rise" ? 640 : kind === "pop_air" ? 980 : 420, now);
+    filter.frequency.exponentialRampToValueAtTime(kind === "whoosh_rise" ? 2400 : kind === "pop_air" ? 1800 : 920, now + (kind === "pop_air" ? 0.12 : 0.3));
+    filter.Q.value = kind === "pop_air" ? 0.9 : 0.65;
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(kind === "pop_air" ? 0.12 : 0.18, now + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + (kind === "pop_air" ? 0.14 : 0.34));
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(master);
+    noise.start(now);
+    noise.stop(now + (kind === "pop_air" ? 0.16 : 0.36));
+  }
+
+  window.setTimeout(() => {
+    master.disconnect();
+    compressor.disconnect();
+  }, 700);
 }
 
 function AnimatedMotif({
@@ -568,6 +673,26 @@ function getTranscriptSegments(track: ProjectTrack): TranscriptSegment[] {
   return Array.isArray(track.transcription?.segments) ? track.transcription?.segments || [] : [];
 }
 
+function getTranscriptWords(track: ProjectTrack) {
+  return Array.isArray(track.transcription?.words) ? track.transcription?.words || [] : [];
+}
+
+function buildActiveSubtitleWord(track: ProjectTrack, time: number): string | null {
+  const words = getTranscriptWords(track)
+    .map((word) => ({
+      word: String(word.word || "").trim(),
+      start: Math.max(0, Number(word.start || 0)),
+      end: Math.max(Number(word.start || 0), Number(word.end || 0)),
+    }))
+    .filter((word) => word.word && word.end >= word.start);
+
+  if (words.length === 0) return null;
+
+  const activeIndex = words.findIndex((word) => time >= word.start && time <= word.end + 0.04);
+  if (activeIndex < 0) return null;
+  return words[activeIndex].word || null;
+}
+
 function hasTranscript(track: ProjectTrack): boolean {
   if (getTranscriptText(track)) return true;
   return Array.isArray(track.transcription?.words) && track.transcription!.words!.length > 0;
@@ -718,6 +843,19 @@ function sortTracksForProject(tracks: ProjectTrack[]): ProjectTrack[] {
 
 function isTrackHidden(track: ProjectTrack): boolean {
   return track.status === "hidden" || track.excluded === true;
+}
+
+function getTrackRenderVersions(track: ProjectTrack): TrackRenderVersion[] {
+  const raw = track.render_versions;
+  if (!Array.isArray(raw)) return [];
+  return [...raw].sort((left, right) => {
+    const leftTime = new Date(left.created_at).getTime();
+    const rightTime = new Date(right.created_at).getTime();
+    if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+      return rightTime - leftTime;
+    }
+    return right.label.localeCompare(left.label, undefined, { numeric: true });
+  });
 }
 
 function getTrackSize(track: ProjectTrack): number | null {
@@ -1189,7 +1327,7 @@ function VisualOverlayPreview({
       }}
     >
       <div
-        className={`visualOverlayFloat visualOverlayFloat${spec.theme.charAt(0).toUpperCase()}${spec.theme.slice(1)}`}
+        className={`visualOverlayFloat visualOverlayFloat${spec.theme.charAt(0).toUpperCase()}${spec.theme.slice(1)} visualOverlayLayout${spec.layout.charAt(0).toUpperCase()}${spec.layout.slice(1)}`}
         style={{
           transform: `translateY(${cardLift}px) scale(${(0.92 + envelope * 0.08).toFixed(4)})`,
         }}
@@ -1239,33 +1377,43 @@ function SpeechFilterEditor({
   track,
   artifact,
   visualPlan,
+  selectedVersionId,
   projectId,
   token,
   saving,
   saveError,
   onSave,
+  onCutsChange,
 }: {
   src: string;
   track: ProjectTrack;
   artifact: SpeechFilterArtifact;
   visualPlan?: VisualPlanArtifact | null;
+  selectedVersionId: string;
   projectId: string;
   token: string | undefined;
   saving: boolean;
   saveError?: string | null;
   onSave: (cuts: SpeechFilterCut[]) => Promise<void>;
+  onCutsChange: (cuts: SpeechFilterCut[]) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const lastVisualSfxIndexRef = useRef<number>(-1);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [mediaDuration, setMediaDuration] = useState<number | null>(null);
   const [editableCuts, setEditableCuts] = useState<SpeechFilterCut[]>(() => normalizeEditableCuts(artifact.cuts));
   const [selectedCutIndex, setSelectedCutIndex] = useState(0);
   const [dragState, setDragState] = useState<{ cutIndex: number; edge: "start" | "end" } | null>(null);
   const [zoomPreviewEnabled, setZoomPreviewEnabled] = useState(true);
+  const [visualSfxEnabled, setVisualSfxEnabled] = useState(true);
+  const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
   const skipInFlightRef = useRef(false);
   const animationFrameRef = useRef<number | null>(null);
-  const duration = Math.max(track.duration || 0, 0.1);
+  const showEditablePreview = selectedVersionId === "source";
+  const duration = Math.max((showEditablePreview ? track.duration : mediaDuration || track.duration) || 0, 0.1);
   const stageAspectRatio = useMemo(() => {
     if ((track.width || 0) > 0 && (track.height || 0) > 0) {
       return `${track.width} / ${track.height}`;
@@ -1302,14 +1450,23 @@ function SpeechFilterEditor({
   }, [artifact]);
 
   useEffect(() => {
+    onCutsChange(editableCuts);
+  }, [editableCuts, onCutsChange]);
+
+  useEffect(() => {
     setZoomPreviewEnabled(zoomBeats.some((beat) => beat.enabled));
   }, [zoomBeats]);
+
+  useEffect(() => {
+    lastVisualSfxIndexRef.current = -1;
+  }, [track.id, selectedVersionId]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
     const syncTime = () => setCurrentTime(video.currentTime || 0);
+    const syncDuration = () => setMediaDuration(Number.isFinite(video.duration) ? video.duration : null);
     const tick = () => {
       syncTime();
       if (!video.paused && !video.ended) {
@@ -1338,6 +1495,7 @@ function SpeechFilterEditor({
     video.addEventListener("pause", stopTick);
     video.addEventListener("ended", stopTick);
     video.addEventListener("loadedmetadata", syncTime);
+    video.addEventListener("loadedmetadata", syncDuration);
     return () => {
       stopTick();
       video.removeEventListener("timeupdate", syncTime);
@@ -1347,6 +1505,16 @@ function SpeechFilterEditor({
       video.removeEventListener("pause", stopTick);
       video.removeEventListener("ended", stopTick);
       video.removeEventListener("loadedmetadata", syncTime);
+      video.removeEventListener("loadedmetadata", syncDuration);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => undefined);
+        audioContextRef.current = null;
+      }
     };
   }, []);
 
@@ -1355,7 +1523,7 @@ function SpeechFilterEditor({
     if (!video) return;
 
     const maybeSkipCut = () => {
-      if (video.paused || dragState || skipInFlightRef.current) return;
+      if (!showEditablePreview || video.paused || dragState || skipInFlightRef.current) return;
       const current = video.currentTime || 0;
       const activeCut = editableCuts.find((cut) => current >= cut.start && current < cut.end - 0.01);
       if (!activeCut) return;
@@ -1375,7 +1543,7 @@ function SpeechFilterEditor({
       video.removeEventListener("timeupdate", maybeSkipCut);
       video.removeEventListener("play", maybeSkipCut);
     };
-  }, [dragState, duration, editableCuts]);
+  }, [dragState, duration, editableCuts, showEditablePreview]);
 
   useEffect(() => {
     if (!dragState) return;
@@ -1415,8 +1583,12 @@ function SpeechFilterEditor({
     };
   }, [dragState, duration]);
 
-  const activeCut = editableCuts.find((cut) => currentTime >= cut.start && currentTime <= cut.end) || null;
-  const activeVisualPart = visualPlan?.parts.find((part) => currentTime >= part.start && currentTime <= part.end) || null;
+  const activeCut = showEditablePreview
+    ? editableCuts.find((cut) => currentTime >= cut.start && currentTime <= cut.end) || null
+    : null;
+  const activeVisualPart = showEditablePreview
+    ? visualPlan?.parts.find((part) => currentTime >= part.start && currentTime <= part.end) || null
+    : null;
   const activeVisualPartIndex = activeVisualPart ? visualPlan?.parts.findIndex((part) => part === activeVisualPart) ?? -1 : -1;
   const activeVisualProgress = activeVisualPart
     ? clamp(
@@ -1425,6 +1597,38 @@ function SpeechFilterEditor({
         1,
       )
     : 0;
+  const activeSubtitle = showEditablePreview && subtitlesEnabled ? buildActiveSubtitleWord(track, currentTime) : null;
+
+  useEffect(() => {
+    if (!showEditablePreview || !visualSfxEnabled || !isPlaying) {
+      if (!isPlaying || !showEditablePreview || !visualSfxEnabled) {
+        lastVisualSfxIndexRef.current = -1;
+      }
+      return;
+    }
+    if (!activeVisualPart || activeVisualPartIndex < 0) {
+      lastVisualSfxIndexRef.current = -1;
+      return;
+    }
+    if (lastVisualSfxIndexRef.current === activeVisualPartIndex) return;
+    const context = audioContextRef.current;
+    if (!context) return;
+
+    const fire = () => {
+      const spec = buildAnimationSpec(activeVisualPart, activeVisualPartIndex);
+      playVisualSfx(context, inferVisualSfx(activeVisualPart, spec));
+      lastVisualSfxIndexRef.current = activeVisualPartIndex;
+    };
+
+    if (context.state === "running") {
+      fire();
+      return;
+    }
+
+    context.resume().then(() => {
+      if (context.state === "running") fire();
+    }).catch(() => undefined);
+  }, [activeVisualPart, activeVisualPartIndex, isPlaying, showEditablePreview, visualSfxEnabled]);
 
   const seekTo = (time: number) => {
     const video = videoRef.current;
@@ -1437,6 +1641,17 @@ function SpeechFilterEditor({
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
+      if (showEditablePreview && visualSfxEnabled && typeof window !== "undefined") {
+        if (!audioContextRef.current) {
+          const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+          if (AudioContextCtor) {
+            audioContextRef.current = new AudioContextCtor();
+          }
+        }
+        if (audioContextRef.current?.state === "suspended") {
+          await audioContextRef.current.resume().catch(() => undefined);
+        }
+      }
       await video.play().catch(() => undefined);
     } else {
       video.pause();
@@ -1467,12 +1682,12 @@ function SpeechFilterEditor({
               Suggested cut: {formatSpeechFilterReason(activeCut.reason)}
             </div>
           ) : null}
-          {activeZoomBeat ? (
+          {showEditablePreview && activeZoomBeat ? (
             <div className="speechEditorZoomNotice">
               Zoom beat: {formatTime(activeZoomBeat.start)} - {formatTime(activeZoomBeat.end)}
             </div>
           ) : null}
-          {activeVisualPart && activeVisualPartIndex >= 0 ? (
+          {showEditablePreview && activeVisualPart && activeVisualPartIndex >= 0 ? (
             <VisualOverlayPreview
               projectId={projectId}
               trackId={track.id}
@@ -1482,6 +1697,11 @@ function SpeechFilterEditor({
               partIndex={activeVisualPartIndex}
               progress={activeVisualProgress}
             />
+          ) : null}
+          {activeSubtitle ? (
+            <div className="speechEditorSubtitleWrap">
+              <div className="speechEditorSubtitle">{activeSubtitle}</div>
+            </div>
           ) : null}
         </div>
       </div>
@@ -1494,9 +1714,39 @@ function SpeechFilterEditor({
           type="button"
           className={`btn secondary ${zoomPreviewEnabled ? "speechEditorToggleActive" : ""}`}
           onClick={() => setZoomPreviewEnabled((current) => !current)}
-          disabled={zoomBeats.length === 0}
+          disabled={!showEditablePreview || zoomBeats.length === 0}
         >
           {zoomPreviewEnabled ? "Zoom Preview On" : "Zoom Preview Off"}
+        </button>
+        <button
+          type="button"
+          className={`btn secondary ${visualSfxEnabled ? "speechEditorToggleActive" : ""}`}
+          onClick={async () => {
+            if (!visualSfxEnabled && typeof window !== "undefined") {
+              if (!audioContextRef.current) {
+                const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+                if (AudioContextCtor) {
+                  audioContextRef.current = new AudioContextCtor();
+                }
+              }
+              if (audioContextRef.current?.state === "suspended") {
+                await audioContextRef.current.resume().catch(() => undefined);
+              }
+            }
+            setVisualSfxEnabled((current) => !current);
+            lastVisualSfxIndexRef.current = -1;
+          }}
+          disabled={!showEditablePreview || !visualPlan?.parts?.length}
+        >
+          {visualSfxEnabled ? "SFX On" : "SFX Off"}
+        </button>
+        <button
+          type="button"
+          className={`btn secondary ${subtitlesEnabled ? "speechEditorToggleActive" : ""}`}
+          onClick={() => setSubtitlesEnabled((current) => !current)}
+          disabled={!showEditablePreview || getTranscriptWords(track).length === 0}
+        >
+          {subtitlesEnabled ? "Subtitles On" : "Subtitles Off"}
         </button>
         <button
           type="button"
@@ -1505,7 +1755,7 @@ function SpeechFilterEditor({
             const selected = editableCuts[selectedCutIndex];
             if (selected) seekTo(selected.start);
           }}
-          disabled={!editableCuts[selectedCutIndex]}
+          disabled={!showEditablePreview || !editableCuts[selectedCutIndex]}
         >
           Jump To Cut
         </button>
@@ -1517,6 +1767,7 @@ function SpeechFilterEditor({
         </button>
       </div>
 
+      {showEditablePreview ? (
       <div className="speechEditorTimelineWrap">
         <div ref={timelineRef} className="speechEditorTimeline" onClick={handleTimelineClick}>
           <div className="speechEditorTimelineBase" />
@@ -1574,7 +1825,9 @@ function SpeechFilterEditor({
           <div className="speechEditorPlayhead" style={{ left: `${(currentTime / duration) * 100}%` }} />
         </div>
       </div>
+      ) : null}
 
+      {showEditablePreview ? (
       <div className="speechEditorCutsPanel">
         <div className="speechEditorSummary">
           <strong>{artifact.summary}</strong>
@@ -1618,6 +1871,7 @@ function SpeechFilterEditor({
           ))}
         </div>
       </div>
+      ) : null}
     </div>
   );
 }
@@ -1634,9 +1888,12 @@ function PreviewModal({
   visualPlan,
   visualPlanLoading,
   visualPlanError,
+  renderLoading,
+  renderError,
   onGenerateSpeechFilter,
   onGenerateVisualPlan,
   onSaveSpeechFilter,
+  onRenderTrack,
   onClose,
 }: {
   projectId: string;
@@ -1650,12 +1907,31 @@ function PreviewModal({
   visualPlan?: VisualPlanArtifact | null;
   visualPlanLoading: boolean;
   visualPlanError?: string | null;
+  renderLoading: boolean;
+  renderError?: string | null;
   onGenerateSpeechFilter: (track: ProjectTrack) => void;
   onGenerateVisualPlan: (track: ProjectTrack) => void;
   onSaveSpeechFilter: (track: ProjectTrack, cuts: SpeechFilterCut[]) => Promise<void>;
+  onRenderTrack: (track: ProjectTrack, cuts: SpeechFilterCut[]) => Promise<TrackRenderVersion | null>;
   onClose: () => void;
 }) {
-  const { blobUrl, loading, error } = useAuthedBlobUrl(api.getTrackMediaUrl(projectId, track.id), token);
+  const renderVersions = getTrackRenderVersions(track);
+  const [selectedVersionId, setSelectedVersionId] = useState<string>("source");
+  const [draftCuts, setDraftCuts] = useState<SpeechFilterCut[]>(speechFilter?.cuts || []);
+
+  useEffect(() => {
+    setSelectedVersionId("source");
+  }, [track.id]);
+
+  useEffect(() => {
+    setDraftCuts(speechFilter?.cuts || []);
+  }, [speechFilter, track.id]);
+
+  const selectedMediaUrl = selectedVersionId === "source"
+    ? api.getTrackMediaUrl(projectId, track.id)
+    : api.getTrackRenderAssetUrl(projectId, track.id, selectedVersionId);
+  const { blobUrl, loading, error } = useAuthedBlobUrl(selectedMediaUrl, token);
+  const selectedRenderVersion = renderVersions.find((version) => version.id === selectedVersionId) || null;
 
   return (
     <div className="previewModalBackdrop" onClick={onClose}>
@@ -1670,8 +1946,53 @@ function PreviewModal({
                 : ""}
             </span>
           </div>
+          <div className="previewModalActions">
+            <button
+              type="button"
+              className="btn"
+              disabled={renderLoading || !speechFilter}
+              onClick={async () => {
+                if (!speechFilter) return;
+                const version = await onRenderTrack(track, draftCuts);
+                if (version) setSelectedVersionId(version.id);
+              }}
+            >
+              {renderLoading ? "Rendering..." : "Render"}
+            </button>
+            {renderVersions.length > 0 ? (
+              <>
+                <label className="previewModalVersionLabel">
+                  <span className="muted previewModalVersionLabelText">Version</span>
+                  <select
+                    className="previewModalVersionSelect"
+                    value={selectedVersionId}
+                    onChange={(event) => setSelectedVersionId(event.target.value)}
+                  >
+                    <option value="source">Original</option>
+                    {renderVersions.map((version) => (
+                      <option key={version.id} value={version.id}>
+                        {version.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {selectedVersionId !== "source" ? (
+                  <a
+                    className="btn secondary"
+                    href={blobUrl || undefined}
+                    download={selectedRenderVersion?.filename || undefined}
+                  >
+                    Download
+                  </a>
+                ) : null}
+              </>
+            ) : (
+              <span className="muted previewModalNoVersion">No version available</span>
+            )}
+          </div>
           <button type="button" className="previewModalClose" onClick={onClose}>×</button>
         </div>
+        {renderError ? <div className="speechEditorError">{renderError}</div> : null}
         {blobUrl ? (
           speechFilter ? (
             <SpeechFilterEditor
@@ -1679,11 +2000,13 @@ function PreviewModal({
               track={track}
               artifact={speechFilter}
               visualPlan={visualPlan}
+              selectedVersionId={selectedVersionId}
               projectId={projectId}
               token={token}
               saving={speechFilterSaving}
               saveError={speechFilterError}
               onSave={(cuts) => onSaveSpeechFilter(track, cuts)}
+              onCutsChange={setDraftCuts}
             />
           ) : (
             <video
@@ -1754,6 +2077,8 @@ export default function ProjectDetailPage() {
   const [visualPlans, setVisualPlans] = useState<Record<string, VisualPlanArtifact | null>>({});
   const [visualPlanLoadingIds, setVisualPlanLoadingIds] = useState<Record<string, boolean>>({});
   const [visualPlanErrors, setVisualPlanErrors] = useState<Record<string, string | null>>({});
+  const [renderLoadingIds, setRenderLoadingIds] = useState<Record<string, boolean>>({});
+  const [renderErrors, setRenderErrors] = useState<Record<string, string | null>>({});
   const [token, setToken] = useState<string | undefined>(undefined);
   const [draggingTrackId, setDraggingTrackId] = useState<string | null>(null);
   const [dragTargetTrackId, setDragTargetTrackId] = useState<string | null>(null);
@@ -1795,6 +2120,8 @@ export default function ProjectDetailPage() {
     setVisualPlans({});
     setVisualPlanLoadingIds({});
     setVisualPlanErrors({});
+    setRenderLoadingIds({});
+    setRenderErrors({});
   }, [projectId]);
 
   useEffect(() => {
@@ -2072,6 +2399,27 @@ export default function ProjectDetailPage() {
     }
   };
 
+  const handleRenderTrack = async (track: ProjectTrack, cuts: SpeechFilterCut[]): Promise<TrackRenderVersion | null> => {
+    if (!token || !project) return null;
+    setRenderLoadingIds((current) => ({ ...current, [track.id]: true }));
+    setRenderErrors((current) => ({ ...current, [track.id]: null }));
+    try {
+      const result = await api.renderTrack(project.id, track.id, cuts, token);
+      const response = await api.getProject(project.id, token);
+      setProject(response.project);
+      setActiveTrack(response.project.tracks.find((item) => item.id === track.id) || null);
+      setMessage(`${result.version.label} rendered.`);
+      return result.version;
+    } catch (error) {
+      const text = String((error as Error).message || error);
+      setRenderErrors((current) => ({ ...current, [track.id]: text }));
+      setMessage(text);
+      return null;
+    } finally {
+      setRenderLoadingIds((current) => ({ ...current, [track.id]: false }));
+    }
+  };
+
   const sortedTracks = useMemo(
     () => sortTracksForProject((project?.tracks || []).filter((track) => !isTrackHidden(track))),
     [project?.tracks],
@@ -2275,9 +2623,12 @@ export default function ProjectDetailPage() {
           visualPlan={visualPlans[activeTrack.id]}
           visualPlanLoading={Boolean(visualPlanLoadingIds[activeTrack.id])}
           visualPlanError={visualPlanErrors[activeTrack.id]}
+          renderLoading={Boolean(renderLoadingIds[activeTrack.id])}
+          renderError={renderErrors[activeTrack.id]}
           onGenerateSpeechFilter={handleGenerateSpeechFilter}
           onGenerateVisualPlan={handleGenerateVisualPlan}
           onSaveSpeechFilter={handleSaveSpeechFilter}
+          onRenderTrack={handleRenderTrack}
           onClose={() => setActiveTrack(null)}
         />
       ) : null}

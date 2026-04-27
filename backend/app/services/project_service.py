@@ -19,6 +19,8 @@ from ..models.project import (
     ProjectCreateRequest,
     ProjectUpdateRequest,
     SpeechFilterArtifact,
+    VisualPlanArtifact,
+    TrackRenderVersion,
     TrackOrientation,
     TrackType,
     VideoTrack,
@@ -155,6 +157,16 @@ class ProjectService:
 
     def get_track_edit_file(self, user_id: str, project_id: str, track_id: str) -> Path:
         return self.get_project_edits_dir(user_id, project_id) / f"{track_id}.json"
+
+    def get_project_renders_dir(self, user_id: str, project_id: str) -> Path:
+        directory = self.get_project_dir(user_id, project_id, create=True) / "renders"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def get_track_renders_dir(self, user_id: str, project_id: str, track_id: str) -> Path:
+        directory = self.get_project_renders_dir(user_id, project_id) / track_id
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
 
     async def get_project(self, project_id: str, user_id: Optional[str] = None) -> Optional[Project]:
         cached = self.projects.get(project_id)
@@ -711,6 +723,151 @@ class ProjectService:
             merged.append(item)
         from ..models.project import SpeechFilterCut
         return [SpeechFilterCut(**item) for item in merged]
+
+    async def render_track_version(
+        self,
+        project_id: str,
+        track_id: str,
+        *,
+        cuts: List[Dict[str, Any]] | List[Any] | None = None,
+        user_id: Optional[str] = None,
+    ) -> TrackRenderVersion:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project or not project.user_id:
+            raise ValueError("Project not found")
+
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track:
+            raise ValueError("Track not found")
+        if track.type != TrackType.VIDEO:
+            raise ValueError("Only video tracks can be rendered")
+
+        normalized_cuts = self._normalize_manual_speech_filter_cuts(cuts or [], track.duration)
+        existing_speech_filter = await self.get_track_speech_filter(project_id, track_id, user_id=user_id)
+        if normalized_cuts:
+            artifact = SpeechFilterArtifact(
+                project_id=project.id,
+                track_id=track.id,
+                filename=track.filename,
+                status="completed",
+                summary=self._summarize_speech_filter_cuts(normalized_cuts),
+                cuts=normalized_cuts,
+                zoom_beats=existing_speech_filter.zoom_beats if existing_speech_filter else [],
+                source_word_count=len(normalize_words((track.transcription or {}).get("words", []))),
+                model=existing_speech_filter.model if existing_speech_filter else "manual",
+            )
+            await self._persist_track_speech_filter(project, track, artifact)
+            existing_speech_filter = artifact
+
+        source_path = self._resolve_project_media_path(project, track.file_path)
+        if source_path is None or not source_path.exists():
+            raise ValueError("Track media not found")
+
+        processor = VideoProcessor()
+        keep_segments = self._segments_from_cut_ranges(track.duration, normalized_cuts)
+        render_dir = self.get_track_renders_dir(project.user_id, project.id, track.id)
+        version_id = uuid.uuid4().hex
+        timestamp_label = datetime.now().strftime("%d.%m.%Y.%H%M")
+        output_path = self._reserve_named_output(render_dir, timestamp_label, ".mp4")
+        staged_source = source_path
+
+        visual_plan = await self.get_track_visual_plan(project.id, track.id, user_id=project.user_id)
+        zoom_beats = existing_speech_filter.zoom_beats if existing_speech_filter else []
+        visual_parts = visual_plan.parts if visual_plan else []
+        if zoom_beats or visual_parts:
+            styled_path = render_dir / f"{Path(output_path).stem}__styled.mp4"
+            staged_source = Path(
+                await processor.render_styled_track(
+                    source_path=source_path,
+                    output_path=styled_path,
+                    width=int(track.width or 720),
+                    height=int(track.height or 1280),
+                    zoom_beats=zoom_beats,
+                    visual_parts=visual_parts,
+                )
+            )
+
+        rendered_path = await processor.render_source_segments(
+            source_path=staged_source,
+            segments=keep_segments,
+            output_path=output_path,
+        )
+        if staged_source != source_path:
+            Path(staged_source).unlink(missing_ok=True)
+
+        duration_after = round(sum(max(0.0, end - start) for start, end in keep_segments), 3)
+        version = TrackRenderVersion(
+            id=version_id,
+            label=Path(rendered_path).stem,
+            filename=Path(rendered_path).name,
+            file_path=str(rendered_path),
+            cut_count=len(normalized_cuts),
+            duration_before=round(float(track.duration or 0.0), 3),
+            duration_after=duration_after,
+        )
+        track.render_versions.append(version)
+        track.metadata["latest_render_version_id"] = version.id
+        track.metadata["render_version_count"] = len(track.render_versions)
+        project.updated_at = datetime.utcnow()
+        await self._save_project(project)
+        self.projects[project.id] = project
+        return version
+
+    async def get_track_visual_plan(
+        self,
+        project_id: str,
+        track_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Optional[VisualPlanArtifact]:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project or not project.user_id:
+            return None
+        artifact_path = self.get_project_dir(project.user_id, project.id, create=True) / "visual_worker" / f"{track_id}.json"
+        if not artifact_path.exists():
+            return None
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        return VisualPlanArtifact(**payload)
+
+    async def get_track_render_version(
+        self,
+        project_id: str,
+        track_id: str,
+        version_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> tuple[Project, VideoTrack, TrackRenderVersion] | None:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project:
+            return None
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track:
+            return None
+        version = next((item for item in track.render_versions if item.id == version_id), None)
+        if not version:
+            return None
+        return project, track, version
+
+    @staticmethod
+    def _segments_from_cut_ranges(duration: float, cuts: List[Any]) -> List[tuple[float, float]]:
+        safe_duration = max(0.0, float(duration or 0.0))
+        if safe_duration <= 0:
+            return []
+        if not cuts:
+            return [(0.0, safe_duration)]
+
+        ordered = sorted(cuts, key=lambda cut: (float(cut.start), float(cut.end)))
+        segments: List[tuple[float, float]] = []
+        cursor = 0.0
+        for cut in ordered:
+            start = max(0.0, min(safe_duration, float(cut.start)))
+            end = max(start, min(safe_duration, float(cut.end)))
+            if start > cursor + 0.001:
+                segments.append((round(cursor, 3), round(start, 3)))
+            cursor = max(cursor, end)
+        if cursor < safe_duration - 0.001:
+            segments.append((round(cursor, 3), round(safe_duration, 3)))
+        return [(start, end) for start, end in segments if end - start >= 0.05]
 
     @staticmethod
     def _track_is_transcribable(track: VideoTrack) -> bool:

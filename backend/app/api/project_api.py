@@ -27,6 +27,8 @@ from ..models.project import (
     ProjectUpdateRequest,
     SpeechFilterArtifact,
     SpeechFilterUpdateRequest,
+    TrackRenderRequest,
+    TrackRenderResponse,
     VisualPlanArtifact,
 )
 from ..services.project_service import project_service
@@ -561,6 +563,57 @@ async def download_project_track_media(project_id: str, track_id: str, current_u
         served_path,
         media_type=media_type or "application/octet-stream",
         filename=served_filename,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
+
+
+@router.post("/{project_id}/tracks/{track_id}/render", response_model=TrackRenderResponse)
+async def render_project_track_version(
+    project_id: str,
+    track_id: str,
+    request: TrackRenderRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        version = await project_service.render_track_version(
+            project_id,
+            track_id,
+            cuts=[cut.model_dump() for cut in request.cuts],
+            user_id=current_user.id,
+        )
+        return TrackRenderResponse(version=version, message="Track version rendered successfully")
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to render track version: {exc}") from exc
+
+
+@router.get("/{project_id}/tracks/{track_id}/renders/{version_id}")
+async def download_project_track_render_version(
+    project_id: str,
+    track_id: str,
+    version_id: str,
+    current_user=Depends(get_current_user),
+):
+    resolved = await project_service.get_track_render_version(
+        project_id,
+        track_id,
+        version_id,
+        user_id=current_user.id,
+    )
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Rendered version not found")
+
+    _, _, version = resolved
+    render_path = _resolve_existing_project_path(version.file_path, project_id, current_user.id)
+    media_type, _ = mimetypes.guess_type(version.filename)
+    return FileResponse(
+        render_path,
+        media_type=media_type or "video/mp4",
+        filename=version.filename,
         headers={"Cache-Control": "private, max-age=31536000, immutable"},
     )
 

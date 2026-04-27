@@ -94,6 +94,23 @@ export type SpeechFilterArtifact = {
   error_message?: string | null;
 };
 
+export type TrackRenderVersion = {
+  id: string;
+  label: string;
+  filename: string;
+  file_path: string;
+  created_at: string;
+  source: "speech_filter";
+  cut_count: number;
+  duration_before: number;
+  duration_after: number;
+};
+
+export type TrackRenderResponse = {
+  version: TrackRenderVersion;
+  message: string;
+};
+
 export type VisualPlanPart = {
   start: number;
   end: number;
@@ -151,6 +168,7 @@ export type ProjectTrack = {
   has_voice?: boolean;
   recorded_at?: string | null;
   local_gap_ranges?: GapRange[];
+  render_versions?: TrackRenderVersion[];
   status?: "visible" | "hidden";
   excluded?: boolean;
 };
