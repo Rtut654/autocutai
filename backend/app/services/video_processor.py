@@ -142,6 +142,32 @@ class VideoProcessor:
                 ranges.append((start, end))
         return ranges
 
+    async def extract_audio_segment(
+        self,
+        source_path: str | Path,
+        output_path: str | Path,
+        start: float,
+        end: float,
+    ) -> str:
+        """Extract a WAV sub-range from an audio source for more granular ASR."""
+        cmd = [
+            self.ffmpeg_path,
+            "-ss",
+            f"{max(0.0, start):.3f}",
+            "-to",
+            f"{max(start, end):.3f}",
+            "-i",
+            str(source_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-y",
+            str(output_path),
+        ]
+        await self._run_ffmpeg_command(cmd)
+        return str(output_path)
+
     async def _process_track(self, track: VideoTrack, project: Project) -> VideoTrack:
         return track
 

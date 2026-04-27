@@ -17,6 +17,7 @@ from ..models.project import (
     ProjectCreateRequest,
     ProjectUpdateRequest,
     SpeechFilterArtifact,
+    TrackOrientation,
     TrackType,
     VideoTrack,
 )
@@ -303,6 +304,14 @@ class ProjectService:
                 self._set_track_transcript_status(track, next_status)
                 changed = True
 
+            refreshed_geometry = await self._refresh_track_geometry_from_media_info(
+                project,
+                track,
+                processor=processor,
+            )
+            if refreshed_geometry:
+                changed = True
+
             transcript_path = track.metadata.get("transcript_path")
             if transcript_path and isinstance(transcript_path, str):
                 candidate = Path(transcript_path)
@@ -362,6 +371,41 @@ class ProjectService:
 
         track.recorded_at = extracted
         return True
+
+    async def _refresh_track_geometry_from_media_info(
+        self,
+        project: Project,
+        track: VideoTrack,
+        *,
+        processor: VideoProcessor,
+    ) -> bool:
+        if str(track.file_path).startswith("client://"):
+            return False
+
+        media_path = self._resolve_project_media_path(project, track.file_path)
+        if media_path is None:
+            return False
+
+        try:
+            info = await processor.get_video_info(str(media_path))
+        except Exception:
+            return False
+
+        width, height, orientation = self._extract_track_geometry_from_media_info(info.get("streams", []))
+        if width is None or height is None:
+            return False
+
+        changed = False
+        if track.width != width:
+            track.width = width
+            changed = True
+        if track.height != height:
+            track.height = height
+            changed = True
+        if track.orientation != orientation:
+            track.orientation = orientation
+            changed = True
+        return changed
 
     def _resolve_project_media_path(self, project: Project, path_value: str | None) -> Optional[Path]:
         if not path_value or not project.user_id:
@@ -529,6 +573,7 @@ class ProjectService:
                 filename=track.filename,
                 words=words,
                 duration=float(track.duration or 0.0),
+                transcript_segments=(track.transcription or {}).get("segments", []),
                 min_gap_seconds=float(project.settings.min_gap_seconds or 1.0),
             )
         except Exception as exc:
@@ -566,6 +611,7 @@ class ProjectService:
             status="completed",
             summary=self._summarize_speech_filter_cuts(normalized_cuts),
             cuts=normalized_cuts,
+            zoom_beats=existing.zoom_beats if existing else [],
             source_word_count=len(normalize_words((track.transcription or {}).get("words", []))),
             model=model_name,
         )
@@ -762,8 +808,11 @@ class ProjectService:
                 location = self._extract_location_from_streams(streams, fmt)
                 if location:
                     metadata["location"] = location
+                inferred_width, inferred_height, inferred_orientation = self._extract_track_geometry_from_media_info(streams)
             except Exception:
-                pass
+                inferred_width, inferred_height, inferred_orientation = (None, None, TrackOrientation.UNKNOWN)
+        else:
+            inferred_width, inferred_height, inferred_orientation = (None, None, TrackOrientation.UNKNOWN)
 
         if inferred_recorded_at is None:
             inferred_recorded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
@@ -777,6 +826,9 @@ class ProjectService:
             position=position,
             metadata=metadata,
             recorded_at=inferred_recorded_at,
+            orientation=inferred_orientation,
+            width=inferred_width,
+            height=inferred_height,
         )
 
     @staticmethod
@@ -861,16 +913,28 @@ class ProjectService:
             audio_path = extracted_audio_path
             track.metadata["audio_path"] = extracted_audio_path
 
-        with open(audio_path, "rb") as handle:
-            audio_data = handle.read()
-        transcription_filename = Path(audio_path).name
-        raw_transcription = await transcribe_audio(audio_data, transcription_filename, "en")
-        sanitized = sanitize_transcription_payload(raw_transcription, track.duration)
         try:
-            silence_ranges = await processor.detect_silence_ranges(audio_path)
-            sanitized = self._align_transcription_to_detected_silence(sanitized, silence_ranges, track.duration)
+            silence_ranges = await processor.detect_silence_ranges(audio_path, noise_db=-40.0, min_silence_duration=0.08)
         except Exception:
-            pass
+            silence_ranges = []
+
+        chunked_transcription = await self._transcribe_audio_with_chunking(
+            audio_path,
+            track.duration,
+            silence_ranges,
+            processor=processor,
+        )
+        if chunked_transcription is not None:
+            sanitized = sanitize_transcription_payload(chunked_transcription, track.duration)
+        else:
+            with open(audio_path, "rb") as handle:
+                audio_data = handle.read()
+            transcription_filename = Path(audio_path).name
+            raw_transcription = await transcribe_audio(audio_data, transcription_filename, "en")
+            sanitized = sanitize_transcription_payload(raw_transcription, track.duration)
+
+        if silence_ranges:
+            sanitized = self._align_transcription_to_detected_silence(sanitized, silence_ranges, track.duration)
         words = normalize_words(sanitized.get("words", []))
 
         track.has_voice = len(words) > 0
@@ -888,6 +952,111 @@ class ProjectService:
         transcript_text_path = self._reserve_named_output(transcript_dir, Path(track.filename).stem, ".txt")
         transcript_text_path.write_text((track.transcription or {}).get("text", ""), encoding="utf-8")
         track.metadata["transcript_path"] = str(transcript_text_path)
+
+    async def _transcribe_audio_with_chunking(
+        self,
+        audio_path: str,
+        duration: float,
+        silence_ranges: List[tuple[float, float]],
+        *,
+        processor: VideoProcessor,
+    ) -> Optional[Dict[str, Any]]:
+        windows = self._build_transcription_windows(silence_ranges, duration)
+        if len(windows) <= 1:
+            return None
+
+        chunk_dir = self.temp_dir / "transcription_chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        merged_words: List[Dict[str, Any]] = []
+        merged_segments: List[Dict[str, Any]] = []
+        segment_id = 0
+
+        for idx, (nominal_start, nominal_end) in enumerate(windows):
+            padded_start = max(0.0, nominal_start - 0.15)
+            padded_end = min(float(duration), nominal_end + 0.15)
+            if padded_end - padded_start < 0.2:
+                continue
+
+            chunk_path = chunk_dir / f"{Path(audio_path).stem}-{idx + 1}.wav"
+            await processor.extract_audio_segment(audio_path, chunk_path, padded_start, padded_end)
+            try:
+                chunk_bytes = chunk_path.read_bytes()
+                raw_chunk = await transcribe_audio(chunk_bytes, chunk_path.name, "en")
+            finally:
+                chunk_path.unlink(missing_ok=True)
+
+            sanitized_chunk = sanitize_transcription_payload(raw_chunk, padded_end - padded_start)
+            chunk_words = normalize_words(sanitized_chunk.get("words", []))
+            kept_words: List[Dict[str, Any]] = []
+            for word in chunk_words:
+                absolute_start = padded_start + float(word.start)
+                absolute_end = padded_start + float(word.end)
+                midpoint = (absolute_start + absolute_end) / 2
+                if midpoint < nominal_start - 0.03 or midpoint > nominal_end + 0.03:
+                    continue
+                kept_words.append(
+                    {
+                        "word": word.word,
+                        "start": round(max(0.0, absolute_start), 3),
+                        "end": round(max(absolute_start, absolute_end), 3),
+                        "confidence": word.confidence,
+                    }
+                )
+
+            if not kept_words:
+                continue
+
+            merged_words.extend(kept_words)
+            merged_segments.append(
+                {
+                    "id": segment_id,
+                    "start": kept_words[0]["start"],
+                    "end": kept_words[-1]["end"],
+                    "text": " ".join(word["word"] for word in kept_words).strip(),
+                    "words": kept_words,
+                }
+            )
+            segment_id += 1
+
+        if not merged_words:
+            return None
+
+        return {
+            "text": " ".join(word["word"] for word in merged_words).strip(),
+            "words": merged_words,
+            "segments": merged_segments,
+            "language": "en",
+        }
+
+    @staticmethod
+    def _build_transcription_windows(
+        silence_ranges: List[tuple[float, float]],
+        duration: float,
+        *,
+        min_window_duration: float = 0.3,
+        max_window_duration: float = 3.5,
+    ) -> List[tuple[float, float]]:
+        if duration <= 0:
+            return []
+
+        sorted_silences = sorted((max(0.0, start), max(0.0, end)) for start, end in silence_ranges if end > start)
+        speech_ranges: List[tuple[float, float]] = []
+        cursor = 0.0
+        for silence_start, silence_end in sorted_silences:
+            if silence_start - cursor >= min_window_duration:
+                speech_ranges.append((cursor, silence_start))
+            cursor = max(cursor, silence_end)
+        if duration - cursor >= min_window_duration:
+            speech_ranges.append((cursor, duration))
+
+        windows: List[tuple[float, float]] = []
+        for speech_start, speech_end in speech_ranges:
+            current = speech_start
+            while current < speech_end - min_window_duration:
+                next_end = min(speech_end, current + max_window_duration)
+                windows.append((round(current, 3), round(next_end, 3)))
+                current = next_end
+        return windows
 
     def _create_track_from_hybrid_input(self, track: HybridTrackInput, position: int) -> VideoTrack:
         transcription = sanitize_transcription_payload(track.transcription or {}, float(track.duration or 0.0))
@@ -927,6 +1096,9 @@ class ProjectService:
             ),
             has_voice=bool(words),
             recorded_at=track.recorded_at or datetime.utcnow(),
+            orientation=self._orientation_from_metadata(track.metadata),
+            width=self._int_or_none(track.metadata.get("width")),
+            height=self._int_or_none(track.metadata.get("height")),
             local_gap_ranges=[],
         )
 
@@ -973,12 +1145,18 @@ class ProjectService:
             insertions = await ai_service.suggest_insertions(combined_words)
 
         track_decisions = []
+        orientation_streams: Dict[str, List[str]] = {}
         for track in project.tracks:
+            orientation_key = track.orientation.value if isinstance(track.orientation, TrackOrientation) else str(track.orientation)
+            orientation_streams.setdefault(orientation_key, []).append(track.id)
             track_decisions.append(
                 {
                     "track_id": track.id,
                     "filename": track.filename,
                     "duration": track.duration,
+                    "orientation": orientation_key,
+                    "width": track.width,
+                    "height": track.height,
                     "recorded_at": track.recorded_at.isoformat() if track.recorded_at else None,
                     "source_reference": track.metadata.get("source_reference"),
                     "proxy_reference": track.metadata.get("proxy_reference"),
@@ -1006,6 +1184,7 @@ class ProjectService:
             "ordered_track_ids": [track.id for track in project.tracks],
             "auto_cut_enabled": project.settings.smart_pause_cutter,
             "gap_ranges": [gap.model_dump() for gap in gap_ranges],
+            "orientation_streams": orientation_streams,
             "track_decisions": track_decisions,
             "subtitle_path": str(subtitle_srt_path) if project.settings.generate_subtitles else None,
             "requires_source_upload_for_server_render": render_strategy != "on_device",
@@ -1053,6 +1232,78 @@ class ProjectService:
         if fmt_tags:
             return _extract_from_tags(fmt_tags)
         return None
+
+    @staticmethod
+    def _int_or_none(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            parsed = int(value)
+            return parsed if parsed > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _orientation_from_dimensions(cls, width: Optional[int], height: Optional[int]) -> TrackOrientation:
+        if not width or not height:
+            return TrackOrientation.UNKNOWN
+        if width == height:
+            return TrackOrientation.SQUARE
+        return TrackOrientation.VERTICAL if height > width else TrackOrientation.HORIZONTAL
+
+    @classmethod
+    def _orientation_from_metadata(cls, metadata: Dict[str, Any]) -> TrackOrientation:
+        raw = metadata.get("orientation")
+        if isinstance(raw, str):
+            try:
+                return TrackOrientation(raw)
+            except ValueError:
+                pass
+        return cls._orientation_from_dimensions(
+            cls._int_or_none(metadata.get("width")),
+            cls._int_or_none(metadata.get("height")),
+        )
+
+    @classmethod
+    def _extract_track_geometry_from_media_info(
+        cls,
+        streams: List[Dict[str, Any]],
+    ) -> tuple[Optional[int], Optional[int], TrackOrientation]:
+        for stream in streams:
+            if str(stream.get("codec_type")) != "video":
+                continue
+            width = cls._int_or_none(stream.get("width"))
+            height = cls._int_or_none(stream.get("height"))
+            if not width or not height:
+                continue
+
+            rotation = 0
+            tags = stream.get("tags") or {}
+            rotate_tag = tags.get("rotate")
+            if rotate_tag is not None:
+                try:
+                    rotation = int(float(rotate_tag))
+                except (TypeError, ValueError):
+                    rotation = 0
+            for side_data in stream.get("side_data_list") or []:
+                if not isinstance(side_data, dict):
+                    continue
+                value = side_data.get("rotation")
+                if value is None:
+                    continue
+                try:
+                    rotation = int(float(value))
+                except (TypeError, ValueError):
+                    continue
+
+            normalized_rotation = rotation % 360
+            if normalized_rotation in {90, 270}:
+                width, height = height, width
+
+            orientation = cls._orientation_from_dimensions(width, height)
+            return width, height, orientation
+
+        return None, None, TrackOrientation.UNKNOWN
 
     @staticmethod
     def _extract_recorded_at_from_media_info(

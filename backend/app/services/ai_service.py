@@ -9,7 +9,7 @@ from typing import Iterable, List, Sequence
 
 import httpx
 
-from ..models.project import InsertionSuggestion, SpeechFilterArtifact, SpeechFilterCut
+from ..models.project import InsertionSuggestion, SpeechFilterArtifact, SpeechFilterCut, ZoomPreviewBeat
 from ..models.transcription import WordTimestamp
 
 CONTENT_STOPWORDS = {
@@ -106,9 +106,15 @@ class AIService:
         filename: str,
         words: Sequence[WordTimestamp],
         duration: float,
+        transcript_segments: Sequence[dict] | None = None,
         min_gap_seconds: float = 1.0,
     ) -> SpeechFilterArtifact:
         heuristic_cuts = self._heuristic_speech_filter_cuts(words, duration, min_gap_seconds=min_gap_seconds)
+        heuristic_zoom_beats = self._heuristic_zoom_beats(
+            words,
+            duration,
+            transcript_segments=transcript_segments,
+        )
         heuristic_artifact = SpeechFilterArtifact(
             project_id=project_id,
             track_id=track_id,
@@ -116,6 +122,7 @@ class AIService:
             status="completed",
             summary=self._build_speech_filter_summary(heuristic_cuts),
             cuts=heuristic_cuts,
+            zoom_beats=heuristic_zoom_beats,
             source_word_count=len(words),
             model="heuristic",
         )
@@ -124,17 +131,38 @@ class AIService:
             return heuristic_artifact
 
         prompt_lines = [f"{idx + 1}. {word.start:.2f}-{word.end:.2f}: {word.word}" for idx, word in enumerate(words)]
+        segment_hint_lines: List[str] = []
+        for idx, segment in enumerate(transcript_segments or []):
+            if not isinstance(segment, dict):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                seg_start = float(segment.get("start", 0.0) or 0.0)
+                seg_end = float(segment.get("end", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            segment_hint_lines.append(f"{idx + 1}. {seg_start:.2f}-{seg_end:.2f}: {text}")
         prompt = (
             "You are helping trim spoken video clips. "
             "Given the word-level transcript, identify conservative cut ranges that remove filler words, "
             "false starts, repeated words/phrases caused by re-starting pronunciation, and long pauses. "
+            "Also split the speech into logical, complete spoken beats for punch-in preview. "
+            "Each zoom beat should feel like a complete thought and usually last about 3 to 4 seconds. "
+            "Prefer grouping by meaning rather than rigid sentence boundaries. "
             "Do not cut meaningful content. "
-            "Return JSON object with keys summary:string and cuts:array. "
+            "Return JSON object with keys summary:string, cuts:array, and zoom_beats:array. "
             "Each cut must be {start:number, end:number, reason:string, transcript:string, confidence:number}. "
+            "Each zoom beat must be {start:number, end:number, text:string, enabled:boolean, scale:number}. "
+            "Use enabled=true only on selected beats where a slow center punch-in helps attention. "
+            "Use subtle scales around 1.10 to 1.16. "
             "Only propose cuts that are safe to remove.\n\n"
             f"Clip: {filename}\n"
             f"Duration: {duration:.2f} seconds\n"
             f"Minimum long-pause threshold: {min_gap_seconds:.2f} seconds\n\n"
+            + ("Existing transcript segment hints:\n" + "\n".join(segment_hint_lines) + "\n\n" if segment_hint_lines else "")
+            +
             "Word timeline:\n"
             + "\n".join(prompt_lines)
         )
@@ -154,12 +182,19 @@ class AIService:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(f"{self.base_url}/chat/completions", json=payload, headers=headers)
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
+            content = response.json()["choices"][0]["message"]["content"]
             data = json.loads(content)
             raw_cuts = data.get("cuts") if isinstance(data, dict) else None
             ai_cuts = self._sanitize_speech_filter_cuts(raw_cuts, words, duration)
+            ai_zoom_beats = self._sanitize_zoom_beats(
+                data.get("zoom_beats") if isinstance(data, dict) else None,
+                words,
+                duration,
+            )
             if not ai_cuts:
-                return heuristic_artifact
+                ai_cuts = heuristic_cuts
+            if not ai_zoom_beats:
+                ai_zoom_beats = heuristic_zoom_beats
             summary = str(data.get("summary") or self._build_speech_filter_summary(ai_cuts)).strip()
             return SpeechFilterArtifact(
                 project_id=project_id,
@@ -168,11 +203,141 @@ class AIService:
                 status="completed",
                 summary=summary or self._build_speech_filter_summary(ai_cuts),
                 cuts=ai_cuts,
+                zoom_beats=ai_zoom_beats,
                 source_word_count=len(words),
                 model=self.speech_filter_model,
             )
         except Exception:
             return heuristic_artifact
+
+    def _sanitize_zoom_beats(
+        self,
+        raw_beats: object,
+        words: Sequence[WordTimestamp],
+        duration: float,
+    ) -> List[ZoomPreviewBeat]:
+        if not isinstance(raw_beats, list):
+            return []
+
+        beats: List[ZoomPreviewBeat] = []
+        for item in raw_beats:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = max(0.0, float(item["start"]))
+                end = min(float(duration), float(item["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end - start < 1.0 or end <= start:
+                continue
+            text = str(item.get("text") or self._transcript_snippet(words, start, end)).strip()
+            try:
+                scale = max(1.0, min(1.2, float(item.get("scale", 1.12))))
+            except (TypeError, ValueError):
+                scale = 1.12
+            beats.append(
+                ZoomPreviewBeat(
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    duration=round(end - start, 3),
+                    text=text,
+                    enabled=bool(item.get("enabled", False)),
+                    scale=round(scale, 3),
+                )
+            )
+
+        beats.sort(key=lambda beat: (beat.start, beat.end))
+        return beats
+
+    def _heuristic_zoom_beats(
+        self,
+        words: Sequence[WordTimestamp],
+        duration: float,
+        *,
+        transcript_segments: Sequence[dict] | None = None,
+    ) -> List[ZoomPreviewBeat]:
+        raw_units: List[tuple[float, float, str]] = []
+        if transcript_segments:
+            for segment in transcript_segments:
+                if not isinstance(segment, dict):
+                    continue
+                start = max(0.0, float(segment.get("start", 0.0) or 0.0))
+                end = min(float(duration), float(segment.get("end", 0.0) or 0.0))
+                text = str(segment.get("text") or "").strip()
+                if text and end - start >= 0.7:
+                    raw_units.append((start, end, text))
+
+        if not raw_units:
+            raw_units = self._build_zoom_units_from_words(words, duration)
+
+        if not raw_units:
+            return []
+
+        beats: List[ZoomPreviewBeat] = []
+        cursor_start, cursor_end, cursor_text = raw_units[0]
+
+        def flush() -> None:
+            beat_duration = round(max(0.0, cursor_end - cursor_start), 3)
+            if beat_duration < 1.2:
+                return
+            index = len(beats)
+            label = re.sub(r"\s+", " ", cursor_text).strip()
+            beats.append(
+                ZoomPreviewBeat(
+                    start=round(cursor_start, 3),
+                    end=round(cursor_end, 3),
+                    duration=beat_duration,
+                    text=label,
+                    enabled=index % 2 == 0,
+                    scale=1.18 if index % 3 == 1 else 1.12,
+                )
+            )
+
+        for start, end, text in raw_units[1:]:
+            next_duration = end - cursor_start
+            gap = start - cursor_end
+            if next_duration <= 4.4 and gap <= 0.45:
+                cursor_end = end
+                cursor_text = f"{cursor_text} {text}".strip()
+                continue
+            flush()
+            cursor_start, cursor_end, cursor_text = start, end, text
+        flush()
+        return beats
+
+    def _build_zoom_units_from_words(
+        self,
+        words: Sequence[WordTimestamp],
+        duration: float,
+    ) -> List[tuple[float, float, str]]:
+        if not words:
+            return []
+        units: List[tuple[float, float, str]] = []
+        current_words: List[str] = [words[0].word]
+        current_start = words[0].start
+        current_end = words[0].end
+
+        def flush() -> None:
+            if current_words and current_end - current_start >= 0.7:
+                units.append((current_start, current_end, " ".join(current_words).strip()))
+
+        for previous, current in zip(words, words[1:]):
+            pause = current.start - previous.end
+            punctuation_break = previous.word.endswith((".", "!", "?", "…", ":"))
+            clause_break = pause >= 0.45
+            next_duration = current.end - current_start
+            if (punctuation_break and next_duration >= 2.0) or (clause_break and next_duration >= 2.2):
+                flush()
+                current_words = [current.word]
+                current_start = current.start
+                current_end = current.end
+                continue
+            current_words.append(current.word)
+            current_end = current.end
+        flush()
+        if not units:
+            units.append((words[0].start, min(duration, words[-1].end), " ".join(word.word for word in words)))
+        return units
 
     def _sanitize_speech_filter_cuts(
         self,

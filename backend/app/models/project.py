@@ -34,6 +34,13 @@ class TrackType(str, Enum):
     IMAGE = "image"
 
 
+class TrackOrientation(str, Enum):
+    HORIZONTAL = "horizontal"
+    VERTICAL = "vertical"
+    SQUARE = "square"
+    UNKNOWN = "unknown"
+
+
 class VideoTrack(BaseModel):
     """Model for video track data."""
     
@@ -49,6 +56,9 @@ class VideoTrack(BaseModel):
     transcription: Optional[Dict[str, Any]] = Field(None, description="Transcription data if available")
     has_voice: bool = Field(default=False, description="Whether narration/voice exists in track")
     recorded_at: Optional[datetime] = Field(None, description="Capture time used for chronological ordering")
+    orientation: TrackOrientation = Field(default=TrackOrientation.UNKNOWN, description="Normalized track orientation")
+    width: Optional[int] = Field(default=None, description="Normalized display width in pixels")
+    height: Optional[int] = Field(default=None, description="Normalized display height in pixels")
     local_gap_ranges: List["GapRange"] = Field(
         default_factory=list, description="Track-local pause ranges to remove"
     )
@@ -88,6 +98,17 @@ class SpeechFilterCut(BaseModel):
     confidence: float = Field(default=0.5, description="Confidence score from 0 to 1")
 
 
+class ZoomPreviewBeat(BaseModel):
+    """A logical transcript beat used for punch-in preview timing."""
+
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    duration: float = Field(..., description="Beat duration in seconds")
+    text: str = Field(default="", description="Transcript text associated with the beat")
+    enabled: bool = Field(default=False, description="Whether the zoom effect should apply on this beat")
+    scale: float = Field(default=1.12, description="Target scale for gradual center zoom preview")
+
+
 class SpeechFilterArtifact(BaseModel):
     """Persisted speech-filter suggestions for a single track."""
 
@@ -97,6 +118,10 @@ class SpeechFilterArtifact(BaseModel):
     status: Literal["completed", "error"] = Field(..., description="Generation result")
     summary: str = Field(default="", description="Human-readable summary of the suggested cuts")
     cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Suggested removable ranges")
+    zoom_beats: List[ZoomPreviewBeat] = Field(
+        default_factory=list,
+        description="Logical transcript beats used for preview zoom timing",
+    )
     generated_at: datetime = Field(default_factory=datetime.utcnow, description="Artifact creation timestamp")
     source_word_count: int = Field(default=0, description="Number of words evaluated")
     model: str = Field(default="heuristic", description="Model/provider used to generate the suggestions")

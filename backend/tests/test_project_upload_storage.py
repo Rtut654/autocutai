@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import types
@@ -668,7 +669,7 @@ def test_download_uses_resolved_output_path(tmp_path, monkeypatch):
 
 def test_track_speech_filter_route_persists_per_track_edit_json(tmp_path, monkeypatch):
     from backend.app.main import app
-    from backend.app.models.project import SpeechFilterArtifact, SpeechFilterCut
+    from backend.app.models.project import SpeechFilterArtifact, SpeechFilterCut, ZoomPreviewBeat
     from backend.app.services.ai_service import ai_service
     from backend.app.services.auth_service import auth_service
     from backend.app.services.project_service import project_service
@@ -702,6 +703,24 @@ def test_track_speech_filter_route_persists_per_track_edit_json(tmp_path, monkey
                     reason="long_pause",
                     transcript="",
                     confidence=0.98,
+                ),
+            ],
+            zoom_beats=[
+                ZoomPreviewBeat(
+                    start=0.0,
+                    end=3.4,
+                    duration=3.4,
+                    text="Here are the most important strategies.",
+                    enabled=True,
+                    scale=1.12,
+                ),
+                ZoomPreviewBeat(
+                    start=3.4,
+                    end=6.0,
+                    duration=2.6,
+                    text="for TOEFL listening task two conversations.",
+                    enabled=False,
+                    scale=1.12,
                 ),
             ],
             generated_at=datetime(2026, 4, 26),
@@ -767,6 +786,8 @@ def test_track_speech_filter_route_persists_per_track_edit_json(tmp_path, monkey
     stored_artifact = json.loads(edit_file.read_text(encoding="utf-8"))
     assert stored_artifact["track_id"] == track_id
     assert stored_artifact["cuts"][0]["reason"] == "filler_word"
+    assert stored_artifact["zoom_beats"][0]["enabled"] is True
+    assert stored_artifact["zoom_beats"][0]["text"] == "Here are the most important strategies."
 
     refreshed_project = json.loads(project_file.read_text(encoding="utf-8"))
     metadata = refreshed_project["tracks"][0]["metadata"]
@@ -847,7 +868,7 @@ def test_get_track_speech_filter_returns_saved_artifact(tmp_path, monkeypatch):
 
 def test_patch_track_speech_filter_updates_saved_artifact(tmp_path, monkeypatch):
     from backend.app.main import app
-    from backend.app.models.project import SpeechFilterArtifact, SpeechFilterCut
+    from backend.app.models.project import SpeechFilterArtifact, SpeechFilterCut, ZoomPreviewBeat
     from backend.app.services.auth_service import auth_service
     from backend.app.services.project_service import project_service
 
@@ -896,6 +917,16 @@ def test_patch_track_speech_filter_updates_saved_artifact(tmp_path, monkeypatch)
                 confidence=0.91,
             )
         ],
+        zoom_beats=[
+            ZoomPreviewBeat(
+                start=0.0,
+                end=3.0,
+                duration=3.0,
+                text="Original logical beat",
+                enabled=True,
+                scale=1.12,
+            )
+        ],
         generated_at=datetime(2026, 4, 26),
         source_word_count=4,
         model="heuristic",
@@ -929,6 +960,30 @@ def test_patch_track_speech_filter_updates_saved_artifact(tmp_path, monkeypatch)
     stored = json.loads(edit_file.read_text(encoding="utf-8"))
     assert stored["cuts"][0]["reason"] == "manual_adjustment"
     assert stored["cuts"][0]["transcript"] == "retry phrase"
+    assert stored["zoom_beats"][0]["text"] == "Original logical beat"
+
+
+def test_heuristic_zoom_beats_group_logical_parts_from_segments():
+    from backend.app.services.ai_service import ai_service
+
+    beats = ai_service._heuristic_zoom_beats(
+        [],
+        20.0,
+        transcript_segments=[
+            {"start": 0.0, "end": 1.2, "text": "Here are the most important strategies"},
+            {"start": 1.25, "end": 2.6, "text": "for TOEFL Listening Task 2 conversations."},
+            {"start": 3.4, "end": 4.6, "text": "In this task you'll hear conversations"},
+            {"start": 4.65, "end": 6.7, "text": "between two speakers and then questions."},
+        ],
+    )
+
+    assert len(beats) == 2
+    assert beats[0].start == 0.0
+    assert beats[0].end == 2.6
+    assert "important strategies" in beats[0].text
+    assert beats[0].enabled is True
+    assert beats[1].start == 3.4
+    assert beats[1].end == 6.7
 
 
 def test_speech_filter_heuristic_detects_rephrased_restart_after_pause():
@@ -1059,3 +1114,120 @@ def test_align_transcription_to_detected_silence_repairs_broken_edge_timestamps(
     assert aligned["segments"][0]["start"] == 6.664
     assert aligned["words"][-1]["end"] == 111.943
     assert aligned["segments"][-1]["end"] == 111.943
+
+
+def test_build_transcription_windows_splits_long_speech_ranges():
+    from backend.app.services.project_service import project_service
+
+    windows = project_service._build_transcription_windows(
+        [(0.0, 6.664), (13.255, 13.341), (111.943, 116.615)],
+        117.0,
+    )
+
+    assert windows[:2] == [(6.664, 10.164), (10.164, 13.255)]
+    assert windows[-1] == (116.615, 117.0)
+
+
+def test_transcribe_audio_with_chunking_offsets_words(tmp_path, monkeypatch):
+    from backend.app.services.project_service import project_service
+    from backend.app.services.video_processor import VideoProcessor
+
+    async def fake_extract_audio_segment(self, source_path, output_path, start, end):
+        Path(output_path).write_bytes(f"{start:.3f}-{end:.3f}".encode("utf-8"))
+        return str(output_path)
+
+    async def fake_transcribe_audio(audio_data: bytes, filename: str, language: str = "en"):
+        marker = audio_data.decode("utf-8")
+        if marker.startswith("6.514-10.314"):
+            return {
+                "text": "Here are the most",
+                "language": "en",
+                "words": [
+                    {"word": "Here", "start": 0.15, "end": 0.45},
+                    {"word": "are", "start": 0.45, "end": 0.60},
+                    {"word": "the", "start": 0.60, "end": 0.75},
+                    {"word": "most", "start": 0.75, "end": 1.0},
+                ],
+                "segments": [],
+            }
+        if marker.startswith("10.014-13.405"):
+            return {
+                "text": "important strategies",
+                "language": "en",
+                "words": [
+                    {"word": "important", "start": 0.15, "end": 0.65},
+                    {"word": "strategies", "start": 0.65, "end": 1.10},
+                ],
+                "segments": [],
+            }
+        return {"text": "", "language": "en", "words": [], "segments": []}
+
+    monkeypatch.setattr(VideoProcessor, "extract_audio_segment", fake_extract_audio_segment)
+    monkeypatch.setattr("backend.app.services.project_service.transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path)
+
+    processor = VideoProcessor()
+    result = asyncio.run(
+        project_service._transcribe_audio_with_chunking(
+            "fake.wav",
+            20.0,
+            [(0.0, 6.664), (13.255, 13.341)],
+            processor=processor,
+        )
+    )
+
+    assert result is not None
+    assert [word["word"] for word in result["words"]] == ["Here", "are", "the", "most", "important", "strategies"]
+    assert result["words"][0]["start"] == 6.664
+    assert result["words"][-1]["end"] == 11.114
+
+
+def test_extract_track_geometry_from_media_info_handles_rotation():
+    from backend.app.models.project import TrackOrientation
+    from backend.app.services.project_service import project_service
+
+    width, height, orientation = project_service._extract_track_geometry_from_media_info(
+        [
+            {
+                "codec_type": "video",
+                "width": 1920,
+                "height": 1080,
+                "side_data_list": [{"rotation": 90}],
+            }
+        ]
+    )
+
+    assert width == 1080
+    assert height == 1920
+    assert orientation == TrackOrientation.VERTICAL
+
+
+def test_create_track_from_file_sets_orientation_and_dimensions(tmp_path, monkeypatch):
+    from backend.app.models.project import TrackOrientation
+    from backend.app.services.project_service import project_service
+    from backend.app.services.video_processor import VideoProcessor
+
+    clip_path = tmp_path / "portrait.mov"
+    clip_path.write_bytes(b"video")
+
+    async def fake_get_video_info(self, source_path: str):
+        return {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "tags": {"rotate": "90"},
+                }
+            ],
+            "format": {"duration": "12.5", "tags": {}},
+        }
+
+    monkeypatch.setattr(VideoProcessor, "get_video_info", fake_get_video_info)
+
+    track = asyncio.run(project_service._create_track_from_file(str(clip_path), 0, None, {}))
+
+    assert track.duration == 12.5
+    assert track.width == 1080
+    assert track.height == 1920
+    assert track.orientation == TrackOrientation.VERTICAL

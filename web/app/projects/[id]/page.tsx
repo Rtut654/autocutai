@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { api } from "../../../lib/api";
 import { getStoredSession, setLastProjectId } from "../../../lib/session";
-import type { ProjectDetail, ProjectTrack, SpeechFilterArtifact, SpeechFilterCut, TranscriptSegment } from "../../../lib/types";
+import type { ProjectDetail, ProjectTrack, SpeechFilterArtifact, SpeechFilterCut, TranscriptSegment, ZoomPreviewBeat } from "../../../lib/types";
 
 type TranscriptStatus = "pending" | "processing" | "completed" | "error" | "not_applicable";
 const MEDIA_BLOB_CACHE_NAME = "bestshotai-track-media-v1";
@@ -59,12 +59,25 @@ function formatDuration(seconds: number): string {
   return formatTime(seconds || 0);
 }
 
+function formatOrientation(value?: ProjectTrack["orientation"]): string | null {
+  if (!value || value === "unknown") return null;
+  if (value === "horizontal") return "Horizontal";
+  if (value === "vertical") return "Vertical";
+  if (value === "square") return "Square";
+  return null;
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
 function roundToMillis(value: number): number {
   return Math.round(value * 1000) / 1000;
+}
+
+function easeOutCubic(value: number): number {
+  const clamped = clamp(value, 0, 1);
+  return 1 - Math.pow(1 - clamped, 3);
 }
 
 function formatSpeechFilterReason(value: string): string {
@@ -134,6 +147,62 @@ function normalizeEditableCuts(cuts: SpeechFilterCut[]): SpeechFilterCut[] {
       duration: roundToMillis(Math.max(0, cut.end - cut.start)),
     }))
     .sort((left, right) => left.start - right.start);
+}
+
+function buildZoomPreviewBeats(track: ProjectTrack): Array<ZoomPreviewBeat & { id: string; label: string }> {
+  const segments = getTranscriptSegments(track)
+    .map((segment) => ({
+      start: Math.max(0, segment.start || 0),
+      end: Math.max(segment.start || 0, segment.end || 0),
+      text: String(segment.text || "").trim(),
+    }))
+    .filter((segment) => segment.text && segment.end - segment.start >= 0.8)
+    .sort((left, right) => left.start - right.start);
+
+  if (segments.length === 0) {
+    return [];
+  }
+
+  const merged: ZoomPreviewBeat[] = [];
+  let currentStart = segments[0].start;
+  let currentEnd = segments[0].end;
+  let currentText = segments[0].text;
+
+  const flush = () => {
+    const duration = roundToMillis(Math.max(0, currentEnd - currentStart));
+    if (duration < 1.2) return;
+    const index = merged.length;
+    const normalizedLabel = currentText.replace(/\s+/g, " ").trim();
+    merged.push({
+      start: roundToMillis(currentStart),
+      end: roundToMillis(currentEnd),
+      duration,
+      text: normalizedLabel,
+      scale: index % 3 === 1 ? 1.18 : 1.12,
+      enabled: index % 2 === 0,
+    });
+  };
+
+  for (let index = 1; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const nextDuration = segment.end - currentStart;
+    const gap = segment.start - currentEnd;
+    if (nextDuration <= 4.3 && gap <= 0.55) {
+      currentEnd = segment.end;
+      currentText = `${currentText} ${segment.text}`.trim();
+      continue;
+    }
+    flush();
+    currentStart = segment.start;
+    currentEnd = segment.end;
+    currentText = segment.text;
+  }
+  flush();
+  return merged.map((beat, index) => ({
+    ...beat,
+    id: `zoom-${index + 1}`,
+    label: beat.text.length > 88 ? `${beat.text.slice(0, 85).trim()}...` : beat.text,
+  }));
 }
 
 function isTrackTranscribable(track: ProjectTrack): boolean {
@@ -417,6 +486,7 @@ function ClipCard({
   const videoRef = useRef<HTMLVideoElement>(null);
   const [posterReady, setPosterReady] = useState(false);
   const clipCreatedAt = track.recorded_at || projectCreatedAt;
+  const orientationLabel = formatOrientation(track.orientation);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -479,6 +549,12 @@ function ClipCard({
           <strong className="clipFileName" title={track.filename}>{track.filename}</strong>
           <span className="muted">{formatDate(clipCreatedAt)}</span>
           <span className="muted">Duration: {formatDuration(track.duration)}</span>
+          {orientationLabel ? (
+            <span className="muted">
+              {orientationLabel}
+              {track.width && track.height ? ` • ${track.width}×${track.height}` : ""}
+            </span>
+          ) : null}
         </div>
         <TranscriptPanel
           track={track}
@@ -514,8 +590,31 @@ function SpeechFilterEditor({
   const [editableCuts, setEditableCuts] = useState<SpeechFilterCut[]>(() => normalizeEditableCuts(artifact.cuts));
   const [selectedCutIndex, setSelectedCutIndex] = useState(0);
   const [dragState, setDragState] = useState<{ cutIndex: number; edge: "start" | "end" } | null>(null);
+  const [zoomPreviewEnabled, setZoomPreviewEnabled] = useState(true);
   const skipInFlightRef = useRef(false);
+  const animationFrameRef = useRef<number | null>(null);
   const duration = Math.max(track.duration || 0, 0.1);
+  const zoomBeats = useMemo(() => {
+    if (artifact.zoom_beats?.length) {
+      return artifact.zoom_beats.map((beat, index) => ({
+        ...beat,
+        id: `zoom-${index + 1}`,
+        label: beat.text.length > 88 ? `${beat.text.slice(0, 85).trim()}...` : beat.text,
+      }));
+    }
+    return buildZoomPreviewBeats(track);
+  }, [artifact.zoom_beats, track]);
+  const activeZoomBeat = useMemo(() => {
+    if (!zoomPreviewEnabled) return null;
+    return zoomBeats.find((beat) => beat.enabled && currentTime >= beat.start && currentTime <= beat.end) || null;
+  }, [currentTime, zoomBeats, zoomPreviewEnabled]);
+  const videoTransform = useMemo(() => {
+    if (!activeZoomBeat) return "scale(1)";
+    const progress = clamp((currentTime - activeZoomBeat.start) / Math.max(activeZoomBeat.duration, 0.001), 0, 1);
+    const eased = easeOutCubic(progress);
+    const scale = 1 + (activeZoomBeat.scale - 1) * eased;
+    return `scale(${scale.toFixed(4)})`;
+  }, [activeZoomBeat, currentTime]);
 
   useEffect(() => {
     setEditableCuts(normalizeEditableCuts(artifact.cuts));
@@ -523,21 +622,50 @@ function SpeechFilterEditor({
   }, [artifact]);
 
   useEffect(() => {
+    setZoomPreviewEnabled(zoomBeats.some((beat) => beat.enabled));
+  }, [zoomBeats]);
+
+  useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
     const syncTime = () => setCurrentTime(video.currentTime || 0);
+    const tick = () => {
+      syncTime();
+      if (!video.paused && !video.ended) {
+        animationFrameRef.current = window.requestAnimationFrame(tick);
+      } else {
+        animationFrameRef.current = null;
+      }
+    };
+    const startTick = () => {
+      if (animationFrameRef.current !== null) return;
+      animationFrameRef.current = window.requestAnimationFrame(tick);
+    };
+    const stopTick = () => {
+      if (animationFrameRef.current !== null) {
+        window.cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+    };
     const syncPlay = () => setIsPlaying(true);
     const syncPause = () => setIsPlaying(false);
 
     video.addEventListener("timeupdate", syncTime);
     video.addEventListener("play", syncPlay);
+    video.addEventListener("play", startTick);
     video.addEventListener("pause", syncPause);
+    video.addEventListener("pause", stopTick);
+    video.addEventListener("ended", stopTick);
     video.addEventListener("loadedmetadata", syncTime);
     return () => {
+      stopTick();
       video.removeEventListener("timeupdate", syncTime);
       video.removeEventListener("play", syncPlay);
+      video.removeEventListener("play", startTick);
       video.removeEventListener("pause", syncPause);
+      video.removeEventListener("pause", stopTick);
+      video.removeEventListener("ended", stopTick);
       video.removeEventListener("loadedmetadata", syncTime);
     };
   }, []);
@@ -642,10 +770,16 @@ function SpeechFilterEditor({
           src={src}
           preload="metadata"
           playsInline
+          style={{ transform: videoTransform }}
         />
         {activeCut ? (
           <div className="speechEditorVideoNotice">
             Suggested cut: {formatSpeechFilterReason(activeCut.reason)}
+          </div>
+        ) : null}
+        {activeZoomBeat ? (
+          <div className="speechEditorZoomNotice">
+            Zoom beat: {formatTime(activeZoomBeat.start)} - {formatTime(activeZoomBeat.end)}
           </div>
         ) : null}
       </div>
@@ -653,6 +787,14 @@ function SpeechFilterEditor({
       <div className="speechEditorControls">
         <button type="button" className="btn secondary" onClick={togglePlayback}>
           {isPlaying ? "Pause" : "Play"}
+        </button>
+        <button
+          type="button"
+          className={`btn secondary ${zoomPreviewEnabled ? "speechEditorToggleActive" : ""}`}
+          onClick={() => setZoomPreviewEnabled((current) => !current)}
+          disabled={zoomBeats.length === 0}
+        >
+          {zoomPreviewEnabled ? "Zoom Preview On" : "Zoom Preview Off"}
         </button>
         <button
           type="button"
@@ -677,6 +819,18 @@ function SpeechFilterEditor({
         <div ref={timelineRef} className="speechEditorTimeline" onClick={handleTimelineClick}>
           <div className="speechEditorTimelineBase" />
           <div className="speechEditorTimelinePlayed" style={{ width: `${(currentTime / duration) * 100}%` }} />
+          {zoomBeats.map((beat) => {
+            const left = (beat.start / duration) * 100;
+            const width = ((beat.end - beat.start) / duration) * 100;
+            return (
+              <div
+                key={beat.id}
+                className={`speechEditorZoomBeat ${beat.enabled ? "speechEditorZoomBeatEnabled" : ""}`}
+                style={{ left: `${left}%`, width: `${width}%` }}
+                title={`${formatTime(beat.start)} - ${formatTime(beat.end)} ${beat.enabled ? "center zoom" : "no zoom"}`}
+              />
+            );
+          })}
           {editableCuts.map((cut, index) => {
             const left = (cut.start / duration) * 100;
             const width = ((cut.end - cut.start) / duration) * 100;
@@ -723,8 +877,27 @@ function SpeechFilterEditor({
         <div className="speechEditorSummary">
           <strong>{artifact.summary}</strong>
           <span className="muted">Drag the left or right edge of each red block to adjust the cut.</span>
+          {zoomBeats.length > 0 ? (
+            <span className="muted">
+              Center zoom preview is generated from transcript beats. Blue blocks mark beats, darker blue means zoom-in.
+            </span>
+          ) : null}
           {saveError ? <span className="speechEditorError">{saveError}</span> : null}
         </div>
+        {zoomBeats.length > 0 ? (
+          <div className="speechEditorZoomList">
+            {zoomBeats.map((beat) => (
+              <div
+                key={`${beat.id}-row`}
+                className={`speechEditorZoomRow ${beat.enabled ? "speechEditorZoomRowEnabled" : ""} ${activeZoomBeat?.id === beat.id ? "speechEditorZoomRowActive" : ""}`}
+              >
+                <strong>{formatTime(beat.start)} - {formatTime(beat.end)}</strong>
+                <span>{beat.enabled ? `Center zoom ${beat.scale.toFixed(2)}x` : "Normal framing"}</span>
+                <span className="muted">{beat.label}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
         <div className="speechEditorCutList">
           {editableCuts.map((cut, index) => (
             <button
@@ -782,6 +955,9 @@ function PreviewModal({
             <strong className="clipFileName">{track.filename}</strong>
             <span className="muted">
               {formatDate(track.recorded_at || projectCreatedAt)} • {formatDuration(track.duration)}
+              {formatOrientation(track.orientation)
+                ? ` • ${formatOrientation(track.orientation)}${track.width && track.height ? ` ${track.width}×${track.height}` : ""}`
+                : ""}
             </span>
           </div>
           <button type="button" className="previewModalClose" onClick={onClose}>×</button>

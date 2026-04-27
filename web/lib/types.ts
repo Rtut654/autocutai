@@ -71,6 +71,15 @@ export type SpeechFilterCut = {
   confidence: number;
 };
 
+export type ZoomPreviewBeat = {
+  start: number;
+  end: number;
+  duration: number;
+  text: string;
+  enabled: boolean;
+  scale: number;
+};
+
 export type SpeechFilterArtifact = {
   project_id: string;
   track_id: string;
@@ -78,6 +87,7 @@ export type SpeechFilterArtifact = {
   status: "completed" | "error";
   summary: string;
   cuts: SpeechFilterCut[];
+  zoom_beats: ZoomPreviewBeat[];
   generated_at: string;
   source_word_count: number;
   model: string;
@@ -90,6 +100,9 @@ export type ProjectTrack = {
   filename: string;
   file_path: string;
   duration: number;
+  orientation?: "horizontal" | "vertical" | "square" | "unknown";
+  width?: number | null;
+  height?: number | null;
   start_time?: number | null;
   end_time?: number | null;
   position: number;

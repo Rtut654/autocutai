@@ -835,6 +835,8 @@ input, select {
   max-height: 62vh;
   display: block;
   background: #0f1523;
+  transform-origin: center center;
+  will-change: transform;
 }
 
 .speechEditorVideoNotice {
@@ -844,6 +846,18 @@ input, select {
   padding: 8px 12px;
   border-radius: 999px;
   background: rgba(185, 28, 28, 0.86);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.speechEditorZoomNotice {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(21, 84, 146, 0.9);
   color: #fff;
   font-size: 13px;
   font-weight: 700;
@@ -862,6 +876,11 @@ input, select {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   margin-left: auto;
+}
+
+.speechEditorToggleActive {
+  border-color: #155492;
+  color: #155492;
 }
 
 .speechEditorTimelineWrap {
@@ -898,6 +917,19 @@ input, select {
   transform: translateY(-50%);
   border-radius: 999px;
   background: #89b6e2;
+}
+
+.speechEditorZoomBeat {
+  position: absolute;
+  top: 15px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(167, 204, 240, 0.55);
+  pointer-events: none;
+}
+
+.speechEditorZoomBeatEnabled {
+  background: rgba(73, 139, 207, 0.52);
 }
 
 .speechEditorCut {
@@ -972,6 +1004,30 @@ input, select {
 .speechEditorCutList {
   display: grid;
   gap: 10px;
+}
+
+.speechEditorZoomList {
+  display: grid;
+  gap: 10px;
+}
+
+.speechEditorZoomRow {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #dbe5ef;
+  border-radius: 14px;
+  background: #fff;
+  padding: 12px 14px;
+}
+
+.speechEditorZoomRowEnabled {
+  border-color: #a8caee;
+  background: #f5faff;
+}
+
+.speechEditorZoomRowActive {
+  border-color: #498bcf;
+  box-shadow: 0 0 0 1px rgba(73, 139, 207, 0.14);
 }
 
 .speechEditorCutRow {
