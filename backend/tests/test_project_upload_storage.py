@@ -308,8 +308,19 @@ def test_render_track_version_persists_version_and_downloads(tmp_path, monkeypat
         Path(output_path).write_bytes(b"rendered-track-version")
         return str(output_path)
 
+    async def fake_generate_background_music_track(self, output_path, *, duration, preset):
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(b"bgm-track")
+        return str(output_path)
+
+    async def fake_mix_background_music(self, video_input, music_input, output_path, *, music_volume, ducking):
+        Path(output_path).write_bytes(b"rendered-track-version-with-bgm")
+        return str(output_path)
+
     monkeypatch.setattr(VideoProcessor, "get_video_info", fake_get_video_info)
     monkeypatch.setattr(VideoProcessor, "render_source_segments", fake_render_source_segments)
+    monkeypatch.setattr(VideoProcessor, "generate_background_music_track", fake_generate_background_music_track)
+    monkeypatch.setattr(VideoProcessor, "mix_background_music", fake_mix_background_music)
 
     client = TestClient(app)
     signup_response = client.post(
@@ -332,6 +343,18 @@ def test_render_track_version_persists_version_and_downloads(tmp_path, monkeypat
     project = create_response.json()["project"]
     project_id = project["id"]
     track_id = project["tracks"][0]["id"]
+
+    bgm_response = client.patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/background-music",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "enabled": True,
+            "preset": "warm_focus",
+            "volume": 0.18,
+            "ducking": 0.7,
+        },
+    )
+    assert bgm_response.status_code == 200
 
     render_response = client.post(
         f"/api/projects/{project_id}/tracks/{track_id}/render",
@@ -370,7 +393,59 @@ def test_render_track_version_persists_version_and_downloads(tmp_path, monkeypat
         headers={"Authorization": f"Bearer {token}"},
     )
     assert download_response.status_code == 200
-    assert download_response.content == b"rendered-track-version"
+    assert download_response.content == b"rendered-track-version-with-bgm"
+
+
+def test_update_track_background_music_persists_to_project(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "bgm@example.com",
+            "password": "password123",
+            "full_name": "BGM User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "BGM Test"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project = create_response.json()["project"]
+    project_id = project["id"]
+    track_id = project["tracks"][0]["id"]
+
+    response = client.patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/background-music",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "enabled": True,
+            "preset": "upbeat_motion",
+            "volume": 0.2,
+            "ducking": 0.68,
+        },
+    )
+
+    assert response.status_code == 200
+    track = response.json()["project"]["tracks"][0]
+    assert track["background_music"]["enabled"] is True
+    assert track["background_music"]["preset"] == "upbeat_motion"
+    assert track["background_music"]["volume"] == 0.2
+    assert track["background_music"]["ducking"] == 0.68
 
 
 def test_create_project_requires_authenticated_user(tmp_path, monkeypatch):

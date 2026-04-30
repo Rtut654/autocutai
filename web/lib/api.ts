@@ -1,5 +1,6 @@
 import {
   AuthResponse,
+  BackgroundVideoPlanArtifact,
   BillingPlan,
   BillingPlanKey,
   ProjectListResponse,
@@ -293,6 +294,15 @@ export const api = {
   async getProject(projectId: string, token?: string) {
     return request<ProjectResponse>(`/api/projects/${projectId}`, "GET", token);
   },
+  async deleteProject(projectId: string, token?: string) {
+    return request<{ message: string }>(`/api/projects/${projectId}`, "DELETE", token);
+  },
+  async getBackgroundVideoPlan(projectId: string, token?: string) {
+    return request<BackgroundVideoPlanArtifact>(`/api/projects/${projectId}/background-video-plan`, "GET", token);
+  },
+  async generateBackgroundVideoPlan(projectId: string, token?: string) {
+    return request<BackgroundVideoPlanArtifact>(`/api/projects/${projectId}/background-video-plan`, "POST", token, {});
+  },
   getTrackMediaUrl(projectId: string, trackId: string) {
     return `${getApiBase()}/api/projects/${projectId}/tracks/${trackId}/media`;
   },
@@ -315,10 +325,18 @@ export const api = {
       token,
     );
   },
-  async addTracksToProject(projectId: string, files: File[], token?: string) {
+  async addTracksToProject(
+    projectId: string,
+    files: File[],
+    token?: string,
+    options?: {
+      captureTimes?: Array<string | null>;
+      metadata?: Array<Record<string, unknown>>;
+    },
+  ) {
     const form = new FormData();
-    form.append("capture_times_json", JSON.stringify(files.map(() => null)));
-    form.append("metadata_json", JSON.stringify(files.map(() => ({}))));
+    form.append("capture_times_json", JSON.stringify(options?.captureTimes || files.map(() => null)));
+    form.append("metadata_json", JSON.stringify(options?.metadata || files.map(() => ({}))));
     files.forEach((file) => form.append("files", file));
     return requestMultipart<ProjectResponse>(`/api/projects/${projectId}/tracks`, form, token);
   },
@@ -329,7 +347,7 @@ export const api = {
     return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "GET", token);
   },
   async generateTrackSpeechFilter(projectId: string, trackId: string, token?: string) {
-    return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "POST", token, {});
+    return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "POST", token, {}, 240000);
   },
   async updateTrackSpeechFilter(projectId: string, trackId: string, cuts: SpeechFilterArtifact["cuts"], token?: string) {
     return request<SpeechFilterArtifact>(`/api/projects/${projectId}/tracks/${trackId}/speech-filter`, "PATCH", token, { cuts });
@@ -342,6 +360,34 @@ export const api = {
   },
   async generateTrackVisualPlan(projectId: string, trackId: string, token?: string) {
     return request<VisualPlanArtifact>(`/api/projects/${projectId}/tracks/${trackId}/visual-plan`, "POST", token, {}, 240000);
+  },
+  async updateTrackBackgroundMusic(
+    projectId: string,
+    trackId: string,
+    payload: { enabled: boolean; preset: "ambient_pulse" | "upbeat_motion" | "warm_focus"; volume: number; ducking: number },
+    token?: string,
+  ) {
+    return request<ProjectResponse>(
+      `/api/projects/${projectId}/tracks/${trackId}/background-music`,
+      "PATCH",
+      token,
+      payload,
+      30000,
+    );
+  },
+  async updateTrackBackgroundVideo(
+    projectId: string,
+    trackId: string,
+    payload: { role: "primary" | "background"; background_description?: string | null },
+    token?: string,
+  ) {
+    return request<ProjectResponse>(
+      `/api/projects/${projectId}/tracks/${trackId}/background-video`,
+      "PATCH",
+      token,
+      payload,
+      30000,
+    );
   },
   async renderTrack(projectId: string, trackId: string, cuts: SpeechFilterArtifact["cuts"], token?: string) {
     return request<TrackRenderResponse>(

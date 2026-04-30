@@ -1,0 +1,30 @@
+{
+  "users": [
+    {
+      "id": "103385296343735012789",
+      "email": "rtut654@gmail.com",
+      "password_hash": "",
+      "full_name": "Kirill O'nayd",
+      "picture": "https://lh3.googleusercontent.com/a/ACg8ocJRayAIcn_6_gj_2jwvUlLvdvrr3ArcDbb0TNaRvS8HQsV5rWWF=s96-c",
+      "provider": "google",
+      "provider_user_id": "103385296343735012789",
+      "created_at": "2026-04-29T21:55:38.909348",
+      "onboarding_completed": false,
+      "onboarding": {
+        "goal": null,
+        "niche": null,
+        "preferred_edit_style": null
+      },
+      "subscription_plan": "free"
+    }
+  ],
+  "tokens_to_user_id": {
+    "fwQdcgeWNEzHukWx4uf1PX220ctHxhYgJMR2VaOe3cM": "103385296343735012789"
+  },
+  "refresh_tokens_to_user_id": {
+    "JK8brDrGf1Jr0vEkF10hPWL5I3h7R3WDimXNFLU0AGw": "103385296343735012789"
+  },
+  "users_by_provider_identity": {
+    "google:103385296343735012789": "103385296343735012789"
+  }
+}

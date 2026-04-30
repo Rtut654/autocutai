@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { api } from "../../../lib/api";
 import { getStoredSession, setLastProjectId } from "../../../lib/session";
-import type { ProjectDetail, ProjectTrack, SpeechFilterArtifact, SpeechFilterCut, TrackRenderVersion, TranscriptSegment, VisualPlanArtifact, VisualPlanPart, ZoomPreviewBeat } from "../../../lib/types";
+import type { BackgroundMusicSettings, BackgroundVideoPlanArtifact, ProjectDetail, ProjectTrack, SpeechFilterArtifact, SpeechFilterCut, TrackRenderVersion, TranscriptSegment, VisualPlanArtifact, VisualPlanPart, ZoomPreviewBeat } from "../../../lib/types";
 
 type TranscriptStatus = "pending" | "processing" | "completed" | "error" | "not_applicable";
 const MEDIA_BLOB_CACHE_NAME = "bestshotai-track-media-v1";
@@ -177,6 +177,28 @@ type VisualSfxKind =
   | "whoosh_rise"
   | "pop_air";
 
+type SoundSpec = {
+  duration: number;
+  tones?: Array<{ start: number; end: number; fromHz: number; toHz: number; gain: number; type?: "sine" | "square" | "triangle" }>;
+  noises?: Array<{ start: number; end: number; fromHz: number; toHz: number; gain: number }>;
+};
+
+type BackgroundMusicPreset = BackgroundMusicSettings["preset"];
+const COMMON_TRANSITION_SFX: VisualSfxKind = "whoosh_soft";
+
+const DEFAULT_BACKGROUND_MUSIC: BackgroundMusicSettings = {
+  enabled: true,
+  preset: "upbeat_motion",
+  volume: 0.82,
+  ducking: 0.5,
+};
+
+const BACKGROUND_MUSIC_LABELS: Record<BackgroundMusicPreset, string> = {
+  ambient_pulse: "Ambient",
+  upbeat_motion: "Upbeat",
+  warm_focus: "Warm",
+};
+
 function hashString(value: string): number {
   let hash = 0;
   for (let index = 0; index < value.length; index += 1) {
@@ -311,89 +333,241 @@ function buildAnimationSpec(part: VisualPlanPart, partIndex: number): VisualAnim
 }
 
 function inferVisualSfx(part: VisualPlanPart, spec: VisualAnimationSpec): VisualSfxKind {
-  const explicit = String(part.sfx || "").trim().toLowerCase() as VisualSfxKind;
-  if (["ui_click_soft", "ui_click_snap", "whoosh_soft", "whoosh_rise", "pop_air"].includes(explicit)) {
-    return explicit;
-  }
-  if (part.visual_type === "web_image") {
-    return spec.motionProfile === "crisp" ? "ui_click_snap" : "whoosh_soft";
-  }
-  if (spec.motif === "question_answer" || spec.motif === "checklist_reveal" || spec.motif === "chart_pop" || spec.motif === "object_spotlight") {
-    return spec.motionProfile === "punchy" ? "ui_click_snap" : "ui_click_soft";
-  }
-  if (spec.motif === "compare_problem_solution" || spec.motif === "decision_split" || spec.motif === "timeline_sequence") {
-    return "whoosh_rise";
-  }
-  if (spec.motif === "conversation_flow" || spec.motif === "process_arrow" || spec.motif === "map_pointer") {
-    return "whoosh_soft";
-  }
-  return spec.motionProfile === "elastic" ? "pop_air" : "ui_click_soft";
+  void part;
+  void spec;
+  return COMMON_TRANSITION_SFX;
 }
 
-function createNoiseBuffer(context: AudioContext, durationSeconds: number): AudioBuffer {
-  const length = Math.max(1, Math.floor(context.sampleRate * durationSeconds));
-  const buffer = context.createBuffer(1, length, context.sampleRate);
-  const data = buffer.getChannelData(0);
-  for (let index = 0; index < length; index += 1) {
-    data[index] = Math.random() * 2 - 1;
+function getVisualSfxSpec(kind: VisualSfxKind): SoundSpec {
+  switch (kind) {
+    case "ui_click_snap":
+      return {
+        duration: 0.16,
+        tones: [{ start: 0, end: 0.055, fromHz: 1600, toHz: 700, gain: 0.95, type: "square" }],
+      };
+    case "whoosh_soft":
+      return {
+        duration: 0.2,
+        tones: [
+          { start: 0.015, end: 0.09, fromHz: 520, toHz: 300, gain: 0.08, type: "triangle" },
+          { start: 0.02, end: 0.07, fromHz: 1500, toHz: 980, gain: 0.05, type: "sine" },
+        ],
+        noises: [
+          { start: 0, end: 0.18, fromHz: 700, toHz: 4200, gain: 0.22 },
+          { start: 0.04, end: 0.2, fromHz: 420, toHz: 1600, gain: 0.12 },
+        ],
+      };
+    case "whoosh_rise":
+      return {
+        duration: 0.38,
+        noises: [{ start: 0, end: 0.34, fromHz: 620, toHz: 2500, gain: 0.48 }],
+      };
+    case "pop_air":
+      return {
+        duration: 0.18,
+        tones: [{ start: 0, end: 0.12, fromHz: 920, toHz: 520, gain: 0.52, type: "triangle" }],
+        noises: [{ start: 0, end: 0.12, fromHz: 980, toHz: 1800, gain: 0.18 }],
+      };
+    default:
+      return {
+        duration: 0.14,
+        tones: [{ start: 0, end: 0.06, fromHz: 1040, toHz: 720, gain: 0.68, type: "square" }],
+      };
   }
-  return buffer;
 }
 
-function playVisualSfx(context: AudioContext, kind: VisualSfxKind): void {
-  const now = context.currentTime + 0.01;
-  const compressor = context.createDynamicsCompressor();
-  compressor.threshold.value = -24;
-  compressor.knee.value = 18;
-  compressor.ratio.value = 8;
-  compressor.attack.value = 0.003;
-  compressor.release.value = 0.18;
-  compressor.connect(context.destination);
+function sampleTone(type: "sine" | "square" | "triangle", phase: number): number {
+  if (type === "square") return Math.sin(phase) >= 0 ? 1 : -1;
+  if (type === "triangle") return (2 / Math.PI) * Math.asin(Math.sin(phase));
+  return Math.sin(phase);
+}
 
-  const master = context.createGain();
-  master.connect(compressor);
-  master.gain.setValueAtTime(0.0001, now);
-  master.gain.exponentialRampToValueAtTime(0.42, now + 0.012);
-  master.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+function createWavDataUrl(kind: VisualSfxKind): string {
+  const spec = getVisualSfxSpec(kind);
+  const sampleRate = 44100;
+  const totalSamples = Math.max(1, Math.floor(spec.duration * sampleRate));
+  const samples = new Float32Array(totalSamples);
 
-  if (kind === "ui_click_soft" || kind === "ui_click_snap" || kind === "pop_air") {
-    const osc = context.createOscillator();
-    const tone = context.createGain();
-    osc.type = kind === "pop_air" ? "triangle" : "square";
-    osc.frequency.setValueAtTime(kind === "ui_click_snap" ? 1480 : kind === "pop_air" ? 820 : 980, now);
-    osc.frequency.exponentialRampToValueAtTime(kind === "ui_click_snap" ? 620 : kind === "pop_air" ? 520 : 700, now + (kind === "pop_air" ? 0.12 : 0.05));
-    tone.gain.setValueAtTime(0.0001, now);
-    tone.gain.exponentialRampToValueAtTime(kind === "ui_click_snap" ? 0.28 : 0.2, now + 0.008);
-    tone.gain.exponentialRampToValueAtTime(0.0001, now + (kind === "pop_air" ? 0.14 : 0.055));
-    osc.connect(tone);
-    tone.connect(master);
-    osc.start(now);
-    osc.stop(now + (kind === "pop_air" ? 0.16 : 0.07));
+  spec.tones?.forEach((tone) => {
+    let phase = 0;
+    for (let index = 0; index < totalSamples; index += 1) {
+      const time = index / sampleRate;
+      if (time < tone.start || time > tone.end) continue;
+      const local = (time - tone.start) / Math.max(tone.end - tone.start, 0.0001);
+      const frequency = tone.fromHz + (tone.toHz - tone.fromHz) * local;
+      phase += (2 * Math.PI * frequency) / sampleRate;
+      const attack = Math.min(1, local / 0.12);
+      const release = Math.min(1, (tone.end - time) / Math.max((tone.end - tone.start) * 0.5, 0.0001));
+      const envelope = Math.min(attack, release);
+      samples[index] += sampleTone(tone.type || "sine", phase) * tone.gain * envelope;
+    }
+  });
+
+  spec.noises?.forEach((noise) => {
+    for (let index = 0; index < totalSamples; index += 1) {
+      const time = index / sampleRate;
+      if (time < noise.start || time > noise.end) continue;
+      const local = (time - noise.start) / Math.max(noise.end - noise.start, 0.0001);
+      const envelope = Math.sin(Math.PI * Math.min(1, Math.max(0, local)));
+      const tilt = noise.fromHz + (noise.toHz - noise.fromHz) * local;
+      const colored = Math.sin((index / sampleRate) * tilt * 0.006) * (Math.random() * 2 - 1);
+      samples[index] += colored * noise.gain * envelope;
+    }
+  });
+
+  const pcm = new Int16Array(totalSamples);
+  for (let index = 0; index < totalSamples; index += 1) {
+    const value = Math.max(-1, Math.min(1, samples[index]));
+    pcm[index] = value < 0 ? value * 0x8000 : value * 0x7fff;
   }
 
-  if (kind === "whoosh_soft" || kind === "whoosh_rise" || kind === "pop_air") {
-    const noise = context.createBufferSource();
-    noise.buffer = createNoiseBuffer(context, kind === "pop_air" ? 0.12 : 0.32);
-    const filter = context.createBiquadFilter();
-    filter.type = "bandpass";
-    filter.frequency.setValueAtTime(kind === "whoosh_rise" ? 640 : kind === "pop_air" ? 980 : 420, now);
-    filter.frequency.exponentialRampToValueAtTime(kind === "whoosh_rise" ? 2400 : kind === "pop_air" ? 1800 : 920, now + (kind === "pop_air" ? 0.12 : 0.3));
-    filter.Q.value = kind === "pop_air" ? 0.9 : 0.65;
-    const gain = context.createGain();
-    gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(kind === "pop_air" ? 0.12 : 0.18, now + 0.03);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + (kind === "pop_air" ? 0.14 : 0.34));
-    noise.connect(filter);
-    filter.connect(gain);
-    gain.connect(master);
-    noise.start(now);
-    noise.stop(now + (kind === "pop_air" ? 0.16 : 0.36));
+  const byteLength = 44 + pcm.length * 2;
+  const buffer = new ArrayBuffer(byteLength);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, text: string) => {
+    for (let index = 0; index < text.length; index += 1) {
+      view.setUint8(offset + index, text.charCodeAt(index));
+    }
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + pcm.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, pcm.length * 2, true);
+  for (let index = 0; index < pcm.length; index += 1) {
+    view.setInt16(44 + index * 2, pcm[index], true);
   }
 
-  window.setTimeout(() => {
-    master.disconnect();
-    compressor.disconnect();
-  }, 700);
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+function ensureVisualSfxAudio(
+  kind: VisualSfxKind,
+  cache: Partial<Record<VisualSfxKind, HTMLAudioElement>>,
+): HTMLAudioElement {
+  const existing = cache[kind];
+  if (existing) return existing;
+  const audio = new Audio(createWavDataUrl(kind));
+  audio.preload = "auto";
+  audio.volume = 0.24;
+  cache[kind] = audio;
+  return audio;
+}
+
+async function playVisualSfx(
+  kind: VisualSfxKind,
+  cache: Partial<Record<VisualSfxKind, HTMLAudioElement>>,
+): Promise<void> {
+  const base = ensureVisualSfxAudio(kind, cache);
+  const audio = base.cloneNode(true) as HTMLAudioElement;
+  audio.volume = base.volume;
+  audio.currentTime = 0;
+  await audio.play().catch(() => undefined);
+}
+
+function createBackgroundMusicLoopWavDataUrl(preset: BackgroundMusicPreset): string {
+  const sampleRate = 44100;
+  const duration = 8;
+  const totalSamples = sampleRate * duration;
+  const samples = new Float32Array(totalSamples);
+
+  const noteFreq = (name: string) => ({
+    C3: 130.81, D3: 146.83, E3: 164.81, F3: 174.61, G3: 196.0, A3: 220.0,
+    C4: 261.63, D4: 293.66, E4: 329.63, G4: 392.0, A4: 440.0,
+  }[name]);
+
+  const sampleTone = (type: "sine" | "square" | "triangle", phase: number) => {
+    if (type === "square") return Math.sin(phase) >= 0 ? 1 : -1;
+    if (type === "triangle") return (2 / Math.PI) * Math.asin(Math.sin(phase));
+    return Math.sin(phase);
+  };
+
+  const config = preset === "upbeat_motion"
+    ? { chords: [["C4", "E4", "G4"], ["A3", "C4", "E4"], ["F3", "A3", "C4"], ["G3", "B3", "D4"]], beat: 0.33, gain: 0.34, wave: "square" as const, bass: ["C3", "A2", "F2", "G2"] }
+    : preset === "warm_focus"
+      ? { chords: [["A3", "C4", "E4"], ["G3", "B3", "D4"], ["F3", "A3", "C4"], ["G3", "B3", "D4"]], beat: 0.5, gain: 0.24, wave: "triangle" as const, bass: ["A2", "G2", "F2", "G2"] }
+      : { chords: [["C4", "E4", "G4"], ["A3", "C4", "E4"], ["F3", "A3", "C4"], ["G3", "B3", "D4"]], beat: 0.66, gain: 0.22, wave: "sine" as const, bass: ["C3", "A2", "F2", "G2"] };
+
+  const phases = [0, 0, 0];
+  let bassPhase = 0;
+  for (let index = 0; index < totalSamples; index += 1) {
+    const time = index / sampleRate;
+    const chordIndex = Math.floor(time / (config.beat * 4)) % config.chords.length;
+    const chord = config.chords[chordIndex];
+    const bassNote = config.bass[chordIndex];
+    const localBeat = (time % config.beat) / config.beat;
+    const pulse = 0.35 + 0.65 * Math.max(0, 1 - localBeat * 1.3);
+    let value = 0;
+    chord.forEach((note, noteIndex) => {
+      const frequency = noteFreq(note);
+      phases[noteIndex] += (2 * Math.PI * frequency) / sampleRate;
+      value += sampleTone(config.wave, phases[noteIndex]) * config.gain * pulse * (noteIndex === 1 ? 0.9 : 0.65);
+    });
+    bassPhase += (2 * Math.PI * noteFreq(bassNote)) / sampleRate;
+    value += sampleTone("sine", bassPhase) * 0.14 * (0.6 + pulse * 0.4);
+    const beatPhase = (time % config.beat) / config.beat;
+    const transient = Math.max(0, 1 - beatPhase * 8);
+    value += Math.sin(time * Math.PI * 2 * 140) * transient * 0.22;
+    value += Math.sin(time * Math.PI * 2 * 280) * transient * 0.1;
+    samples[index] = Math.max(-1, Math.min(1, value));
+  }
+
+  const pcm = new Int16Array(totalSamples);
+  for (let index = 0; index < totalSamples; index += 1) {
+    const value = Math.max(-1, Math.min(1, samples[index]));
+    pcm[index] = value < 0 ? value * 0x8000 : value * 0x7fff;
+  }
+
+  const byteLength = 44 + pcm.length * 2;
+  const buffer = new ArrayBuffer(byteLength);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, text: string) => {
+    for (let index = 0; index < text.length; index += 1) view.setUint8(offset + index, text.charCodeAt(index));
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + pcm.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, pcm.length * 2, true);
+  for (let index = 0; index < pcm.length; index += 1) view.setInt16(44 + index * 2, pcm[index], true);
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+function ensureBackgroundMusicAudio(
+  preset: BackgroundMusicPreset,
+  cache: Partial<Record<BackgroundMusicPreset, HTMLAudioElement>>,
+): HTMLAudioElement {
+  const existing = cache[preset];
+  if (existing) return existing;
+  const audio = new Audio(createBackgroundMusicLoopWavDataUrl(preset));
+  audio.preload = "auto";
+  audio.loop = true;
+  cache[preset] = audio;
+  return audio;
 }
 
 function AnimatedMotif({
@@ -673,18 +847,177 @@ function getTranscriptSegments(track: ProjectTrack): TranscriptSegment[] {
   return Array.isArray(track.transcription?.segments) ? track.transcription?.segments || [] : [];
 }
 
+function getTrackBackgroundMusic(track: ProjectTrack): BackgroundMusicSettings {
+  const raw: Partial<BackgroundMusicSettings> = track.background_music || {};
+  const preset = raw.preset === "upbeat_motion" || raw.preset === "warm_focus" || raw.preset === "ambient_pulse"
+    ? raw.preset
+    : DEFAULT_BACKGROUND_MUSIC.preset;
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_BACKGROUND_MUSIC.enabled,
+    preset,
+    volume: typeof raw.volume === "number" ? clamp(raw.volume, 0, 1) : DEFAULT_BACKGROUND_MUSIC.volume,
+    ducking: typeof raw.ducking === "number" ? raw.ducking : DEFAULT_BACKGROUND_MUSIC.ducking,
+  };
+}
+
 function getTranscriptWords(track: ProjectTrack) {
   return Array.isArray(track.transcription?.words) ? track.transcription?.words || [] : [];
 }
 
-function buildActiveSubtitleWord(track: ProjectTrack, time: number): string | null {
-  const words = getTranscriptWords(track)
-    .map((word) => ({
+function normalizeSpokenToken(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "")
+    .trim();
+}
+
+function getNormalizedTranscriptWords(track: ProjectTrack) {
+  return getTranscriptWords(track)
+    .map((word, index) => ({
+      index,
       word: String(word.word || "").trim(),
+      token: normalizeSpokenToken(String(word.word || "")),
       start: Math.max(0, Number(word.start || 0)),
       end: Math.max(Number(word.start || 0), Number(word.end || 0)),
     }))
-    .filter((word) => word.word && word.end >= word.start);
+    .filter((word) => word.token && word.end >= word.start);
+}
+
+function buildVisualSearchTokens(part: VisualPlanPart): string[] {
+  const base = [
+    part.text || "",
+    part.title || "",
+    ...(Array.isArray(part.keywords) ? part.keywords : []),
+  ]
+    .join(" ")
+    .split(/\s+/)
+    .map(normalizeSpokenToken)
+    .filter(Boolean);
+
+  const filtered = base.filter((token) => token.length > 2 && !STOP_WORDS.has(token));
+  return filtered.length >= 2 ? filtered : base;
+}
+
+function findOrderedPhraseMatch(
+  transcriptTokens: string[],
+  phraseTokens: string[],
+): { startOffset: number; endOffset: number } | null {
+  const maxWindow = Math.min(6, phraseTokens.length);
+  for (let windowSize = maxWindow; windowSize >= 2; windowSize -= 1) {
+    for (let phraseStart = 0; phraseStart <= phraseTokens.length - windowSize; phraseStart += 1) {
+      const phraseSlice = phraseTokens.slice(phraseStart, phraseStart + windowSize);
+      for (let transcriptStart = 0; transcriptStart <= transcriptTokens.length - windowSize; transcriptStart += 1) {
+        let matched = true;
+        for (let offset = 0; offset < windowSize; offset += 1) {
+          if (transcriptTokens[transcriptStart + offset] !== phraseSlice[offset]) {
+            matched = false;
+            break;
+          }
+        }
+        if (matched) {
+          return {
+            startOffset: transcriptStart,
+            endOffset: transcriptStart + windowSize - 1,
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function resolveVisualPartTiming(
+  part: VisualPlanPart,
+  transcriptWords: Array<{ index: number; word: string; token: string; start: number; end: number }>,
+): { start: number; end: number; duration: number } {
+  const fallbackStart = Math.max(0, part.start);
+  const fallbackEnd = Math.max(fallbackStart + 0.18, part.end);
+  if (transcriptWords.length === 0) {
+    return {
+      start: fallbackStart,
+      end: fallbackEnd,
+      duration: fallbackEnd - fallbackStart,
+    };
+  }
+
+  const phraseTokens = buildVisualSearchTokens(part);
+  if (phraseTokens.length === 0) {
+    return {
+      start: fallbackStart,
+      end: fallbackEnd,
+      duration: fallbackEnd - fallbackStart,
+    };
+  }
+
+  const windowStart = Math.max(0, part.start - 0.45);
+  const windowEnd = part.end + 0.45;
+  const candidateWords = transcriptWords.filter((word) => word.end >= windowStart && word.start <= windowEnd);
+  if (candidateWords.length === 0) {
+    return {
+      start: fallbackStart,
+      end: fallbackEnd,
+      duration: fallbackEnd - fallbackStart,
+    };
+  }
+
+  const exact = findOrderedPhraseMatch(candidateWords.map((word) => word.token), phraseTokens);
+  if (exact) {
+    const first = candidateWords[exact.startOffset];
+    const last = candidateWords[exact.endOffset];
+    const alignedStart = Math.max(part.start, first.start - 0.08);
+    const alignedEnd = Math.min(part.end, Math.max(last.end + 0.55, alignedStart + 0.75));
+    return {
+      start: alignedStart,
+      end: alignedEnd,
+      duration: alignedEnd - alignedStart,
+    };
+  }
+
+  const fallbackToken = phraseTokens.find((token) => token.length > 3 && !STOP_WORDS.has(token)) || phraseTokens[0];
+  const anchor = candidateWords.find((word) => word.token === fallbackToken);
+  if (anchor) {
+    const alignedStart = Math.max(part.start, anchor.start - 0.08);
+    const alignedEnd = Math.min(part.end, Math.max(anchor.end + 0.9, alignedStart + Math.min(1.4, Math.max(0.75, part.duration * 0.45))));
+    return {
+      start: alignedStart,
+      end: alignedEnd,
+      duration: alignedEnd - alignedStart,
+    };
+  }
+
+  return {
+    start: fallbackStart,
+    end: fallbackEnd,
+    duration: fallbackEnd - fallbackStart,
+  };
+}
+
+function enforceMinimumVisualDuration(
+  parts: Array<{ part: VisualPlanPart; index: number; start: number; end: number; duration: number }>,
+  maxEnd: number,
+): Array<{ part: VisualPlanPart; index: number; start: number; end: number; duration: number }> {
+  const minVisibleSeconds = 3;
+  const boundedMaxEnd = Math.max(minVisibleSeconds, maxEnd || 0);
+  const resolved: Array<{ part: VisualPlanPart; index: number; start: number; end: number; duration: number }> = [];
+
+  parts.forEach((item) => {
+    const previous = resolved[resolved.length - 1];
+    const minStart = previous ? previous.start + minVisibleSeconds : 0;
+    const start = Math.max(item.start, minStart);
+    const end = Math.min(boundedMaxEnd, Math.max(item.end, start + minVisibleSeconds));
+    resolved.push({
+      ...item,
+      start,
+      end,
+      duration: Math.max(0.001, end - start),
+    });
+  });
+
+  return resolved.filter((item) => item.duration >= minVisibleSeconds - 0.001);
+}
+
+function buildActiveSubtitleWord(track: ProjectTrack, time: number): string | null {
+  const words = getNormalizedTranscriptWords(track);
 
   if (words.length === 0) return null;
 
@@ -713,6 +1046,23 @@ function getTrackTranscriptStatus(track: ProjectTrack): TranscriptStatus | null 
   return null;
 }
 
+function PlayIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="speechEditorIcon" aria-hidden="true">
+      <path d="M8 6.5v11l9-5.5z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function PauseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="speechEditorIcon" aria-hidden="true">
+      <rect x="7" y="6" width="4" height="12" rx="1.5" fill="currentColor" />
+      <rect x="13" y="6" width="4" height="12" rx="1.5" fill="currentColor" />
+    </svg>
+  );
+}
+
 function isTranscriptProcessing(track: ProjectTrack): boolean {
   const status = getTrackTranscriptStatus(track);
   return status === "pending" || status === "processing";
@@ -737,6 +1087,20 @@ function normalizeEditableCuts(cuts: SpeechFilterCut[]): SpeechFilterCut[] {
       duration: roundToMillis(Math.max(0, cut.end - cut.start)),
     }))
     .sort((left, right) => left.start - right.start);
+}
+
+function findCutAtTime(cuts: SpeechFilterCut[], time: number): SpeechFilterCut | null {
+  return cuts.find((cut) => time >= cut.start && time < cut.end - 0.01) || null;
+}
+
+function resolvePlayableTime(time: number, cuts: SpeechFilterCut[], duration: number): number {
+  let nextTime = clamp(time, 0, duration);
+  for (const cut of cuts) {
+    if (nextTime >= cut.start && nextTime < cut.end - 0.01) {
+      nextTime = clamp(roundToMillis(cut.end + 0.01), 0, duration);
+    }
+  }
+  return nextTime;
 }
 
 function buildZoomPreviewBeats(track: ProjectTrack): Array<ZoomPreviewBeat & { id: string; label: string }> {
@@ -843,6 +1207,14 @@ function sortTracksForProject(tracks: ProjectTrack[]): ProjectTrack[] {
 
 function isTrackHidden(track: ProjectTrack): boolean {
   return track.status === "hidden" || track.excluded === true;
+}
+
+function isBackgroundTrack(track: ProjectTrack): boolean {
+  return track.role === "background";
+}
+
+function isImageTrack(track: ProjectTrack): boolean {
+  return track.type === "image";
 }
 
 function getTrackRenderVersions(track: ProjectTrack): TrackRenderVersion[] {
@@ -1130,6 +1502,82 @@ function TranscriptPanel({
   );
 }
 
+function BackgroundClipAction({
+  track,
+  saving,
+  onSave,
+}: {
+  track: ProjectTrack;
+  saving: boolean;
+  onSave: (track: ProjectTrack, description: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [description, setDescription] = useState(track.background_description || "");
+
+  useEffect(() => {
+    setEditing(false);
+    setDescription(track.background_description || "");
+  }, [track.background_description, track.id]);
+
+  return (
+    <div className="clipSpeechFilter">
+      <button
+        type="button"
+        className={`clipTag clipTagButton ${saving ? "clipTagProcessing" : "clipTagActive"}`}
+        disabled={saving}
+        onClick={() => setEditing(true)}
+      >
+        {saving ? (
+          <>
+            <span className="spinner" aria-hidden="true" />
+            saving background
+          </>
+        ) : (
+          "use as background"
+        )}
+      </button>
+      {editing ? (
+        <div className="clipInlinePromptPanel">
+          <p className="muted clipInlinePromptText">
+            Describe what this background clip shows. This is used to place it against the spoken narration.
+          </p>
+          <textarea
+            className="clipInlinePromptInput"
+            rows={3}
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            placeholder="Example: desk setup by a window with a person talking to camera"
+          />
+          {!description.trim() ? (
+            <p className="clipSpeechFilterError">Background clips need a short description.</p>
+          ) : null}
+          <div className="clipInlinePromptActions">
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={saving || !description.trim()}
+              onClick={() => onSave(track, description)}
+            >
+              Save as background
+            </button>
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={saving}
+              onClick={() => {
+                setEditing(false);
+                setDescription(track.background_description || "");
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ClipCard({
   projectId,
   projectCreatedAt,
@@ -1143,6 +1591,8 @@ function ClipCard({
   visualPlanError,
   onGenerateSpeechFilter,
   onGenerateVisualPlan,
+  onMarkAsBackground,
+  backgroundSaving,
   onOpen,
   onHide,
   hiding,
@@ -1166,6 +1616,8 @@ function ClipCard({
   visualPlanError?: string | null;
   onGenerateSpeechFilter: (track: ProjectTrack) => void;
   onGenerateVisualPlan: (track: ProjectTrack) => void;
+  onMarkAsBackground: (track: ProjectTrack, description: string) => void;
+  backgroundSaving: boolean;
   onOpen: (track: ProjectTrack) => void;
   onHide: (trackId: string) => void;
   hiding: boolean;
@@ -1270,8 +1722,116 @@ function ClipCard({
           onGenerateSpeechFilter={onGenerateSpeechFilter}
           onGenerateVisualPlan={onGenerateVisualPlan}
         />
+        <BackgroundClipAction
+          track={track}
+          saving={backgroundSaving}
+          onSave={onMarkAsBackground}
+        />
       </div>
     </article>
+  );
+}
+
+function BackgroundTrackCard({
+  projectId,
+  token,
+  track,
+  saving,
+  onPreview,
+  onSaveDescription,
+  onMoveToPrimary,
+}: {
+  projectId: string;
+  token: string | undefined;
+  track: ProjectTrack;
+  saving: boolean;
+  onPreview: (track: ProjectTrack) => void;
+  onSaveDescription: (track: ProjectTrack, description: string) => void;
+  onMoveToPrimary: (track: ProjectTrack) => void;
+}) {
+  const rawUrl = api.getTrackMediaUrl(projectId, track.id);
+  const { blobUrl } = useAuthedBlobUrl(rawUrl, token);
+  const [description, setDescription] = useState(track.background_description || "");
+
+  useEffect(() => {
+    setDescription(track.background_description || "");
+  }, [track.background_description, track.id]);
+
+  return (
+    <article className="clipCard backgroundClipCard">
+      <div className="clipMediaWrap">
+        <button type="button" className="clipPreviewButton" onClick={() => onPreview(track)}>
+          {blobUrl ? isImageTrack(track) ? (
+            <img className="clipMedia" src={blobUrl} alt={track.filename} />
+          ) : (
+            <video className="clipMedia" src={blobUrl} preload="metadata" playsInline muted />
+          ) : (
+            <div className="clipMedia clipMediaLoading" />
+          )}
+          <span className="clipPreviewPlay">{isImageTrack(track) ? "Preview" : "▶ Preview"}</span>
+        </button>
+      </div>
+      <div className="clipMeta">
+        <div className="stack" style={{ gap: 4 }}>
+          <strong className="clipFileName" title={track.filename}>{track.filename}</strong>
+          <span className="badge">Background asset</span>
+          <span className="muted">Describe what this clip shows so the worker can place it correctly.</span>
+        </div>
+        <textarea
+          className="backgroundDescriptionInput"
+          rows={3}
+          value={description}
+          onChange={(event) => setDescription(event.target.value)}
+          placeholder="Example: quick workout set with push-ups and dumbbells in the gym"
+        />
+        {!description.trim() ? (
+          <div className="notice">Add a short description before this clip can be used in automatic background placement.</div>
+        ) : null}
+        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="btn secondary"
+            disabled={saving}
+            onClick={() => onSaveDescription(track, description)}
+          >
+            {saving ? "Saving..." : "Save Description"}
+          </button>
+          <button
+            type="button"
+            className="btn secondary"
+            disabled={saving}
+            onClick={() => onMoveToPrimary(track)}
+          >
+            Move to clips
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function BackgroundUploadCard({
+  uploading,
+  dropActive,
+  onClick,
+}: {
+  uploading: boolean;
+  dropActive: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`clipCard backgroundUploadCard ${dropActive ? "backgroundUploadCardActive" : ""}`}
+      onClick={onClick}
+    >
+      <div className="backgroundUploadCardBody">
+        <strong>Upload background assets</strong>
+        <span className="backgroundUploadCardHint">
+          {uploading ? "Uploading..." : "Drag here or click to upload"}
+        </span>
+      </div>
+    </button>
   );
 }
 
@@ -1372,6 +1932,14 @@ function VisualOverlayPreview({
   );
 }
 
+type ResolvedVisualPreviewPart = {
+  part: VisualPlanPart;
+  index: number;
+  start: number;
+  end: number;
+  duration: number;
+};
+
 function SpeechFilterEditor({
   src,
   track,
@@ -1384,6 +1952,7 @@ function SpeechFilterEditor({
   saveError,
   onSave,
   onCutsChange,
+  onBackgroundMusicChange,
 }: {
   src: string;
   track: ProjectTrack;
@@ -1396,10 +1965,12 @@ function SpeechFilterEditor({
   saveError?: string | null;
   onSave: (cuts: SpeechFilterCut[]) => Promise<void>;
   onCutsChange: (cuts: SpeechFilterCut[]) => void;
+  onBackgroundMusicChange: (settings: BackgroundMusicSettings) => Promise<void>;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const visualSfxAudioCacheRef = useRef<Partial<Record<VisualSfxKind, HTMLAudioElement>>>({});
+  const backgroundMusicAudioCacheRef = useRef<Partial<Record<BackgroundMusicPreset, HTMLAudioElement>>>({});
   const lastVisualSfxIndexRef = useRef<number>(-1);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -1410,6 +1981,7 @@ function SpeechFilterEditor({
   const [zoomPreviewEnabled, setZoomPreviewEnabled] = useState(true);
   const [visualSfxEnabled, setVisualSfxEnabled] = useState(true);
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
+  const [backgroundMusic, setBackgroundMusic] = useState<BackgroundMusicSettings>(() => getTrackBackgroundMusic(track));
   const skipInFlightRef = useRef(false);
   const animationFrameRef = useRef<number | null>(null);
   const showEditablePreview = selectedVersionId === "source";
@@ -1432,6 +2004,23 @@ function SpeechFilterEditor({
     }
     return buildZoomPreviewBeats(track);
   }, [artifact.zoom_beats, track]);
+  const resolvedVisualParts = useMemo<ResolvedVisualPreviewPart[]>(() => {
+    if (!visualPlan?.parts?.length) return [];
+    const transcriptWords = getNormalizedTranscriptWords(track);
+    const aligned = visualPlan.parts
+      .map((part, index) => {
+        const timing = resolveVisualPartTiming(part, transcriptWords);
+        return {
+          part,
+          index,
+          start: timing.start,
+          end: timing.end,
+          duration: timing.duration,
+        };
+      })
+      .filter((part) => part.duration > 0.12);
+    return enforceMinimumVisualDuration(aligned, duration);
+  }, [duration, track, visualPlan?.parts]);
   const activeZoomBeat = useMemo(() => {
     if (!zoomPreviewEnabled) return null;
     return zoomBeats.find((beat) => beat.enabled && currentTime >= beat.start && currentTime <= beat.end) || null;
@@ -1448,6 +2037,16 @@ function SpeechFilterEditor({
     setEditableCuts(normalizeEditableCuts(artifact.cuts));
     setSelectedCutIndex(0);
   }, [artifact]);
+
+  useEffect(() => {
+    setBackgroundMusic(getTrackBackgroundMusic(track));
+  }, [track]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(backgroundMusicAudioCacheRef.current).forEach((audio) => audio?.pause());
+    };
+  }, []);
 
   useEffect(() => {
     onCutsChange(editableCuts);
@@ -1468,7 +2067,19 @@ function SpeechFilterEditor({
     const syncTime = () => setCurrentTime(video.currentTime || 0);
     const syncDuration = () => setMediaDuration(Number.isFinite(video.duration) ? video.duration : null);
     const tick = () => {
-      syncTime();
+      let nextTime = video.currentTime || 0;
+      if (showEditablePreview && !dragState && !skipInFlightRef.current) {
+        const targetTime = resolvePlayableTime(nextTime, editableCuts, duration);
+        if (Math.abs(targetTime - nextTime) >= 0.005) {
+          skipInFlightRef.current = true;
+          video.currentTime = targetTime;
+          nextTime = targetTime;
+          window.setTimeout(() => {
+            skipInFlightRef.current = false;
+          }, 0);
+        }
+      }
+      setCurrentTime(nextTime);
       if (!video.paused && !video.ended) {
         animationFrameRef.current = window.requestAnimationFrame(tick);
       } else {
@@ -1507,29 +2118,19 @@ function SpeechFilterEditor({
       video.removeEventListener("loadedmetadata", syncTime);
       video.removeEventListener("loadedmetadata", syncDuration);
     };
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (audioContextRef.current) {
-        audioContextRef.current.close().catch(() => undefined);
-        audioContextRef.current = null;
-      }
-    };
-  }, []);
+  }, [dragState, duration, editableCuts, showEditablePreview]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    const maybeSkipCut = () => {
-      if (!showEditablePreview || video.paused || dragState || skipInFlightRef.current) return;
+    const enforcePlayablePosition = () => {
+      if (!showEditablePreview || dragState || skipInFlightRef.current) return;
       const current = video.currentTime || 0;
-      const activeCut = editableCuts.find((cut) => current >= cut.start && current < cut.end - 0.01);
-      if (!activeCut) return;
+      const targetTime = resolvePlayableTime(current, editableCuts, duration);
+      if (Math.abs(targetTime - current) < 0.005) return;
 
       skipInFlightRef.current = true;
-      const targetTime = clamp(activeCut.end + 0.01, 0, duration);
       video.currentTime = targetTime;
       setCurrentTime(targetTime);
       window.setTimeout(() => {
@@ -1537,13 +2138,37 @@ function SpeechFilterEditor({
       }, 0);
     };
 
-    video.addEventListener("timeupdate", maybeSkipCut);
-    video.addEventListener("play", maybeSkipCut);
+    video.addEventListener("play", enforcePlayablePosition);
+    video.addEventListener("seeked", enforcePlayablePosition);
+    video.addEventListener("loadedmetadata", enforcePlayablePosition);
     return () => {
-      video.removeEventListener("timeupdate", maybeSkipCut);
-      video.removeEventListener("play", maybeSkipCut);
+      video.removeEventListener("play", enforcePlayablePosition);
+      video.removeEventListener("seeked", enforcePlayablePosition);
+      video.removeEventListener("loadedmetadata", enforcePlayablePosition);
     };
   }, [dragState, duration, editableCuts, showEditablePreview]);
+
+  useEffect(() => {
+    const bgAudio = backgroundMusic.enabled ? ensureBackgroundMusicAudio(backgroundMusic.preset, backgroundMusicAudioCacheRef.current) : null;
+    if (bgAudio) {
+      bgAudio.volume = clamp(backgroundMusic.volume, 0, 1);
+      const syncedTime = duration > 0 ? currentTime % Math.max(0.1, bgAudio.duration || 8) : 0;
+      if (Math.abs((bgAudio.currentTime || 0) - syncedTime) > 1.5) {
+        bgAudio.currentTime = syncedTime;
+      }
+      if (showEditablePreview && isPlaying) {
+        bgAudio.play().catch(() => undefined);
+      } else {
+        bgAudio.pause();
+      }
+    }
+    Object.entries(backgroundMusicAudioCacheRef.current).forEach(([key, audio]) => {
+      if (!audio) return;
+      if (key !== backgroundMusic.preset || !backgroundMusic.enabled || !showEditablePreview || !isPlaying) {
+        audio.pause();
+      }
+    });
+  }, [backgroundMusic, currentTime, duration, isPlaying, showEditablePreview]);
 
   useEffect(() => {
     if (!dragState) return;
@@ -1583,16 +2208,15 @@ function SpeechFilterEditor({
     };
   }, [dragState, duration]);
 
-  const activeCut = showEditablePreview
-    ? editableCuts.find((cut) => currentTime >= cut.start && currentTime <= cut.end) || null
+  const activeCut = showEditablePreview ? findCutAtTime(editableCuts, currentTime) : null;
+  const activeVisualCue = showEditablePreview
+    ? resolvedVisualParts.find((part) => currentTime >= part.start && currentTime <= part.end) || null
     : null;
-  const activeVisualPart = showEditablePreview
-    ? visualPlan?.parts.find((part) => currentTime >= part.start && currentTime <= part.end) || null
-    : null;
-  const activeVisualPartIndex = activeVisualPart ? visualPlan?.parts.findIndex((part) => part === activeVisualPart) ?? -1 : -1;
-  const activeVisualProgress = activeVisualPart
+  const activeVisualPart = activeVisualCue?.part || null;
+  const activeVisualPartIndex = activeVisualCue?.index ?? -1;
+  const activeVisualProgress = activeVisualCue
     ? clamp(
-        (currentTime - activeVisualPart.start) / Math.max(activeVisualPart.end - activeVisualPart.start, 0.001),
+        (currentTime - activeVisualCue.start) / Math.max(activeVisualCue.duration, 0.001),
         0,
         1,
       )
@@ -1611,50 +2235,59 @@ function SpeechFilterEditor({
       return;
     }
     if (lastVisualSfxIndexRef.current === activeVisualPartIndex) return;
-    const context = audioContextRef.current;
-    if (!context) return;
-
-    const fire = () => {
-      const spec = buildAnimationSpec(activeVisualPart, activeVisualPartIndex);
-      playVisualSfx(context, inferVisualSfx(activeVisualPart, spec));
-      lastVisualSfxIndexRef.current = activeVisualPartIndex;
-    };
-
-    if (context.state === "running") {
-      fire();
-      return;
-    }
-
-    context.resume().then(() => {
-      if (context.state === "running") fire();
-    }).catch(() => undefined);
+    const spec = buildAnimationSpec(activeVisualPart, activeVisualPartIndex);
+    playVisualSfx(inferVisualSfx(activeVisualPart, spec), visualSfxAudioCacheRef.current).catch(() => undefined);
+    lastVisualSfxIndexRef.current = activeVisualPartIndex;
   }, [activeVisualPart, activeVisualPartIndex, isPlaying, showEditablePreview, visualSfxEnabled]);
 
   const seekTo = (time: number) => {
     const video = videoRef.current;
     if (!video) return;
-    video.currentTime = clamp(time, 0, duration);
+    const nextTime = showEditablePreview
+      ? resolvePlayableTime(time, editableCuts, duration)
+      : clamp(time, 0, duration);
+    video.currentTime = nextTime;
     setCurrentTime(video.currentTime);
+  };
+
+  const applyBackgroundMusicPreview = (settings: BackgroundMusicSettings) => {
+    const activeAudio = ensureBackgroundMusicAudio(settings.preset, backgroundMusicAudioCacheRef.current);
+    activeAudio.volume = clamp(settings.volume, 0, 1);
+    if (showEditablePreview && isPlaying && settings.enabled) {
+      activeAudio.currentTime = currentTime % Math.max(0.1, activeAudio.duration || 8);
+      activeAudio.play().catch(() => undefined);
+    } else {
+      activeAudio.pause();
+    }
+    Object.entries(backgroundMusicAudioCacheRef.current).forEach(([key, audio]) => {
+      if (!audio) return;
+      if (key !== settings.preset) audio.pause();
+    });
+  };
+
+  const persistBackgroundMusic = async (settings: BackgroundMusicSettings) => {
+    setBackgroundMusic(settings);
+    applyBackgroundMusicPreview(settings);
+    await onBackgroundMusicChange(settings);
   };
 
   const togglePlayback = async () => {
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      if (showEditablePreview && visualSfxEnabled && typeof window !== "undefined") {
-        if (!audioContextRef.current) {
-          const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-          if (AudioContextCtor) {
-            audioContextRef.current = new AudioContextCtor();
-          }
-        }
-        if (audioContextRef.current?.state === "suspended") {
-          await audioContextRef.current.resume().catch(() => undefined);
-        }
+      if (showEditablePreview && visualSfxEnabled) {
+        ensureVisualSfxAudio(COMMON_TRANSITION_SFX, visualSfxAudioCacheRef.current);
+      }
+      if (showEditablePreview && backgroundMusic.enabled) {
+        const bgAudio = ensureBackgroundMusicAudio(backgroundMusic.preset, backgroundMusicAudioCacheRef.current);
+        bgAudio.volume = clamp(backgroundMusic.volume, 0, 1);
+        bgAudio.currentTime = currentTime % Math.max(0.1, bgAudio.duration || 8);
+        bgAudio.play().catch(() => undefined);
       }
       await video.play().catch(() => undefined);
     } else {
       video.pause();
+      Object.values(backgroundMusicAudioCacheRef.current).forEach((audio) => audio?.pause());
     }
   };
 
@@ -1682,11 +2315,6 @@ function SpeechFilterEditor({
               Suggested cut: {formatSpeechFilterReason(activeCut.reason)}
             </div>
           ) : null}
-          {showEditablePreview && activeZoomBeat ? (
-            <div className="speechEditorZoomNotice">
-              Zoom beat: {formatTime(activeZoomBeat.start)} - {formatTime(activeZoomBeat.end)}
-            </div>
-          ) : null}
           {showEditablePreview && activeVisualPart && activeVisualPartIndex >= 0 ? (
             <VisualOverlayPreview
               projectId={projectId}
@@ -1707,8 +2335,14 @@ function SpeechFilterEditor({
       </div>
 
       <div className="speechEditorControls">
-        <button type="button" className="btn secondary" onClick={togglePlayback}>
-          {isPlaying ? "Pause" : "Play"}
+        <button
+          type="button"
+          className="speechEditorIconButton"
+          onClick={togglePlayback}
+          aria-label={isPlaying ? "Pause preview" : "Play preview"}
+          title={isPlaying ? "Pause" : "Play"}
+        >
+          {isPlaying ? <PauseIcon /> : <PlayIcon />}
         </button>
         <button
           type="button"
@@ -1722,16 +2356,8 @@ function SpeechFilterEditor({
           type="button"
           className={`btn secondary ${visualSfxEnabled ? "speechEditorToggleActive" : ""}`}
           onClick={async () => {
-            if (!visualSfxEnabled && typeof window !== "undefined") {
-              if (!audioContextRef.current) {
-                const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-                if (AudioContextCtor) {
-                  audioContextRef.current = new AudioContextCtor();
-                }
-              }
-              if (audioContextRef.current?.state === "suspended") {
-                await audioContextRef.current.resume().catch(() => undefined);
-              }
+            if (!visualSfxEnabled) {
+              ensureVisualSfxAudio(COMMON_TRANSITION_SFX, visualSfxAudioCacheRef.current);
             }
             setVisualSfxEnabled((current) => !current);
             lastVisualSfxIndexRef.current = -1;
@@ -1742,22 +2368,87 @@ function SpeechFilterEditor({
         </button>
         <button
           type="button"
+          className={`btn secondary ${backgroundMusic.enabled ? "speechEditorToggleActive" : ""}`}
+          onClick={async () => {
+            const next = { ...backgroundMusic, enabled: !backgroundMusic.enabled };
+            await persistBackgroundMusic(next);
+          }}
+          disabled={!showEditablePreview}
+        >
+          {backgroundMusic.enabled ? "BGM On" : "BGM Off"}
+        </button>
+        <label className="speechEditorSelectWrap">
+          <span className="muted speechEditorSelectLabel">Music</span>
+          <select
+            className="speechEditorSelect"
+            value={backgroundMusic.preset}
+            disabled={!showEditablePreview}
+            onChange={async (event) => {
+              const next = { ...backgroundMusic, preset: event.target.value as BackgroundMusicPreset };
+              await persistBackgroundMusic(next);
+            }}
+          >
+            {Object.entries(BACKGROUND_MUSIC_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="speechEditorSliderWrap">
+          <span className="muted speechEditorSelectLabel">BGM {Math.round(backgroundMusic.volume * 100)}%</span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            className="speechEditorSlider"
+            value={backgroundMusic.volume}
+            disabled={!showEditablePreview}
+            onChange={(event) => {
+              const nextVolume = Number(event.target.value);
+              const next = {
+                ...backgroundMusic,
+                enabled: nextVolume > 0 ? true : backgroundMusic.enabled,
+                volume: nextVolume,
+              };
+              setBackgroundMusic(next);
+              applyBackgroundMusicPreview(next);
+            }}
+            onMouseUp={async (event) => {
+              const nextVolume = Number((event.target as HTMLInputElement).value);
+              const next = {
+                ...backgroundMusic,
+                enabled: nextVolume > 0 ? true : backgroundMusic.enabled,
+                volume: nextVolume,
+              };
+              await persistBackgroundMusic(next);
+            }}
+            onTouchEnd={async (event) => {
+              const nextVolume = Number((event.target as HTMLInputElement).value);
+              const next = {
+                ...backgroundMusic,
+                enabled: nextVolume > 0 ? true : backgroundMusic.enabled,
+                volume: nextVolume,
+              };
+              await persistBackgroundMusic(next);
+            }}
+            onBlur={async (event) => {
+              const nextVolume = Number((event.target as HTMLInputElement).value);
+              const next = {
+                ...backgroundMusic,
+                enabled: nextVolume > 0 ? true : backgroundMusic.enabled,
+                volume: nextVolume,
+              };
+              await persistBackgroundMusic(next);
+            }}
+          />
+        </label>
+        <button
+          type="button"
           className={`btn secondary ${subtitlesEnabled ? "speechEditorToggleActive" : ""}`}
           onClick={() => setSubtitlesEnabled((current) => !current)}
           disabled={!showEditablePreview || getTranscriptWords(track).length === 0}
         >
           {subtitlesEnabled ? "Subtitles On" : "Subtitles Off"}
-        </button>
-        <button
-          type="button"
-          className="btn secondary"
-          onClick={() => {
-            const selected = editableCuts[selectedCutIndex];
-            if (selected) seekTo(selected.start);
-          }}
-          disabled={!showEditablePreview || !editableCuts[selectedCutIndex]}
-        >
-          Jump To Cut
         </button>
         <div className="speechEditorTime">
           {formatTime(currentTime)} / {formatDuration(duration)}
@@ -1893,6 +2584,7 @@ function PreviewModal({
   onGenerateSpeechFilter,
   onGenerateVisualPlan,
   onSaveSpeechFilter,
+  onUpdateBackgroundMusic,
   onRenderTrack,
   onClose,
 }: {
@@ -1912,6 +2604,7 @@ function PreviewModal({
   onGenerateSpeechFilter: (track: ProjectTrack) => void;
   onGenerateVisualPlan: (track: ProjectTrack) => void;
   onSaveSpeechFilter: (track: ProjectTrack, cuts: SpeechFilterCut[]) => Promise<void>;
+  onUpdateBackgroundMusic: (track: ProjectTrack, settings: BackgroundMusicSettings) => Promise<void>;
   onRenderTrack: (track: ProjectTrack, cuts: SpeechFilterCut[]) => Promise<TrackRenderVersion | null>;
   onClose: () => void;
 }) {
@@ -2007,6 +2700,13 @@ function PreviewModal({
               saveError={speechFilterError}
               onSave={(cuts) => onSaveSpeechFilter(track, cuts)}
               onCutsChange={setDraftCuts}
+              onBackgroundMusicChange={(settings) => onUpdateBackgroundMusic(track, settings)}
+            />
+          ) : isImageTrack(track) ? (
+            <img
+              className="previewModalVideo"
+              src={blobUrl}
+              alt={track.filename}
             />
           ) : (
             <video
@@ -2068,6 +2768,7 @@ export default function ProjectDetailPage() {
   const [loading, setLoading] = useState(true);
   const [addingTracks, setAddingTracks] = useState(false);
   const [groupByDay, setGroupByDay] = useState(false);
+  const [deletingProject, setDeletingProject] = useState(false);
   const [hidingTrackId, setHidingTrackId] = useState<string | null>(null);
   const [activeTrack, setActiveTrack] = useState<ProjectTrack | null>(null);
   const [speechFilters, setSpeechFilters] = useState<Record<string, SpeechFilterArtifact | null>>({});
@@ -2079,12 +2780,18 @@ export default function ProjectDetailPage() {
   const [visualPlanErrors, setVisualPlanErrors] = useState<Record<string, string | null>>({});
   const [renderLoadingIds, setRenderLoadingIds] = useState<Record<string, boolean>>({});
   const [renderErrors, setRenderErrors] = useState<Record<string, string | null>>({});
+  const [backgroundTrackSavingIds, setBackgroundTrackSavingIds] = useState<Record<string, boolean>>({});
+  const [backgroundPlan, setBackgroundPlan] = useState<BackgroundVideoPlanArtifact | null>(null);
+  const [backgroundPlanLoading, setBackgroundPlanLoading] = useState(false);
   const [token, setToken] = useState<string | undefined>(undefined);
   const [draggingTrackId, setDraggingTrackId] = useState<string | null>(null);
   const [dragTargetTrackId, setDragTargetTrackId] = useState<string | null>(null);
   const [reorderingTracks, setReorderingTracks] = useState(false);
+  const [backgroundUploading, setBackgroundUploading] = useState(false);
+  const [backgroundLibraryDropActive, setBackgroundLibraryDropActive] = useState(false);
   const requestedTranscriptBackfill = useRef(false);
   const addTracksInputRef = useRef<HTMLInputElement>(null);
+  const backgroundUploadInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const session = getStoredSession();
@@ -2122,6 +2829,8 @@ export default function ProjectDetailPage() {
     setVisualPlanErrors({});
     setRenderLoadingIds({});
     setRenderErrors({});
+    setBackgroundTrackSavingIds({});
+    setBackgroundPlan(null);
   }, [projectId]);
 
   useEffect(() => {
@@ -2195,26 +2904,37 @@ export default function ProjectDetailPage() {
       });
   }, [activeTrack, project, token, visualPlans, visualPlanLoadingIds, visualPlanErrors]);
 
-  const handleAddTracks = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = Array.from(event.target.files || []);
-    event.target.value = "";
+  const uploadFilesToProject = async (
+    selectedFiles: File[],
+    mode: "primary" | "background",
+  ) => {
     if (selectedFiles.length === 0 || !token || !project) return;
-
     const duplicateFiles = selectedFiles.filter((file) => isDuplicateSelectedFile(file, project.tracks));
     const nextFiles = selectedFiles.filter((file) => !isDuplicateSelectedFile(file, project.tracks));
     if (nextFiles.length === 0) {
-      setMessage("All selected clips are already in this project.");
+      setMessage(mode === "background" ? "All selected background assets are already in this project." : "All selected clips are already in this project.");
       return;
     }
 
     try {
-      setAddingTracks(true);
+      if (mode === "background") {
+        setBackgroundUploading(true);
+      } else {
+        setAddingTracks(true);
+      }
       setMessage(
         duplicateFiles.length
-          ? `${duplicateFiles.length} duplicate clip${duplicateFiles.length === 1 ? "" : "s"} skipped.`
+          ? `${duplicateFiles.length} duplicate ${mode === "background" ? "asset" : "clip"}${duplicateFiles.length === 1 ? "" : "s"} skipped.`
           : null
       );
-      const response = await api.addTracksToProject(projectId, nextFiles, token);
+      const response = await api.addTracksToProject(
+        projectId,
+        nextFiles,
+        token,
+        mode === "background"
+          ? { metadata: nextFiles.map(() => ({ role: "background" })) }
+          : undefined,
+      );
       requestedTranscriptBackfill.current = false;
       setProject(response.project);
       if (response.message) {
@@ -2223,7 +2943,38 @@ export default function ProjectDetailPage() {
     } catch (error) {
       setMessage(String((error as Error).message || error));
     } finally {
-      setAddingTracks(false);
+      if (mode === "background") {
+        setBackgroundUploading(false);
+      } else {
+        setAddingTracks(false);
+      }
+    }
+  };
+
+  const handleAddTracks = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    event.target.value = "";
+    await uploadFilesToProject(selectedFiles, "primary");
+  };
+
+  const handleAddBackgroundAssets = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    event.target.value = "";
+    await uploadFilesToProject(selectedFiles, "background");
+  };
+
+  const handleDeleteProject = async () => {
+    if (!token || !project || deletingProject) return;
+    const confirmed = window.confirm(`Delete project "${project.name}"? This cannot be undone.`);
+    if (!confirmed) return;
+    setDeletingProject(true);
+    setMessage(null);
+    try {
+      await api.deleteProject(project.id, token);
+      router.push("/projects");
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+      setDeletingProject(false);
     }
   };
 
@@ -2242,6 +2993,85 @@ export default function ProjectDetailPage() {
       setMessage(String((error as Error).message || error));
     } finally {
       setHidingTrackId(null);
+    }
+  };
+
+  const handleMarkAsBackground = async (track: ProjectTrack, description?: string | null) => {
+    if (!token || !project) return;
+    const trimmed = String(description || "").trim() || null;
+    setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: true }));
+    try {
+      const response = await api.updateTrackBackgroundVideo(
+        project.id,
+        track.id,
+        { role: "background", background_description: trimmed },
+        token,
+      );
+      setProject(response.project);
+      setMessage("Clip moved to background library.");
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    } finally {
+      setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: false }));
+    }
+  };
+
+  const handleSaveBackgroundDescription = async (track: ProjectTrack, description: string) => {
+    if (!token || !project) return;
+    const trimmed = description.trim();
+    if (!trimmed) {
+      setMessage("Background clips need a short description.");
+      return;
+    }
+    setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: true }));
+    try {
+      const response = await api.updateTrackBackgroundVideo(
+        project.id,
+        track.id,
+        { role: "background", background_description: trimmed },
+        token,
+      );
+      setProject(response.project);
+      setMessage("Background description saved.");
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    } finally {
+      setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: false }));
+    }
+  };
+
+  const handleMoveToPrimary = async (track: ProjectTrack) => {
+    if (!token || !project) return;
+    setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: true }));
+    try {
+      const response = await api.updateTrackBackgroundVideo(
+        project.id,
+        track.id,
+        { role: "primary", background_description: null },
+        token,
+      );
+      setProject(response.project);
+      setMessage("Clip moved back to editable clips.");
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    } finally {
+      setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: false }));
+    }
+  };
+
+  const handleGenerateBackgroundPlan = async () => {
+    if (!token || !project) return;
+    setBackgroundPlanLoading(true);
+    try {
+      const artifact = await api.generateBackgroundVideoPlan(project.id, token);
+      setBackgroundPlan(artifact);
+      const refreshed = await api.getProject(project.id, token);
+      setProject(refreshed.project);
+      setMessage(artifact.summary);
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    } finally {
+      setBackgroundPlanLoading(false);
     }
   };
 
@@ -2271,7 +3101,7 @@ export default function ProjectDetailPage() {
   };
 
   const handleDragStart = (track: ProjectTrack) => {
-    if (groupByDay || reorderingTracks) return;
+    if (reorderingTracks) return;
     setDraggingTrackId(track.id);
     setDragTargetTrackId(track.id);
   };
@@ -2312,6 +3142,44 @@ export default function ProjectDetailPage() {
       };
     });
     await persistTrackOrder(nextVisible);
+  };
+
+  const handleBackgroundLibraryDragOver = (event: React.DragEvent<HTMLElement>) => {
+    const hasFiles = Array.from(event.dataTransfer?.types || []).includes("Files");
+    if (!draggingTrackId && !hasFiles) return;
+    event.preventDefault();
+    setBackgroundLibraryDropActive(true);
+  };
+
+  const handleBackgroundLibraryDragLeave = (event: React.DragEvent<HTMLElement>) => {
+    const nextTarget = event.relatedTarget;
+    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
+    setBackgroundLibraryDropActive(false);
+  };
+
+  const handleBackgroundLibraryDrop = async (event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setBackgroundLibraryDropActive(false);
+
+    const droppedFiles = Array.from(event.dataTransfer?.files || []);
+    if (droppedFiles.length > 0) {
+      await uploadFilesToProject(droppedFiles, "background");
+      setDraggingTrackId(null);
+      setDragTargetTrackId(null);
+      return;
+    }
+
+    if (!draggingTrackId || !project) {
+      setDraggingTrackId(null);
+      setDragTargetTrackId(null);
+      return;
+    }
+
+    const track = project.tracks.find((item) => item.id === draggingTrackId);
+    setDraggingTrackId(null);
+    setDragTargetTrackId(null);
+    if (!track || isBackgroundTrack(track)) return;
+    await handleMarkAsBackground(track, track.background_description || null);
   };
 
   const handleGenerateSpeechFilter = async (track: ProjectTrack) => {
@@ -2399,6 +3267,18 @@ export default function ProjectDetailPage() {
     }
   };
 
+  const handleUpdateBackgroundMusic = async (track: ProjectTrack, settings: BackgroundMusicSettings) => {
+    if (!token || !project) return;
+    try {
+      const response = await api.updateTrackBackgroundMusic(project.id, track.id, settings, token);
+      setProject(response.project);
+      setActiveTrack(response.project.tracks.find((item) => item.id === track.id) || null);
+      setMessage(null);
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    }
+  };
+
   const handleRenderTrack = async (track: ProjectTrack, cuts: SpeechFilterCut[]): Promise<TrackRenderVersion | null> => {
     if (!token || !project) return null;
     setRenderLoadingIds((current) => ({ ...current, [track.id]: true }));
@@ -2424,9 +3304,18 @@ export default function ProjectDetailPage() {
     () => sortTracksForProject((project?.tracks || []).filter((track) => !isTrackHidden(track))),
     [project?.tracks],
   );
+  const primaryTracks = useMemo(
+    () => sortedTracks.filter((track) => !isBackgroundTrack(track)),
+    [sortedTracks],
+  );
+  const backgroundTracks = useMemo(
+    () => sortedTracks.filter((track) => isBackgroundTrack(track)),
+    [sortedTracks],
+  );
+  const activeBackgroundPlacements = backgroundPlan?.placements || project?.pipeline?.background_video_suggestions || [];
   const dayGroups = useMemo(() => {
     const groups: Array<{ key: string; label: string; tracks: ProjectTrack[] }> = [];
-    for (const track of sortedTracks) {
+    for (const track of primaryTracks) {
       const sourceTime = track.recorded_at || project?.created_at || null;
       const key = getDayGroupKey(sourceTime);
       const label = formatDayLabel(sourceTime);
@@ -2438,7 +3327,7 @@ export default function ProjectDetailPage() {
       }
     }
     return groups;
-  }, [project?.created_at, sortedTracks]);
+  }, [primaryTracks, project?.created_at]);
 
   if (loading) {
     return (
@@ -2465,7 +3354,17 @@ export default function ProjectDetailPage() {
             <h1>{project.name}</h1>
             <span className="muted">Created {formatDate(project.created_at)}</span>
           </div>
-          <span className="badge">{project.status}</span>
+          <div className="projectOverviewActions">
+            <span className="badge">{project.status}</span>
+            <button
+              type="button"
+              className="btn secondary dangerButton"
+              onClick={handleDeleteProject}
+              disabled={deletingProject}
+            >
+              {deletingProject ? "Deleting..." : "Delete Project"}
+            </button>
+          </div>
         </div>
 
         <div className="projectFinalPreview">
@@ -2492,7 +3391,7 @@ export default function ProjectDetailPage() {
       <section className="card stack" style={{ gap: 16 }}>
         <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
           <div className="stack" style={{ gap: 4 }}>
-            <h2>Clips ({sortedTracks.length})</h2>
+            <h2>Clips ({primaryTracks.length})</h2>
             <span className="muted">
               Ordered chronologically from the earliest clip to the latest.
             </span>
@@ -2529,7 +3428,7 @@ export default function ProjectDetailPage() {
           </div>
         </div>
 
-        {sortedTracks.length === 0 ? (
+        {primaryTracks.length === 0 ? (
           <div className="notice">No clips in this project yet.</div>
         ) : groupByDay ? (
           <div className="clipDayGroups">
@@ -2555,10 +3454,12 @@ export default function ProjectDetailPage() {
                       visualPlanError={visualPlanErrors[track.id]}
                       onGenerateSpeechFilter={handleGenerateSpeechFilter}
                       onGenerateVisualPlan={handleGenerateVisualPlan}
+                      onMarkAsBackground={handleMarkAsBackground}
+                      backgroundSaving={Boolean(backgroundTrackSavingIds[track.id])}
                       onOpen={setActiveTrack}
                       onHide={handleHideTrack}
                       hiding={hidingTrackId === track.id}
-                      draggable={!groupByDay && !reorderingTracks}
+                      draggable={!reorderingTracks}
                       dragActive={draggingTrackId === track.id}
                       dragTarget={dragTargetTrackId === track.id && draggingTrackId !== track.id}
                       onDragStart={handleDragStart}
@@ -2567,6 +3468,7 @@ export default function ProjectDetailPage() {
                       onDragEnd={() => {
                         setDraggingTrackId(null);
                         setDragTargetTrackId(null);
+                        setBackgroundLibraryDropActive(false);
                       }}
                     />
                   ))}
@@ -2591,10 +3493,12 @@ export default function ProjectDetailPage() {
                 visualPlanError={visualPlanErrors[track.id]}
                 onGenerateSpeechFilter={handleGenerateSpeechFilter}
                 onGenerateVisualPlan={handleGenerateVisualPlan}
+                onMarkAsBackground={handleMarkAsBackground}
+                backgroundSaving={Boolean(backgroundTrackSavingIds[track.id])}
                 onOpen={setActiveTrack}
                 onHide={handleHideTrack}
                 hiding={hidingTrackId === track.id}
-                draggable={!groupByDay && !reorderingTracks}
+                draggable={!reorderingTracks}
                 dragActive={draggingTrackId === track.id}
                 dragTarget={dragTargetTrackId === track.id && draggingTrackId !== track.id}
                 onDragStart={handleDragStart}
@@ -2603,11 +3507,83 @@ export default function ProjectDetailPage() {
                 onDragEnd={() => {
                   setDraggingTrackId(null);
                   setDragTargetTrackId(null);
+                  setBackgroundLibraryDropActive(false);
                 }}
               />
             ))}
           </div>
         )}
+      </section>
+
+      <section
+        className={`card stack backgroundLibrarySection ${backgroundLibraryDropActive ? "backgroundLibrarySectionActive" : ""}`}
+        style={{ gap: 16 }}
+        onDragOver={handleBackgroundLibraryDragOver}
+        onDragLeave={handleBackgroundLibraryDragLeave}
+        onDrop={handleBackgroundLibraryDrop}
+      >
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+          <div className="stack" style={{ gap: 4 }}>
+            <h2>Background Library ({backgroundTracks.length})</h2>
+            <span className="muted">
+              These clips stay outside the main spoken timeline and are matched later as supportive background footage.
+            </span>
+          </div>
+          <button
+            type="button"
+            className="btn secondary"
+            disabled={backgroundPlanLoading || backgroundTracks.length === 0}
+            onClick={handleGenerateBackgroundPlan}
+          >
+            {backgroundPlanLoading ? "Planning..." : "Suggest Background Placements"}
+          </button>
+        </div>
+
+        <input
+          ref={backgroundUploadInputRef}
+          type="file"
+          accept="video/*,image/*"
+          multiple
+          hidden
+          onChange={handleAddBackgroundAssets}
+        />
+        <div className="clipGrid">
+          <BackgroundUploadCard
+            uploading={backgroundUploading}
+            dropActive={backgroundLibraryDropActive}
+            onClick={() => backgroundUploadInputRef.current?.click()}
+          />
+          {backgroundTracks.map((track) => (
+            <BackgroundTrackCard
+              key={track.id}
+              projectId={project.id}
+              token={token}
+              track={track}
+              saving={Boolean(backgroundTrackSavingIds[track.id])}
+              onPreview={setActiveTrack}
+              onSaveDescription={handleSaveBackgroundDescription}
+              onMoveToPrimary={handleMoveToPrimary}
+            />
+          ))}
+        </div>
+        <div className="notice">
+          Videos with no usable transcript are auto-marked here. You can also drag clips from the main grid into this section or upload dedicated background video and image assets directly here.
+        </div>
+
+        {activeBackgroundPlacements.length ? (
+          <div className="backgroundPlacementList">
+            {activeBackgroundPlacements.map((placement, index) => (
+              <div key={`${placement.track_id}-${placement.start}-${index}`} className="backgroundPlacementItem">
+                <strong>{placement.filename}</strong>
+                <span className="muted">
+                  {formatDuration(placement.start)} - {formatDuration(placement.end)} • {placement.description}
+                </span>
+                <span>{placement.transcript_excerpt}</span>
+                {placement.rationale ? <span className="muted">{placement.rationale}</span> : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       {activeTrack ? (
@@ -2622,15 +3598,16 @@ export default function ProjectDetailPage() {
           speechFilterError={speechFilterErrors[activeTrack.id]}
           visualPlan={visualPlans[activeTrack.id]}
           visualPlanLoading={Boolean(visualPlanLoadingIds[activeTrack.id])}
-          visualPlanError={visualPlanErrors[activeTrack.id]}
-          renderLoading={Boolean(renderLoadingIds[activeTrack.id])}
-          renderError={renderErrors[activeTrack.id]}
-          onGenerateSpeechFilter={handleGenerateSpeechFilter}
-          onGenerateVisualPlan={handleGenerateVisualPlan}
-          onSaveSpeechFilter={handleSaveSpeechFilter}
-          onRenderTrack={handleRenderTrack}
-          onClose={() => setActiveTrack(null)}
-        />
+              visualPlanError={visualPlanErrors[activeTrack.id]}
+              renderLoading={Boolean(renderLoadingIds[activeTrack.id])}
+              renderError={renderErrors[activeTrack.id]}
+              onGenerateSpeechFilter={handleGenerateSpeechFilter}
+              onGenerateVisualPlan={handleGenerateVisualPlan}
+              onSaveSpeechFilter={handleSaveSpeechFilter}
+              onUpdateBackgroundMusic={handleUpdateBackgroundMusic}
+              onRenderTrack={handleRenderTrack}
+              onClose={() => setActiveTrack(null)}
+            />
       ) : null}
     </div>
   );

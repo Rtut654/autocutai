@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
+import wave
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
 from PIL import Image, ImageDraw, ImageFont
 
-from ..models.project import EditMode, Project, VideoTrack, VisualPlanPart, ZoomPreviewBeat
+from ..models.project import EditMode, Project, SubtitleCue, VideoTrack, VisualPlanPart, ZoomPreviewBeat
 
 logger = logging.getLogger(__name__)
 
@@ -278,25 +280,39 @@ class VideoProcessor:
         normalized = [(max(0.0, float(start)), max(0.0, float(end))) for start, end in segments if end - start >= 0.05]
         if not normalized:
             raise RuntimeError("No usable video ranges were available to render")
+        info = await self.get_video_info(str(source_path))
+        has_audio = any(stream.get("codec_type") == "audio" for stream in info.get("streams", []))
 
-        concat_lines: List[str] = []
-        resolved_source = str(Path(source_path).resolve())
-        for start, end in normalized:
-            concat_lines.append(f"file '{resolved_source}'")
-            if start > 0:
-                concat_lines.append(f"inpoint {start:.3f}")
-            concat_lines.append(f"outpoint {end:.3f}")
+        filter_steps: List[str] = []
+        concat_inputs = ""
+        for index, (start, end) in enumerate(normalized):
+            filter_steps.append(
+                f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{index}]"
+            )
+            concat_inputs += f"[v{index}]"
+            if has_audio:
+                filter_steps.append(
+                    f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{index}]"
+                )
+                concat_inputs += f"[a{index}]"
 
-        concat_file = target.parent / f"concat_track_{uuid.uuid4().hex}.txt"
-        concat_file.write_text("\n".join(concat_lines), encoding="utf-8")
+        if has_audio:
+            filter_steps.append(f"{concat_inputs}concat=n={len(normalized)}:v=1:a=1[vout][aout]")
+        else:
+            filter_steps.append(f"{concat_inputs}concat=n={len(normalized)}:v=1:a=0[vout]")
+
         cmd = [
             self.ffmpeg_path,
-            "-f",
-            "concat",
-            "-safe",
-            "0",
             "-i",
-            str(concat_file),
+            str(source_path),
+            "-filter_complex",
+            ";".join(filter_steps),
+            "-map",
+            "[vout]",
+        ]
+        if has_audio:
+            cmd.extend(["-map", "[aout]"])
+        cmd.extend([
             "-movflags",
             "+faststart",
             "-pix_fmt",
@@ -307,18 +323,226 @@ class VideoProcessor:
             "veryfast",
             "-crf",
             "20",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
-            "-y",
-            str(target),
-        ]
-        try:
-            await self._run_ffmpeg_command(cmd)
-        finally:
-            concat_file.unlink(missing_ok=True)
+        ])
+        if has_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "160k"])
+        cmd.extend(["-y", str(target)])
+        await self._run_ffmpeg_command(cmd)
         return str(target)
+
+    async def generate_background_music_track(
+        self,
+        output_path: str | Path,
+        *,
+        duration: float,
+        preset: str,
+    ) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sample_rate = 44100
+        total_frames = max(1, int(sample_rate * max(0.1, duration)))
+        channels = 2
+
+        def note_freq(name: str) -> float:
+            table = {
+                "C3": 130.81,
+                "D3": 146.83,
+                "E3": 164.81,
+                "F3": 174.61,
+                "G3": 196.00,
+                "A3": 220.00,
+                "B3": 246.94,
+                "C4": 261.63,
+                "D4": 293.66,
+                "E4": 329.63,
+                "G4": 392.00,
+                "A4": 440.00,
+            }
+            return table[name]
+
+        if preset == "upbeat_motion":
+            chords = [["C3", "G3", "C4"], ["A3", "E4", "A4"], ["F3", "C4", "A4"], ["G3", "D4", "G4"]]
+            beat = 0.33
+            gain = 0.24
+            wave_kind = "square"
+        elif preset == "warm_focus":
+            chords = [["A3", "C4", "E4"], ["G3", "C4", "E4"], ["F3", "A3", "C4"], ["G3", "B3", "D4"]]
+            beat = 0.5
+            gain = 0.18
+            wave_kind = "triangle"
+        else:
+            chords = [["C3", "E3", "G3"], ["A3", "C4", "E4"], ["F3", "A3", "C4"], ["G3", "B3", "D4"]]
+            beat = 0.66
+            gain = 0.15
+            wave_kind = "sine"
+
+        def sample(kind: str, phase: float) -> float:
+            if kind == "square":
+                return 1.0 if math.sin(phase) >= 0 else -1.0
+            if kind == "triangle":
+                return (2 / math.pi) * math.asin(math.sin(phase))
+            return math.sin(phase)
+
+        phases = [0.0, 0.0, 0.0]
+        frames = bytearray()
+        for index in range(total_frames):
+            time = index / sample_rate
+            chord = chords[int(time / (beat * 4)) % len(chords)]
+            local_beat = (time % beat) / beat
+            pulse = 0.35 + 0.65 * max(0.0, 1.0 - local_beat * 1.35)
+            left = 0.0
+            right = 0.0
+            for note_index, note in enumerate(chord[:3]):
+                frequency = note_freq(note)
+                phases[note_index] += (2 * math.pi * frequency) / sample_rate
+                voice = sample(wave_kind, phases[note_index])
+                pan = -0.18 if note_index == 0 else 0.18 if note_index == 2 else 0.0
+                voice_gain = gain * (0.82 if note_index == 1 else 0.62) * pulse
+                left += voice * voice_gain * (1 - max(0.0, pan))
+                right += voice * voice_gain * (1 + min(0.0, pan))
+            if preset != "ambient_pulse":
+                bass_phase = phases[0] * 0.5
+                bass = math.sin(bass_phase) * gain * 0.38 * pulse
+                left += bass
+                right += bass
+            left = max(-1.0, min(1.0, left))
+            right = max(-1.0, min(1.0, right))
+            frames.extend(int(left * 32767).to_bytes(2, "little", signed=True))
+            frames.extend(int(right * 32767).to_bytes(2, "little", signed=True))
+
+        with wave.open(str(target), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(bytes(frames))
+        return str(target)
+
+    async def mix_background_music(
+        self,
+        video_input: str | Path,
+        music_input: str | Path,
+        output_path: str | Path,
+        *,
+        music_volume: float,
+        ducking: float,
+    ) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        info = await self.get_video_info(str(video_input))
+        has_audio = any(stream.get("codec_type") == "audio" for stream in info.get("streams", []))
+        duration = float(info.get("format", {}).get("duration", 0.0) or 0.0)
+
+        if has_audio:
+            ratio = max(3.0, 4.0 + ducking * 10.0)
+            threshold = max(0.005, 0.035 - ducking * 0.02)
+            filter_complex = (
+                f"[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+                f"volume={music_volume:.3f}[bg];"
+                f"[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[voice];"
+                f"[bg][voice]sidechaincompress=threshold={threshold:.3f}:ratio={ratio:.2f}:attack=18:release=280[bgduck];"
+                f"[voice][bgduck]amix=inputs=2:weights='1 1':normalize=0[aout]"
+            )
+            cmd = [
+                self.ffmpeg_path,
+                "-i", str(video_input),
+                "-i", str(music_input),
+                "-filter_complex", filter_complex,
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-shortest",
+                "-y", str(target),
+            ]
+        else:
+            cmd = [
+                self.ffmpeg_path,
+                "-i", str(video_input),
+                "-i", str(music_input),
+                "-filter:a", f"volume={music_volume:.3f}",
+                "-map", "0:v",
+                "-map", "1:a",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-t", f"{duration:.3f}" if duration > 0 else "0.1",
+                "-shortest",
+                "-y", str(target),
+            ]
+        await self._run_ffmpeg_command(cmd)
+        return str(target)
+
+    async def mix_visual_sfx(
+        self,
+        video_input: str | Path,
+        output_path: str | Path,
+        *,
+        cue_times: List[float],
+    ) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        normalized = [max(0.0, float(time_value)) for time_value in cue_times]
+        if not normalized:
+            return str(video_input)
+
+        info = await self.get_video_info(str(video_input))
+        has_audio = any(stream.get("codec_type") == "audio" for stream in info.get("streams", []))
+        duration = float(info.get("format", {}).get("duration", 0.0) or 0.0)
+        if duration <= 0:
+            return str(video_input)
+
+        sfx_path = target.parent / f".whoosh_{uuid.uuid4().hex}.wav"
+        await self.generate_transition_sfx(sfx_path)
+        try:
+            cmd = [self.ffmpeg_path, "-i", str(video_input)]
+            for _ in normalized:
+                cmd.extend(["-i", str(sfx_path)])
+
+            filter_steps: List[str] = []
+            cue_inputs = ""
+            for index, cue_time in enumerate(normalized, start=1):
+                delay_ms = max(0, int(cue_time * 1000))
+                filter_steps.append(
+                    f"[{index}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+                    f"volume=0.22,adelay={delay_ms}|{delay_ms}[sfx{index}]"
+                )
+                cue_inputs += f"[sfx{index}]"
+
+            if has_audio:
+                filter_steps.append(
+                    f"[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[voice]"
+                )
+                filter_steps.append(f"{cue_inputs}amix=inputs={len(normalized)}:normalize=0[sfxmix]")
+                filter_steps.append("[voice][sfxmix]amix=inputs=2:weights='1 0.8':normalize=0[aout]")
+            else:
+                filter_steps.append(f"{cue_inputs}amix=inputs={len(normalized)}:normalize=0[aout]")
+
+            cmd.extend([
+                "-filter_complex",
+                ";".join(filter_steps),
+                "-map",
+                "0:v",
+                "-map",
+                "[aout]",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                "-shortest",
+                "-y",
+                str(target),
+            ])
+            await self._run_ffmpeg_command(cmd)
+            return str(target)
+        finally:
+            sfx_path.unlink(missing_ok=True)
 
     def _build_zoom_scale_expression(self, zoom_beats: List[ZoomPreviewBeat]) -> str:
         enabled = [beat for beat in zoom_beats if beat.enabled and beat.end > beat.start]
@@ -334,21 +558,43 @@ class VideoProcessor:
         return f"1+({'+'.join(terms)})"
 
     def _overlay_motion_expressions(self, part: VisualPlanPart) -> tuple[str, str]:
-        placement = str(part.placement or "").lower()
-        enter = 0.22
-        x_from = 0
-        y_from = 14
-        if "left" in placement:
-            x_from = -22
-        elif "right" in placement:
-            x_from = 22
-        if "upper" in placement or "top" in placement:
-            y_from = -18
-        elif "lower" in placement:
-            y_from = 18
-        x_expr = f"if(lt(t,{part.start + enter:.3f}),{x_from:.1f}*(1-((t-{part.start:.3f})/{enter:.3f})),0)"
-        y_expr = f"if(lt(t,{part.start + enter:.3f}),{y_from:.1f}*(1-((t-{part.start:.3f})/{enter:.3f})),0)"
-        return x_expr, y_expr
+        return "0", "0"
+
+    async def generate_transition_sfx(self, output_path: str | Path) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sample_rate = 44100
+        duration = 0.2
+        total_frames = int(sample_rate * duration)
+        channels = 2
+        frames = bytearray()
+        phase_a = 0.0
+        phase_b = 0.0
+        for index in range(total_frames):
+            time = index / sample_rate
+            progress = min(1.0, max(0.0, time / duration))
+            env = math.sin(math.pi * progress) ** 1.4
+            noise = (math.sin(index * 12.9898) * 43758.5453) % 1.0
+            noise = (noise * 2.0) - 1.0
+            freq_a = 700 + (1 - progress) * 900
+            freq_b = 1800 - progress * 700
+            phase_a += (2 * math.pi * freq_a) / sample_rate
+            phase_b += (2 * math.pi * freq_b) / sample_rate
+            sample_value = (
+                noise * 0.18 * env
+                + math.sin(phase_a) * 0.07 * env
+                + math.sin(phase_b) * 0.04 * env
+            )
+            pcm = int(max(-1.0, min(1.0, sample_value)) * 32767)
+            frames.extend(pcm.to_bytes(2, "little", signed=True))
+            frames.extend(pcm.to_bytes(2, "little", signed=True))
+
+        with wave.open(str(target), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(bytes(frames))
+        return str(target)
 
     def _render_visual_overlay_asset(
         self,
@@ -362,12 +608,25 @@ class VideoProcessor:
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         vertical = height > width
-        box_width = int(width * (0.42 if vertical else 0.3))
-        box_width = max(150, min(box_width, 300))
-        box_height = int(box_width * 0.72)
+        if part.visual_type.value == "web_image":
+            box_width = int(width * (0.34 if not vertical else 0.38))
+            box_width = max(120, min(box_width, 180))
+            box_height = int(box_width * 1.15)
+        else:
+            box_width = int(width * (0.42 if vertical else 0.32))
+            box_width = max(170, min(box_width, 240))
+            box_height = int(box_width * (1.48 if vertical else 1.18))
         if part.visual_type.value == "web_image":
             box_height = int(box_width * 1.15)
-        x, y = self._overlay_anchor(width, height, box_width, box_height, str(part.placement or ""), vertical)
+        x, y = self._overlay_anchor(
+            width,
+            height,
+            box_width,
+            box_height,
+            str(part.placement or ""),
+            vertical,
+            part_index,
+        )
 
         if part.visual_type.value == "web_image" and part.local_path and Path(part.local_path).exists():
             self._draw_web_image_overlay(image, draw, x, y, box_width, box_height, part)
@@ -393,11 +652,11 @@ class VideoProcessor:
         ImageDraw.Draw(mask).rounded_rectangle((0, 0, asset.size[0], asset.size[1]), radius=18, fill=255)
         rounded.paste(asset, (0, 0), mask)
         image.alpha_composite(rounded, (x, y))
-        caption_font = self._load_font(18, bold=True)
+        caption_font = self._load_font(12, bold=True)
         caption = str(part.title or part.text or "Visual").strip()[:26]
-        pill_box = (x, y + asset.size[1] + 10, x + min(asset.size[0], width), y + asset.size[1] + 46)
-        draw.rounded_rectangle(pill_box, radius=16, fill=(15, 23, 42, 170))
-        draw.text((pill_box[0] + 12, pill_box[1] + 9), caption, font=caption_font, fill=(255, 255, 255, 238))
+        pill_box = (x, y + asset.size[1] + 8, x + min(asset.size[0], width), y + asset.size[1] + 34)
+        draw.rounded_rectangle(pill_box, radius=12, fill=(15, 23, 42, 132))
+        draw.text((pill_box[0] + 10, pill_box[1] + 5), caption, font=caption_font, fill=(255, 255, 255, 238))
 
     def _draw_animation_overlay(
         self,
@@ -410,29 +669,41 @@ class VideoProcessor:
         part_index: int,
     ) -> None:
         palette = self._palette_colors(str(part.palette or "cool"))
-        title_font = self._load_font(22 if width < 220 else 28, bold=True)
+        title_font = self._load_font(34 if width < 210 else 38, bold=True)
         label_font = self._load_font(14, bold=True)
-        chip_font = self._load_font(14, bold=True)
+        chip_font = self._load_font(13, bold=True)
         title = str(part.title or part.text or "Visual").strip()
         words = [str(word).strip() for word in (part.keywords or []) if str(word).strip()][:2]
         label = self._kicker_for_part(part)
         motif = str(part.animation_kind or "idea_burst")
 
-        self._draw_motif(draw, motif, x, y, width, int(height * 0.55), palette, part_index)
-        pill_width = min(width - 8, max(88, draw.textbbox((0, 0), label.upper(), font=label_font)[2] + 24))
-        draw.rounded_rectangle((x, y, x + pill_width, y + 34), radius=17, fill=palette["primary"])
-        draw.text((x + 14, y + 8), label.upper(), font=label_font, fill=(255, 255, 255, 244))
-        title_y = y + int(height * 0.58)
-        self._draw_shadow_text(draw, (x, title_y), title[:34], font=title_font, fill=(255, 255, 255, 244))
+        motif_height = max(84, int(height * 0.34))
+        self._draw_motif(draw, motif, x, y, width, motif_height, palette, part_index)
+        label_y = y + motif_height + 8
+        pill_width = min(width - 6, max(106, draw.textbbox((0, 0), label.upper(), font=label_font)[2] + 28))
+        pill_height = 30
+        draw.rounded_rectangle((x, label_y, x + pill_width, label_y + pill_height), radius=15, fill=palette["primary"])
+        draw.text((x + 14, label_y + 6), label.upper(), font=label_font, fill=(255, 255, 255, 244))
+        title_y = label_y + pill_height + 12
+        wrapped_title = self._wrap_text(draw, title[:48], title_font, max(132, width - 10), max_lines=3)
+        line_height = max(24, title_font.size + 4)
+        for line_index, line in enumerate(wrapped_title):
+            self._draw_shadow_text(
+                draw,
+                (x, title_y + line_index * line_height),
+                line,
+                font=title_font,
+                fill=(255, 255, 255, 244),
+            )
 
-        chip_y = title_y + 44
+        chip_y = title_y + max(32, len(wrapped_title) * line_height) + 10
         chip_x = x
         for word in words:
             bbox = draw.textbbox((0, 0), word, font=chip_font)
             chip_width = bbox[2] - bbox[0] + 20
-            draw.rounded_rectangle((chip_x, chip_y, chip_x + chip_width, chip_y + 28), radius=14, fill=(30, 41, 59, 160), outline=(255, 255, 255, 35))
-            draw.text((chip_x + 10, chip_y + 6), word, font=chip_font, fill=(255, 255, 255, 232))
-            chip_x += chip_width + 8
+            draw.rounded_rectangle((chip_x, chip_y, chip_x + chip_width, chip_y + 26), radius=13, fill=(15, 23, 42, 112), outline=(255, 255, 255, 30))
+            draw.text((chip_x + 10, chip_y + 5), word, font=chip_font, fill=(255, 255, 255, 232))
+            chip_x += chip_width + 6
 
     def _draw_motif(
         self,
@@ -504,29 +775,179 @@ class VideoProcessor:
         draw.ellipse((x - 18, y - 18, x + 18, y + 18), fill=color)
         draw.rounded_rectangle((x - 26, y + 20, x + 26, y + 50), radius=14, fill=color)
 
-    def _overlay_anchor(self, width: int, height: int, box_width: int, box_height: int, placement: str, vertical: bool) -> tuple[int, int]:
+    def _wrap_text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: ImageFont.ImageFont,
+        max_width: int,
+        *,
+        max_lines: int,
+    ) -> List[str]:
+        words = [segment for segment in text.split() if segment]
+        if not words:
+            return [text]
+        lines: List[str] = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            bbox = draw.textbbox((0, 0), candidate, font=font)
+            if bbox[2] - bbox[0] <= max_width:
+                current = candidate
+                continue
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines - 1:
+                break
+        remaining_words = words[len(" ".join(lines + [current]).split()):]
+        if remaining_words:
+            tail = " ".join([current, *remaining_words]).strip()
+            while tail:
+                bbox = draw.textbbox((0, 0), f"{tail}...", font=font)
+                if bbox[2] - bbox[0] <= max_width or len(tail) <= 4:
+                    current = f"{tail}..."
+                    break
+                tail = tail[:-1].rstrip()
+        lines.append(current)
+        return lines[:max_lines]
+
+    def _overlay_anchor(
+        self,
+        width: int,
+        height: int,
+        box_width: int,
+        box_height: int,
+        placement: str,
+        vertical: bool,
+        part_index: int,
+    ) -> tuple[int, int]:
         horizontal_margin = 18
         vertical_margin = 18
         if "right" in placement:
             x = width - box_width - horizontal_margin
-        elif "center" in placement:
+        elif placement == "center":
             x = (width - box_width) // 2
         else:
-            x = horizontal_margin
-        if "lower" in placement:
-            y = height - box_height - vertical_margin
-        elif "upper" in placement or "top" in placement:
-            y = vertical_margin
-        else:
-            y = int(height * (0.56 if vertical else 0.62)) - box_height
+            x = width - box_width - horizontal_margin if part_index % 2 else horizontal_margin
+        y = vertical_margin
         return max(0, x), max(0, y)
 
-    def _load_font(self, size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-        candidates = [
-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/System/Library/Fonts/Supplemental/Helvetica.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    async def burn_subtitles(
+        self,
+        video_input: str | Path,
+        subtitle_path: str | Path,
+        output_path: str | Path,
+    ) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subtitle_filter = f"subtitles=filename='{self._escape_filter_value(Path(subtitle_path).resolve().as_posix())}'"
+        cmd = [
+            self.ffmpeg_path,
+            "-i",
+            str(video_input),
+            "-vf",
+            subtitle_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(target),
         ]
+        await self._run_ffmpeg_command(cmd)
+        return str(target)
+
+    async def burn_subtitles_from_cues(
+        self,
+        video_input: str | Path,
+        cues: List[SubtitleCue],
+        output_path: str | Path,
+    ) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        font_path = self._preferred_font_path(bold=True)
+        font_expr = f"fontfile='{self._escape_filter_value(font_path)}':" if font_path else ""
+        draw_steps: List[str] = []
+        for cue in cues:
+            text = self._escape_drawtext_text(str(cue.text))
+            draw_steps.append(
+                "drawtext="
+                f"{font_expr}"
+                f"text='{text}':"
+                "fontcolor=white:"
+                "fontsize=42:"
+                "line_spacing=6:"
+                "box=1:"
+                "boxcolor=black@0.52:"
+                "boxborderw=12:"
+                "x=(w-text_w)/2:"
+                "y=h-(text_h*2.8):"
+                f"enable='between(t,{float(cue.start):.3f},{float(cue.end):.3f})'"
+            )
+        cmd = [
+            self.ffmpeg_path,
+            "-i",
+            str(video_input),
+            "-vf",
+            ",".join(draw_steps),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(target),
+        ]
+        await self._run_ffmpeg_command(cmd)
+        return str(target)
+
+    async def attach_subtitle_track(
+        self,
+        video_input: str | Path,
+        subtitle_path: str | Path,
+        output_path: str | Path,
+    ) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self.ffmpeg_path,
+            "-i",
+            str(video_input),
+            "-i",
+            str(subtitle_path),
+            "-map",
+            "0:v",
+            "-map",
+            "0:a?",
+            "-map",
+            "1:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            "-c:s",
+            "mov_text",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(target),
+        ]
+        await self._run_ffmpeg_command(cmd)
+        return str(target)
+
+    def _load_font(self, size: int, *, bold: bool = False) -> ImageFont.ImageFont:
+        candidates = self._font_candidates(bold=bold)
         for candidate in candidates:
             if candidate and Path(candidate).exists():
                 try:
@@ -534,6 +955,28 @@ class VideoProcessor:
                 except Exception:
                     continue
         return ImageFont.load_default()
+
+    def _font_candidates(self, *, bold: bool) -> List[str]:
+        return [
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+
+    def _preferred_font_path(self, *, bold: bool) -> str | None:
+        for candidate in self._font_candidates(bold=bold):
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
+
+    def _escape_drawtext_text(self, value: str) -> str:
+        escaped = value.replace("\\", "\\\\")
+        escaped = escaped.replace(":", "\\:")
+        escaped = escaped.replace("'", "\\'")
+        escaped = escaped.replace("%", "\\%")
+        escaped = escaped.replace("[", "\\[")
+        escaped = escaped.replace("]", "\\]")
+        return escaped
 
     def _draw_shadow_text(
         self,

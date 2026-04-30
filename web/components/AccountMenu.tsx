@@ -139,12 +139,6 @@ export default function AccountMenu() {
             <span className="accountProvider">{providerLabel(user.provider)}</span>
           </div>
 
-          <div className="accountPopoverActions">
-            <Link href="/" className="accountAction">Home</Link>
-            <Link href="/profile" className="accountAction">Profile</Link>
-            <Link href="/pricing" className="accountAction accountActionPrimary">Pricing</Link>
-          </div>
-
           <div className="accountPopoverFooter">
             <Link href="/profile" className="accountDelete">Delete account</Link>
             <button

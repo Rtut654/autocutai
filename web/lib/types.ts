@@ -41,6 +41,30 @@ export type InsertionSuggestion = {
   media_type: string;
 };
 
+export type BackgroundVideoPlacement = {
+  track_id: string;
+  filename: string;
+  description: string;
+  start: number;
+  end: number;
+  duration: number;
+  transcript_excerpt: string;
+  rationale: string;
+  confidence: number;
+};
+
+export type BackgroundVideoPlanArtifact = {
+  project_id: string;
+  status: "completed" | "error";
+  summary: string;
+  placements: BackgroundVideoPlacement[];
+  generated_at: string;
+  source_word_count: number;
+  model: string;
+  worker: string;
+  error_message?: string | null;
+};
+
 export type TranscriptWord = {
   word: string;
   start: number;
@@ -111,6 +135,13 @@ export type TrackRenderResponse = {
   message: string;
 };
 
+export type BackgroundMusicSettings = {
+  enabled: boolean;
+  preset: "ambient_pulse" | "upbeat_motion" | "warm_focus";
+  volume: number;
+  ducking: number;
+};
+
 export type VisualPlanPart = {
   start: number;
   end: number;
@@ -168,7 +199,10 @@ export type ProjectTrack = {
   has_voice?: boolean;
   recorded_at?: string | null;
   local_gap_ranges?: GapRange[];
+  background_music?: BackgroundMusicSettings;
   render_versions?: TrackRenderVersion[];
+  role?: "primary" | "background";
+  background_description?: string | null;
   status?: "visible" | "hidden";
   excluded?: boolean;
 };
@@ -176,6 +210,7 @@ export type ProjectTrack = {
 export type ProjectPipeline = {
   combined_transcript?: string;
   insertion_suggestions?: InsertionSuggestion[];
+  background_video_suggestions?: BackgroundVideoPlacement[];
   gap_ranges?: GapRange[];
   render_plan?: Record<string, unknown>;
   subtitle_cues?: Array<Record<string, unknown>>;

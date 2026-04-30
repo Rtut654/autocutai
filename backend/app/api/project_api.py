@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from .auth_dependencies import get_current_user
 from ..models.project import (
     AspectRatio,
+    BackgroundVideoPlanArtifact,
     EditMode,
     HybridProjectAnalyzeRequest,
     ProcessingStatus,
@@ -27,11 +28,14 @@ from ..models.project import (
     ProjectUpdateRequest,
     SpeechFilterArtifact,
     SpeechFilterUpdateRequest,
+    TrackBackgroundVideoUpdateRequest,
+    TrackBackgroundMusicUpdateRequest,
     TrackRenderRequest,
     TrackRenderResponse,
     VisualPlanArtifact,
 )
 from ..services.project_service import project_service
+from ..services.background_video_worker_service import background_video_worker_service
 from ..services.video_processor import video_processor
 from ..services.visual_worker_service import visual_worker_service
 
@@ -284,6 +288,17 @@ async def get_insertions(project_id: str, current_user=Depends(get_current_user)
     }
 
 
+@router.get("/{project_id}/background-video-plan", response_model=BackgroundVideoPlanArtifact)
+async def get_background_video_plan(project_id: str, current_user=Depends(get_current_user)):
+    artifact = await background_video_worker_service.get_project_background_video_plan(
+        project_id,
+        user_id=current_user.id,
+    )
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Background video plan not found")
+    return artifact
+
+
 @router.get("/{project_id}/download")
 async def download_project_output(project_id: str, current_user=Depends(get_current_user)):
     project = await project_service.get_project(project_id, user_id=current_user.id)
@@ -395,6 +410,66 @@ async def reorder_project_tracks(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return ProjectResponse(project=project, message="Track order updated")
+
+
+@router.patch("/{project_id}/tracks/{track_id}/background-music", response_model=ProjectResponse)
+async def update_track_background_music(
+    project_id: str,
+    track_id: str,
+    request: TrackBackgroundMusicUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        project = await project_service.update_track_background_music(
+            project_id,
+            track_id,
+            request.model_dump(),
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    return ProjectResponse(project=project, message="Background music updated")
+
+
+@router.patch("/{project_id}/tracks/{track_id}/background-video", response_model=ProjectResponse)
+async def update_track_background_video(
+    project_id: str,
+    track_id: str,
+    request: TrackBackgroundVideoUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        project = await project_service.update_track_background_video(
+            project_id,
+            track_id,
+            request.model_dump(),
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    return ProjectResponse(project=project, message="Background clip updated")
+
+
+@router.post("/{project_id}/background-video-plan", response_model=BackgroundVideoPlanArtifact)
+async def generate_background_video_plan(project_id: str, current_user=Depends(get_current_user)):
+    try:
+        return await background_video_worker_service.generate_project_background_video_plan(
+            project_id,
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "Project not found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate background video plan: {exc}") from exc
 
 
 @router.post("/{project_id}/transcribe-missing", response_model=ProjectResponse)

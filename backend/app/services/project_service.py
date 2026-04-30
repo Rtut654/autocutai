@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..models.project import (
+    BackgroundMusicSettings,
+    TrackRole,
     EditMode,
     HybridProjectAnalyzeRequest,
     HybridTrackInput,
@@ -19,11 +21,13 @@ from ..models.project import (
     ProjectCreateRequest,
     ProjectUpdateRequest,
     SpeechFilterArtifact,
+    VisualPlanPart,
     VisualPlanArtifact,
     TrackRenderVersion,
     TrackOrientation,
     TrackType,
     VideoTrack,
+    ZoomPreviewBeat,
 )
 from ..services.ai_service import ai_service
 from ..services.pipeline_service import (
@@ -36,16 +40,25 @@ from ..services.pipeline_service import (
 )
 from ..services.video_processor import VideoProcessor
 from ..services.whisper_service import transcribe_audio
+from ..models.transcription import WordTimestamp
 
 logger = logging.getLogger(__name__)
+
+VISUAL_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "how",
+    "i", "if", "in", "into", "is", "it", "its", "not", "of", "on", "or", "so", "that", "the",
+    "their", "then", "there", "they", "this", "to", "up", "was", "we", "what", "when", "which",
+    "with", "you", "your", "once", "usually", "again",
+}
 
 
 class ProjectService:
     """Service for managing video editing projects."""
 
     def __init__(self, projects_dir: str = "projects", temp_dir: str = "temp"):
-        self.projects_dir = Path(projects_dir)
-        self.temp_dir = Path(temp_dir)
+        repo_root = Path(__file__).resolve().parents[3]
+        self.projects_dir = (repo_root / projects_dir).resolve() if not Path(projects_dir).is_absolute() else Path(projects_dir)
+        self.temp_dir = (repo_root / temp_dir).resolve() if not Path(temp_dir).is_absolute() else Path(temp_dir)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
         self.projects: Dict[str, Project] = {}
@@ -171,7 +184,8 @@ class ProjectService:
     async def get_project(self, project_id: str, user_id: Optional[str] = None) -> Optional[Project]:
         cached = self.projects.get(project_id)
         if cached and (not user_id or cached.user_id == user_id):
-            await self._sanitize_existing_project_state(cached)
+            if self._sync_background_track_defaults(cached):
+                await self._save_project(cached)
             return cached
 
         candidate_files: List[Path] = []
@@ -183,7 +197,8 @@ class ProjectService:
         for project_file in candidate_files:
             if project_file.exists():
                 project = await self._load_project(project_file)
-                await self._sanitize_existing_project_state(project)
+                if self._sync_background_track_defaults(project):
+                    await self._save_project(project)
                 self.projects[project_id] = project
                 if not user_id or project.user_id == user_id:
                     return project
@@ -275,7 +290,8 @@ class ProjectService:
 
         for project_file in candidate_files:
             project = await self._load_project(project_file)
-            await self._sanitize_existing_project_state(project)
+            if self._sync_background_track_defaults(project):
+                await self._save_project(project)
             self.projects[project.id] = project
             projects.append(project)
         return sorted(projects, key=lambda p: p.updated_at, reverse=True)
@@ -769,31 +785,115 @@ class ProjectService:
         version_id = uuid.uuid4().hex
         timestamp_label = datetime.now().strftime("%d.%m.%Y.%H%M")
         output_path = self._reserve_named_output(render_dir, timestamp_label, ".mp4")
-        staged_source = source_path
 
         visual_plan = await self.get_track_visual_plan(project.id, track.id, user_id=project.user_id)
         zoom_beats = existing_speech_filter.zoom_beats if existing_speech_filter else []
         visual_parts = visual_plan.parts if visual_plan else []
-        if zoom_beats or visual_parts:
+        aligned_visual_parts = self._align_visual_parts_to_preview_timing(visual_parts, track)
+        remapped_zoom_beats = self._remap_zoom_beats_to_render_timeline(zoom_beats, keep_segments)
+        remapped_visual_parts = self._remap_visual_parts_to_render_timeline(aligned_visual_parts, keep_segments)
+
+        cut_source_path = render_dir / f"{Path(output_path).stem}__cut.mp4"
+        staged_source = Path(
+            await processor.render_source_segments(
+                source_path=source_path,
+                segments=keep_segments,
+                output_path=cut_source_path,
+            )
+        )
+
+        if remapped_zoom_beats or remapped_visual_parts:
             styled_path = render_dir / f"{Path(output_path).stem}__styled.mp4"
             staged_source = Path(
                 await processor.render_styled_track(
-                    source_path=source_path,
+                    source_path=staged_source,
                     output_path=styled_path,
                     width=int(track.width or 720),
                     height=int(track.height or 1280),
-                    zoom_beats=zoom_beats,
-                    visual_parts=visual_parts,
+                    zoom_beats=remapped_zoom_beats,
+                    visual_parts=remapped_visual_parts,
                 )
             )
+            cut_source_path.unlink(missing_ok=True)
 
-        rendered_path = await processor.render_source_segments(
-            source_path=staged_source,
-            segments=keep_segments,
-            output_path=output_path,
-        )
-        if staged_source != source_path:
+        if remapped_visual_parts:
+            sfx_path = render_dir / f"{Path(output_path).stem}__sfx.mp4"
+            previous_staged_source = staged_source
+            staged_source = Path(
+                await processor.mix_visual_sfx(
+                    video_input=staged_source,
+                    output_path=sfx_path,
+                    cue_times=[float(part.start) for part in remapped_visual_parts],
+                )
+            )
+            if staged_source != previous_staged_source and previous_staged_source != source_path:
+                previous_staged_source.unlink(missing_ok=True)
+
+        dry_output_path = output_path
+        if track.background_music.enabled:
+            dry_output_path = render_dir / f"{Path(output_path).stem}__dry.mp4"
+            shutil.copyfile(staged_source, dry_output_path)
+            rendered_path = str(dry_output_path)
+        else:
+            rendered_path = str(staged_source)
+        if Path(rendered_path) != staged_source and staged_source != source_path:
             Path(staged_source).unlink(missing_ok=True)
+
+        if track.background_music.enabled:
+            bgm_path = render_dir / f"{Path(output_path).stem}__bgm.wav"
+            await processor.generate_background_music_track(
+                output_path=bgm_path,
+                duration=max(0.1, round(sum(max(0.0, end - start) for start, end in keep_segments), 3)),
+                preset=str(track.background_music.preset.value if hasattr(track.background_music.preset, "value") else track.background_music.preset),
+            )
+            rendered_path = await processor.mix_background_music(
+                video_input=rendered_path,
+                music_input=bgm_path,
+                output_path=output_path,
+                music_volume=float(track.background_music.volume),
+                ducking=float(track.background_music.ducking),
+            )
+            Path(dry_output_path).unlink(missing_ok=True)
+            bgm_path.unlink(missing_ok=True)
+
+        if project.settings.generate_subtitles:
+            remapped_words = self._remap_track_words_to_render_timeline(track, keep_segments)
+            subtitle_cues = build_subtitle_cues(remapped_words)
+            if subtitle_cues:
+                subtitle_srt_path = render_dir / f"{Path(output_path).stem}__subtitles.srt"
+                subtitled_path = render_dir / f"{Path(output_path).stem}__subtitled.mp4"
+                write_subtitles_srt(subtitle_cues, subtitle_srt_path)
+                previous_rendered_path = Path(rendered_path)
+                try:
+                    rendered_path = await processor.burn_subtitles(
+                        video_input=previous_rendered_path,
+                        subtitle_path=subtitle_srt_path,
+                        output_path=subtitled_path,
+                    )
+                    if previous_rendered_path != source_path and previous_rendered_path.exists():
+                        previous_rendered_path.unlink(missing_ok=True)
+                except RuntimeError as exc:
+                    if processor._can_skip_subtitle_burn(exc):
+                        logger.warning("Falling back to drawtext subtitle burn-in: %s", exc)
+                        try:
+                            rendered_path = await processor.burn_subtitles_from_cues(
+                                video_input=previous_rendered_path,
+                                cues=subtitle_cues,
+                                output_path=subtitled_path,
+                            )
+                        except RuntimeError as drawtext_exc:
+                            logger.warning("Falling back to embedded subtitle track: %s", drawtext_exc)
+                            rendered_path = await processor.attach_subtitle_track(
+                                video_input=previous_rendered_path,
+                                subtitle_path=subtitle_srt_path,
+                                output_path=subtitled_path,
+                            )
+                        if previous_rendered_path != source_path and previous_rendered_path.exists():
+                            previous_rendered_path.unlink(missing_ok=True)
+                    else:
+                        raise
+                finally:
+                    subtitle_srt_path.unlink(missing_ok=True)
 
         duration_after = round(sum(max(0.0, end - start) for start, end in keep_segments), 3)
         version = TrackRenderVersion(
@@ -812,6 +912,58 @@ class ProjectService:
         await self._save_project(project)
         self.projects[project.id] = project
         return version
+
+    async def update_track_background_music(
+        self,
+        project_id: str,
+        track_id: str,
+        settings: Dict[str, Any],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Project:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project or not project.user_id:
+            raise ValueError("Project not found")
+
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track:
+            raise ValueError("Track not found")
+
+        track.background_music = BackgroundMusicSettings(**settings)
+        project.updated_at = datetime.utcnow()
+        await self._save_project(project)
+        self.projects[project.id] = project
+        return project
+
+    async def update_track_background_video(
+        self,
+        project_id: str,
+        track_id: str,
+        settings: Dict[str, Any],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Project:
+        project = await self.get_project(project_id, user_id=user_id)
+        if not project or not project.user_id:
+            raise ValueError("Project not found")
+
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track:
+            raise ValueError("Track not found")
+        if track.type not in {TrackType.VIDEO, TrackType.IMAGE}:
+            raise ValueError("Only video or image tracks can be labeled as background")
+
+        role = settings.get("role", TrackRole.PRIMARY)
+        if not isinstance(role, TrackRole):
+            role = TrackRole(str(role))
+        description = str(settings.get("background_description") or "").strip() or None
+
+        track.role = role
+        track.background_description = description
+        project.updated_at = datetime.utcnow()
+        await self._save_project(project)
+        self.projects[project.id] = project
+        return project
 
     async def get_track_visual_plan(
         self,
@@ -870,6 +1022,258 @@ class ProjectService:
         return [(start, end) for start, end in segments if end - start >= 0.05]
 
     @staticmethod
+    def _map_time_to_render_timeline(time_value: float, keep_segments: List[tuple[float, float]]) -> Optional[float]:
+        elapsed = 0.0
+        for start, end in keep_segments:
+            if time_value < start:
+                return elapsed
+            if start <= time_value <= end:
+                return round(elapsed + (time_value - start), 3)
+            elapsed += max(0.0, end - start)
+        return None
+
+    @classmethod
+    def _remap_zoom_beats_to_render_timeline(
+        cls,
+        zoom_beats: List[ZoomPreviewBeat],
+        keep_segments: List[tuple[float, float]],
+    ) -> List[ZoomPreviewBeat]:
+        remapped: List[ZoomPreviewBeat] = []
+        for beat in zoom_beats:
+            start = cls._map_time_to_render_timeline(float(beat.start), keep_segments)
+            end = cls._map_time_to_render_timeline(float(beat.end), keep_segments)
+            if start is None or end is None or end - start < 0.08:
+                continue
+            remapped.append(
+                ZoomPreviewBeat(
+                    start=start,
+                    end=end,
+                    duration=round(end - start, 3),
+                    text=beat.text,
+                    enabled=beat.enabled,
+                    scale=beat.scale,
+                )
+            )
+        return remapped
+
+    @classmethod
+    def _remap_visual_parts_to_render_timeline(
+        cls,
+        visual_parts: List[VisualPlanPart],
+        keep_segments: List[tuple[float, float]],
+    ) -> List[VisualPlanPart]:
+        remapped: List[VisualPlanPart] = []
+        for part in visual_parts:
+            start = cls._map_time_to_render_timeline(float(part.start), keep_segments)
+            end = cls._map_time_to_render_timeline(float(part.end), keep_segments)
+            if start is None or end is None or end - start < 0.12:
+                continue
+            remapped.append(
+                part.model_copy(
+                    update={
+                        "start": start,
+                        "end": end,
+                        "duration": round(end - start, 3),
+                    }
+                )
+            )
+        return remapped
+
+    @staticmethod
+    def _normalize_spoken_token(value: str) -> str:
+        return re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", value.lower()).strip()
+
+    @classmethod
+    def _get_normalized_transcript_words(cls, track: VideoTrack) -> List[Dict[str, Any]]:
+        words = normalize_words((track.transcription or {}).get("words", []))
+        normalized: List[Dict[str, Any]] = []
+        for index, word in enumerate(words):
+            token = cls._normalize_spoken_token(str(word.word or ""))
+            start = max(0.0, float(word.start or 0.0))
+            end = max(start, float(word.end or 0.0))
+            if not token:
+                continue
+            normalized.append(
+                {
+                    "index": index,
+                    "word": str(word.word or "").strip(),
+                    "token": token,
+                    "start": start,
+                    "end": end,
+                }
+            )
+        return normalized
+
+    @classmethod
+    def _build_visual_search_tokens(cls, part: VisualPlanPart) -> List[str]:
+        base_tokens = [
+            token
+            for token in (
+                cls._normalize_spoken_token(segment)
+                for segment in " ".join(
+                    [
+                        str(part.text or ""),
+                        str(part.title or ""),
+                        *[str(item) for item in (part.keywords or [])],
+                    ]
+                ).split()
+            )
+            if token
+        ]
+        filtered = [
+            token
+            for token in base_tokens
+            if len(token) > 2 and token not in VISUAL_STOP_WORDS
+        ]
+        return filtered if len(filtered) >= 2 else base_tokens
+
+    @staticmethod
+    def _find_ordered_phrase_match(
+        transcript_tokens: List[str],
+        phrase_tokens: List[str],
+    ) -> Optional[tuple[int, int]]:
+        max_window = min(6, len(phrase_tokens))
+        for window_size in range(max_window, 1, -1):
+            for phrase_start in range(0, len(phrase_tokens) - window_size + 1):
+                phrase_slice = phrase_tokens[phrase_start : phrase_start + window_size]
+                for transcript_start in range(0, len(transcript_tokens) - window_size + 1):
+                    if transcript_tokens[transcript_start : transcript_start + window_size] == phrase_slice:
+                        return transcript_start, transcript_start + window_size - 1
+        return None
+
+    @classmethod
+    def _resolve_visual_part_timing(
+        cls,
+        part: VisualPlanPart,
+        transcript_words: List[Dict[str, Any]],
+    ) -> tuple[float, float, float]:
+        fallback_start = max(0.0, float(part.start or 0.0))
+        fallback_end = max(fallback_start + 0.18, float(part.end or fallback_start + 0.18))
+        if not transcript_words:
+            return fallback_start, fallback_end, fallback_end - fallback_start
+
+        phrase_tokens = cls._build_visual_search_tokens(part)
+        if not phrase_tokens:
+            return fallback_start, fallback_end, fallback_end - fallback_start
+
+        window_start = max(0.0, fallback_start - 0.45)
+        window_end = fallback_end + 0.45
+        candidate_words = [
+            word
+            for word in transcript_words
+            if float(word["end"]) >= window_start and float(word["start"]) <= window_end
+        ]
+        if not candidate_words:
+            return fallback_start, fallback_end, fallback_end - fallback_start
+
+        exact_match = cls._find_ordered_phrase_match(
+            [str(word["token"]) for word in candidate_words],
+            phrase_tokens,
+        )
+        if exact_match is not None:
+            first = candidate_words[exact_match[0]]
+            last = candidate_words[exact_match[1]]
+            aligned_start = max(fallback_start, float(first["start"]) - 0.08)
+            aligned_end = min(fallback_end, max(float(last["end"]) + 0.55, aligned_start + 0.75))
+            return aligned_start, aligned_end, aligned_end - aligned_start
+
+        fallback_token = next(
+            (token for token in phrase_tokens if len(token) > 3 and token not in VISUAL_STOP_WORDS),
+            phrase_tokens[0],
+        )
+        anchor = next((word for word in candidate_words if str(word["token"]) == fallback_token), None)
+        if anchor is not None:
+            aligned_start = max(fallback_start, float(anchor["start"]) - 0.08)
+            min_hold = min(1.4, max(0.75, float(part.duration or 0.0) * 0.45))
+            aligned_end = min(fallback_end, max(float(anchor["end"]) + 0.9, aligned_start + min_hold))
+            return aligned_start, aligned_end, aligned_end - aligned_start
+
+        return fallback_start, fallback_end, fallback_end - fallback_start
+
+    @classmethod
+    def _enforce_minimum_visual_duration(
+        cls,
+        parts: List[Dict[str, Any]],
+        max_end: float,
+    ) -> List[Dict[str, Any]]:
+        min_visible_seconds = 3.0
+        bounded_max_end = max(min_visible_seconds, max_end or 0.0)
+        resolved: List[Dict[str, Any]] = []
+        for item in parts:
+            previous = resolved[-1] if resolved else None
+            min_start = float(previous["start"]) + min_visible_seconds if previous else 0.0
+            start = max(float(item["start"]), min_start)
+            end = min(bounded_max_end, max(float(item["end"]), start + min_visible_seconds))
+            duration = max(0.001, end - start)
+            if duration >= min_visible_seconds - 0.001:
+                resolved.append(
+                    {
+                        **item,
+                        "start": round(start, 3),
+                        "end": round(end, 3),
+                        "duration": round(duration, 3),
+                    }
+                )
+        return resolved
+
+    @classmethod
+    def _align_visual_parts_to_preview_timing(
+        cls,
+        visual_parts: List[VisualPlanPart],
+        track: VideoTrack,
+    ) -> List[VisualPlanPart]:
+        if not visual_parts:
+            return []
+        transcript_words = cls._get_normalized_transcript_words(track)
+        resolved_items: List[Dict[str, Any]] = []
+        for index, part in enumerate(visual_parts):
+            start, end, duration = cls._resolve_visual_part_timing(part, transcript_words)
+            if duration <= 0.12:
+                continue
+            resolved_items.append(
+                {
+                    "part": part,
+                    "index": index,
+                    "start": start,
+                    "end": end,
+                    "duration": duration,
+                }
+            )
+        enforced = cls._enforce_minimum_visual_duration(resolved_items, float(track.duration or 0.0))
+        return [
+            item["part"].model_copy(
+                update={
+                    "start": item["start"],
+                    "end": item["end"],
+                    "duration": item["duration"],
+                }
+            )
+            for item in enforced
+        ]
+
+    @classmethod
+    def _remap_track_words_to_render_timeline(
+        cls,
+        track: VideoTrack,
+        keep_segments: List[tuple[float, float]],
+    ) -> List[WordTimestamp]:
+        remapped: List[WordTimestamp] = []
+        for word in normalize_words((track.transcription or {}).get("words", [])):
+            start = cls._map_time_to_render_timeline(float(word.start), keep_segments)
+            end = cls._map_time_to_render_timeline(float(word.end), keep_segments)
+            if start is None or end is None or end - start < 0.02:
+                continue
+            remapped.append(
+                WordTimestamp(
+                    word=str(word.word),
+                    start=start,
+                    end=end,
+                    confidence=word.confidence,
+                )
+            )
+        return remapped
+
+    @staticmethod
     def _track_is_transcribable(track: VideoTrack) -> bool:
         return track.type in {TrackType.VIDEO, TrackType.AUDIO}
 
@@ -905,6 +1309,20 @@ class ProjectService:
 
     def project_has_missing_transcripts(self, project: Project) -> bool:
         return any(self._track_needs_transcription(track) for track in project.tracks)
+
+    @classmethod
+    def _sync_background_track_defaults(cls, project: Project) -> bool:
+        changed = False
+        for track in project.tracks:
+            if track.type != TrackType.VIDEO or track.excluded:
+                continue
+            transcript_status = cls._get_track_transcript_status(track)
+            has_transcript = cls._track_has_transcript(track)
+            should_be_background = transcript_status in {"completed", "not_applicable", "error"} and not has_transcript
+            if should_be_background and track.role != TrackRole.BACKGROUND:
+                track.role = TrackRole.BACKGROUND
+                changed = True
+        return changed
 
     def mark_missing_transcripts_pending(self, project: Project) -> bool:
         changed = False
@@ -977,6 +1395,14 @@ class ProjectService:
         metadata.update(extra_metadata)
         if track_type in {TrackType.VIDEO, TrackType.AUDIO}:
             metadata.setdefault("transcript_status", "pending")
+        raw_role = extra_metadata.get("role", TrackRole.PRIMARY)
+        try:
+            role = raw_role if isinstance(raw_role, TrackRole) else TrackRole(str(raw_role))
+        except Exception:
+            role = TrackRole.PRIMARY
+        if track_type not in {TrackType.VIDEO, TrackType.IMAGE}:
+            role = TrackRole.PRIMARY
+        background_description = str(extra_metadata.get("background_description") or "").strip() or None
 
         duration = 30.0
         if track_type in {TrackType.VIDEO, TrackType.AUDIO}:
@@ -1011,6 +1437,8 @@ class ProjectService:
             orientation=inferred_orientation,
             width=inferred_width,
             height=inferred_height,
+            role=role,
+            background_description=background_description,
         )
 
     @staticmethod

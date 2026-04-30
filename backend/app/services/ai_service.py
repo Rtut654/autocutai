@@ -12,6 +12,8 @@ import dotenv
 import httpx
 
 from ..models.project import (
+    BackgroundVideoPlacement,
+    BackgroundVideoPlanArtifact,
     InsertionSuggestion,
     SpeechFilterArtifact,
     SpeechFilterCut,
@@ -43,6 +45,7 @@ class AIService:
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.speech_filter_model = os.getenv("OPENAI_SPEECH_FILTER_MODEL", self.model)
         self.visual_plan_model = os.getenv("OPENAI_VISUAL_PLAN_MODEL", self.model)
+        self.background_video_plan_model = os.getenv("OPENAI_BACKGROUND_VIDEO_PLAN_MODEL", self.model)
 
     async def suggest_insertions(self, words: List[WordTimestamp], max_items: int = 8) -> List[InsertionSuggestion]:
         if not words:
@@ -449,6 +452,178 @@ class AIService:
             )
         except Exception:
             return heuristic_artifact
+
+    async def suggest_background_video_plan(
+        self,
+        *,
+        project_id: str,
+        narration_words: Sequence[WordTimestamp],
+        background_assets: Sequence[dict],
+    ) -> BackgroundVideoPlanArtifact:
+        heuristic_placements = self._heuristic_background_video_placements(narration_words, background_assets)
+        heuristic_artifact = BackgroundVideoPlanArtifact(
+            project_id=project_id,
+            status="completed",
+            summary=self._build_background_video_plan_summary(heuristic_placements),
+            placements=heuristic_placements,
+            source_word_count=len(narration_words),
+            model="heuristic",
+        )
+
+        if not narration_words or not background_assets or not self.api_key:
+            return heuristic_artifact
+
+        transcript_windows = self._build_visual_planning_units(narration_words, max((narration_words[-1].end if narration_words else 0.0), 0.1))
+        prompt_lines = [f"{idx + 1}. {start:.2f}-{end:.2f}: {text}" for idx, (start, end, text) in enumerate(transcript_windows)]
+        asset_lines = [
+            f'{idx + 1}. track_id={asset["track_id"]} filename={asset["filename"]} description={asset["description"]} duration={asset["duration"]:.2f}s'
+            for idx, asset in enumerate(background_assets)
+        ]
+        prompt = (
+            "You are planning supportive background/b-roll placements for a narrated edit. "
+            "Use only the provided background clips. Keep narration from the main clips; do not replace spoken audio. "
+            "Find the best moments where a described background clip supports what the speaker is saying. "
+            'Return JSON object {"placements":[...]} only. Each placement must be '
+            '{track_id:string,start:number,end:number,transcript_excerpt:string,rationale:string,confidence:number}. '
+            "Use conservative timing windows, usually 2-6 seconds. Do not spam placements.\n\n"
+            "Background clips:\n"
+            + "\n".join(asset_lines)
+            + "\n\nNarration timeline:\n"
+            + "\n".join(prompt_lines)
+        )
+
+        payload = {
+            "model": self.background_video_plan_model,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "You are an editor choosing supportive b-roll against spoken narration."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(f"{self.base_url}/chat/completions", json=payload, headers=headers)
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+            data = json.loads(content)
+            placements = self._sanitize_background_video_placements(
+                data.get("placements") if isinstance(data, dict) else None,
+                narration_words,
+                background_assets,
+            )
+            if not placements:
+                return heuristic_artifact
+            return BackgroundVideoPlanArtifact(
+                project_id=project_id,
+                status="completed",
+                summary=self._build_background_video_plan_summary(placements),
+                placements=placements,
+                source_word_count=len(narration_words),
+                model=self.background_video_plan_model,
+            )
+        except Exception:
+            return heuristic_artifact
+
+    def _sanitize_background_video_placements(
+        self,
+        raw_placements: object,
+        narration_words: Sequence[WordTimestamp],
+        background_assets: Sequence[dict],
+    ) -> List[BackgroundVideoPlacement]:
+        if not isinstance(raw_placements, list):
+            return []
+        asset_map = {str(asset["track_id"]): asset for asset in background_assets}
+        max_duration = max((word.end for word in narration_words), default=0.0)
+        placements: List[BackgroundVideoPlacement] = []
+        for item in raw_placements:
+            if not isinstance(item, dict):
+                continue
+            track_id = str(item.get("track_id") or "").strip()
+            asset = asset_map.get(track_id)
+            if not asset:
+                continue
+            try:
+                start = max(0.0, float(item["start"]))
+                end = min(max_duration, float(item["end"]))
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.5))))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end <= start or end - start < 1.0:
+                continue
+            excerpt = str(item.get("transcript_excerpt") or self._transcript_snippet(narration_words, start, end)).strip()
+            rationale = str(item.get("rationale") or "").strip()
+            placements.append(
+                BackgroundVideoPlacement(
+                    track_id=track_id,
+                    filename=str(asset["filename"]),
+                    description=str(asset["description"]),
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    duration=round(end - start, 3),
+                    transcript_excerpt=excerpt,
+                    rationale=rationale,
+                    confidence=round(confidence, 3),
+                )
+            )
+        placements.sort(key=lambda item: (item.start, -item.confidence))
+        return placements
+
+    def _heuristic_background_video_placements(
+        self,
+        narration_words: Sequence[WordTimestamp],
+        background_assets: Sequence[dict],
+    ) -> List[BackgroundVideoPlacement]:
+        if not narration_words or not background_assets:
+            return []
+
+        windows = self._build_visual_planning_units(
+            narration_words,
+            max((narration_words[-1].end if narration_words else 0.0), 0.1),
+        )
+        placements: List[BackgroundVideoPlacement] = []
+        used_track_ids: set[str] = set()
+        for start, end, text in windows:
+            text_tokens = set(self._content_tokens(normalize_words([
+                WordTimestamp(word=word, start=start, end=end, confidence=1.0)
+                for word in text.split()
+            ])))
+            if not text_tokens:
+                continue
+            best_asset = None
+            best_score = 0
+            for asset in background_assets:
+                if str(asset["track_id"]) in used_track_ids:
+                    continue
+                description_tokens = set(re.findall(r"[a-z0-9]+", str(asset["description"]).lower()))
+                overlap = len(text_tokens & description_tokens)
+                if overlap > best_score:
+                    best_asset = asset
+                    best_score = overlap
+            if best_asset and best_score > 0:
+                used_track_ids.add(str(best_asset["track_id"]))
+                placements.append(
+                    BackgroundVideoPlacement(
+                        track_id=str(best_asset["track_id"]),
+                        filename=str(best_asset["filename"]),
+                        description=str(best_asset["description"]),
+                        start=round(start, 3),
+                        end=round(end, 3),
+                        duration=round(end - start, 3),
+                        transcript_excerpt=text.strip(),
+                        rationale="Keyword match between narration and background clip description.",
+                        confidence=round(min(0.95, 0.45 + best_score * 0.12), 3),
+                    )
+                )
+        return placements[:12]
+
+    @staticmethod
+    def _build_background_video_plan_summary(placements: Sequence[BackgroundVideoPlacement]) -> str:
+        if not placements:
+            return "No strong background-video placements were found."
+        return f"Planned {len(placements)} supportive background placements from the labeled clip library."
 
     def _sanitize_visual_plan_parts(
         self,

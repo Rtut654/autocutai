@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import uuid
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from ..models.auth import AuthUser, LoginRequest, OnboardingData, SignupRequest
@@ -12,11 +14,15 @@ from ..models.auth import AuthUser, LoginRequest, OnboardingData, SignupRequest
 
 class AuthService:
     def __init__(self) -> None:
+        backend_root = Path(__file__).resolve().parents[2]
+        self.state_file = backend_root / ".runtime" / "auth_state.json"
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.users_by_email: Dict[str, AuthUser] = {}
         self.tokens_to_user_id: Dict[str, str] = {}
         self.refresh_tokens_to_user_id: Dict[str, str] = {}
         self.users_by_id: Dict[str, AuthUser] = {}
         self.users_by_provider_identity: Dict[str, str] = {}
+        self._load_state()
 
     def configure(self, _db_path=None) -> None:
         """Compatibility no-op for older tests and startup paths."""
@@ -28,6 +34,51 @@ class AuthService:
         self.refresh_tokens_to_user_id.clear()
         self.users_by_id.clear()
         self.users_by_provider_identity.clear()
+        self._persist_state()
+
+    def _load_state(self) -> None:
+        if not self.state_file.exists():
+            return
+        try:
+            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        users = payload.get("users", [])
+        self.users_by_id = {}
+        self.users_by_email = {}
+        for raw in users:
+            try:
+                user = AuthUser(**raw)
+            except Exception:
+                continue
+            self.users_by_id[user.id] = user
+            self.users_by_email[user.email] = user
+
+        self.tokens_to_user_id = {
+            str(token): str(user_id)
+            for token, user_id in (payload.get("tokens_to_user_id") or {}).items()
+            if str(user_id) in self.users_by_id
+        }
+        self.refresh_tokens_to_user_id = {
+            str(token): str(user_id)
+            for token, user_id in (payload.get("refresh_tokens_to_user_id") or {}).items()
+            if str(user_id) in self.users_by_id
+        }
+        self.users_by_provider_identity = {
+            str(key): str(user_id)
+            for key, user_id in (payload.get("users_by_provider_identity") or {}).items()
+            if str(user_id) in self.users_by_id
+        }
+
+    def _persist_state(self) -> None:
+        payload = {
+            "users": [user.model_dump(mode="json") for user in self.users_by_id.values()],
+            "tokens_to_user_id": self.tokens_to_user_id,
+            "refresh_tokens_to_user_id": self.refresh_tokens_to_user_id,
+            "users_by_provider_identity": self.users_by_provider_identity,
+        }
+        self.state_file.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
     @staticmethod
     def _hash_password(password: str) -> str:
@@ -50,11 +101,13 @@ class AuthService:
     def _issue_token(self, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
         self.tokens_to_user_id[token] = user_id
+        self._persist_state()
         return token
 
     def _issue_refresh_token(self, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
         self.refresh_tokens_to_user_id[token] = user_id
+        self._persist_state()
         return token
 
     def signup(self, request: SignupRequest) -> AuthUser:
@@ -70,6 +123,7 @@ class AuthService:
         )
         self.users_by_email[email] = user
         self.users_by_id[user.id] = user
+        self._persist_state()
         return user
 
     def login(self, request: LoginRequest) -> str:
@@ -131,6 +185,7 @@ class AuthService:
 
         if provider_key:
             self.users_by_provider_identity[provider_key] = user.id
+        self._persist_state()
         return self._issue_token(user.id)
 
     def get_user_by_token(self, token: str, token_type: Optional[str] = None) -> Optional[AuthUser]:
@@ -156,22 +211,26 @@ class AuthService:
             self.tokens_to_user_id.pop(access_token, None)
         if refresh_token:
             self.refresh_tokens_to_user_id.pop(refresh_token, None)
+        self._persist_state()
 
     def update_onboarding(self, user_id: str, data: OnboardingData) -> AuthUser:
         user = self.users_by_id[user_id]
         user.onboarding = data
         user.onboarding_completed = True
+        self._persist_state()
         return user
 
     def set_subscription(self, user_id: str, plan: str) -> AuthUser:
         user = self.users_by_id[user_id]
         user.subscription_plan = plan  # type: ignore[assignment]
+        self._persist_state()
         return user
 
     def update_profile(self, user_id: str, *, full_name: Optional[str] = None) -> AuthUser:
         user = self.users_by_id[user_id]
         if full_name is not None:
             user.full_name = full_name.strip() or None
+        self._persist_state()
         return user
 
     def delete_user(self, user_id: str) -> bool:
@@ -192,6 +251,7 @@ class AuthService:
             for token, existing_user_id in self.refresh_tokens_to_user_id.items()
             if existing_user_id != user_id
         }
+        self._persist_state()
         return True
 
 
