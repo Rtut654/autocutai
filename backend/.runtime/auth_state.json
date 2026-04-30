@@ -1,14 +1,14 @@
 {
   "users": [
     {
-      "id": "103385296343735012789",
-      "email": "rtut654@gmail.com",
-      "password_hash": "",
-      "full_name": "Kirill O'nayd",
-      "picture": "https://lh3.googleusercontent.com/a/ACg8ocJRayAIcn_6_gj_2jwvUlLvdvrr3ArcDbb0TNaRvS8HQsV5rWWF=s96-c",
-      "provider": "google",
-      "provider_user_id": "103385296343735012789",
-      "created_at": "2026-04-29T21:55:38.909348",
+      "id": "3053f91c-591a-4c63-b48c-2f14439707a5",
+      "email": "backgroundedits@example.com",
+      "password_hash": "ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f",
+      "full_name": "Background Edits User",
+      "picture": null,
+      "provider": "email",
+      "provider_user_id": null,
+      "created_at": "2026-04-30T03:25:03.206738",
       "onboarding_completed": false,
       "onboarding": {
         "goal": null,
@@ -19,12 +19,10 @@
     }
   ],
   "tokens_to_user_id": {
-    "fwQdcgeWNEzHukWx4uf1PX220ctHxhYgJMR2VaOe3cM": "103385296343735012789"
+    "m-lnB-mz44SCgI1fk2eKRELxR8R6eSTt2BPwbcTX-6Q": "3053f91c-591a-4c63-b48c-2f14439707a5"
   },
   "refresh_tokens_to_user_id": {
-    "JK8brDrGf1Jr0vEkF10hPWL5I3h7R3WDimXNFLU0AGw": "103385296343735012789"
+    "r8Kw_gNw01xbsO6KjnwFF1xXONI7OOtmYUZyGlg5mcM": "3053f91c-591a-4c63-b48c-2f14439707a5"
   },
-  "users_by_provider_identity": {
-    "google:103385296343735012789": "103385296343735012789"
-  }
+  "users_by_provider_identity": {}
 }

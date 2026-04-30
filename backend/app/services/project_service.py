@@ -953,13 +953,22 @@ class ProjectService:
         if track.type not in {TrackType.VIDEO, TrackType.IMAGE}:
             raise ValueError("Only video or image tracks can be labeled as background")
 
-        role = settings.get("role", TrackRole.PRIMARY)
+        raw_role = settings.get("role")
+        role = track.role if raw_role is None else raw_role
         if not isinstance(role, TrackRole):
             role = TrackRole(str(role))
-        description = str(settings.get("background_description") or "").strip() or None
 
         track.role = role
-        track.background_description = description
+        if "background_description" in settings:
+            track.background_description = str(settings.get("background_description") or "").strip() or None
+        if "background_trim_start" in settings:
+            track.background_trim_start = float(settings.get("background_trim_start") or 0.0)
+        if "background_trim_end" in settings:
+            raw_end = settings.get("background_trim_end")
+            track.background_trim_end = None if raw_end is None else float(raw_end)
+        if "background_playback_rate" in settings:
+            track.background_playback_rate = float(settings.get("background_playback_rate") or 1.0)
+        self._normalize_background_track_edit_state(track)
         project.updated_at = datetime.utcnow()
         await self._save_project(project)
         self.projects[project.id] = project
@@ -1314,15 +1323,70 @@ class ProjectService:
     def _sync_background_track_defaults(cls, project: Project) -> bool:
         changed = False
         for track in project.tracks:
-            if track.type != TrackType.VIDEO or track.excluded:
+            if track.excluded:
                 continue
-            transcript_status = cls._get_track_transcript_status(track)
-            has_transcript = cls._track_has_transcript(track)
-            should_be_background = transcript_status in {"completed", "not_applicable", "error"} and not has_transcript
-            if should_be_background and track.role != TrackRole.BACKGROUND:
-                track.role = TrackRole.BACKGROUND
+            if track.type == TrackType.VIDEO:
+                transcript_status = cls._get_track_transcript_status(track)
+                has_transcript = cls._track_has_transcript(track)
+                should_be_background = transcript_status in {"completed", "not_applicable", "error"} and not has_transcript
+                if should_be_background and track.role != TrackRole.BACKGROUND:
+                    track.role = TrackRole.BACKGROUND
+                    changed = True
+            if cls._normalize_background_track_edit_state(track):
                 changed = True
         return changed
+
+    @staticmethod
+    def _normalize_background_track_edit_state(track: VideoTrack) -> bool:
+        changed = False
+        if track.type != TrackType.VIDEO:
+            if track.background_trim_start != 0:
+                track.background_trim_start = 0.0
+                changed = True
+            if track.background_trim_end is not None:
+                track.background_trim_end = None
+                changed = True
+            if abs(float(track.background_playback_rate or 1.0) - 1.0) > 1e-6:
+                track.background_playback_rate = 1.0
+                changed = True
+            return changed
+
+        safe_duration = max(0.1, float(track.duration or 0.1))
+        trim_start = max(0.0, min(safe_duration - 0.05, float(track.background_trim_start or 0.0)))
+        trim_end_raw = safe_duration if track.background_trim_end is None else float(track.background_trim_end)
+        trim_end = max(trim_start + 0.05, min(safe_duration, trim_end_raw))
+        playback_rate = max(0.5, min(10.0, float(track.background_playback_rate or 1.0)))
+
+        if abs(trim_start - float(track.background_trim_start or 0.0)) > 1e-6:
+            track.background_trim_start = round(trim_start, 3)
+            changed = True
+        if track.background_trim_end is None or abs(trim_end - float(track.background_trim_end or 0.0)) > 1e-6:
+            track.background_trim_end = round(trim_end, 3)
+            changed = True
+        if abs(playback_rate - float(track.background_playback_rate or 1.0)) > 1e-6:
+            track.background_playback_rate = round(playback_rate, 3)
+            changed = True
+        return changed
+
+    @classmethod
+    def get_background_track_trim_bounds(cls, track: VideoTrack) -> tuple[float, float]:
+        if track.type != TrackType.VIDEO:
+            return (0.0, 0.0)
+        safe_duration = max(0.1, float(track.duration or 0.1))
+        trim_start = max(0.0, min(safe_duration - 0.05, float(track.background_trim_start or 0.0)))
+        trim_end = safe_duration if track.background_trim_end is None else float(track.background_trim_end)
+        trim_end = max(trim_start + 0.05, min(safe_duration, trim_end))
+        return round(trim_start, 3), round(trim_end, 3)
+
+    @classmethod
+    def get_background_track_effective_duration(cls, track: VideoTrack) -> float:
+        if track.type == TrackType.IMAGE:
+            return 4.0
+        if track.type != TrackType.VIDEO:
+            return max(0.1, float(track.duration or 0.1))
+        trim_start, trim_end = cls.get_background_track_trim_bounds(track)
+        playback_rate = max(0.5, min(10.0, float(track.background_playback_rate or 1.0)))
+        return round(max(0.05, trim_end - trim_start) / playback_rate, 3)
 
     def mark_missing_transcripts_pending(self, project: Project) -> bool:
         changed = False

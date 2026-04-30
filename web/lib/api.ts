@@ -378,7 +378,13 @@ export const api = {
   async updateTrackBackgroundVideo(
     projectId: string,
     trackId: string,
-    payload: { role: "primary" | "background"; background_description?: string | null },
+    payload: {
+      role?: "primary" | "background";
+      background_description?: string | null;
+      background_trim_start?: number | null;
+      background_trim_end?: number | null;
+      background_playback_rate?: number | null;
+    },
     token?: string,
   ) {
     return request<ProjectResponse>(

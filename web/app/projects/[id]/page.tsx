@@ -8,6 +8,7 @@ import type { BackgroundMusicSettings, BackgroundVideoPlanArtifact, ProjectDetai
 
 type TranscriptStatus = "pending" | "processing" | "completed" | "error" | "not_applicable";
 const MEDIA_BLOB_CACHE_NAME = "bestshotai-track-media-v1";
+const TRACK_DRAG_MIME = "application/x-bestshot-track-id";
 const mediaObjectUrlCache = new Map<string, string>();
 const mediaObjectUrlPromiseCache = new Map<string, Promise<string>>();
 
@@ -1217,6 +1218,10 @@ function isImageTrack(track: ProjectTrack): boolean {
   return track.type === "image";
 }
 
+function isAudioTrack(track: ProjectTrack): boolean {
+  return track.type === "audio";
+}
+
 function getTrackRenderVersions(track: ProjectTrack): TrackRenderVersion[] {
   const raw = track.render_versions;
   if (!Array.isArray(raw)) return [];
@@ -1228,6 +1233,109 @@ function getTrackRenderVersions(track: ProjectTrack): TrackRenderVersion[] {
     }
     return right.label.localeCompare(left.label, undefined, { numeric: true });
   });
+}
+
+function getPreferredTrackPlaybackUrl(projectId: string, track: ProjectTrack): string {
+  const latestRender = getTrackRenderVersions(track)[0];
+  if (latestRender) {
+    return api.getTrackRenderAssetUrl(projectId, track.id, latestRender.id);
+  }
+  return api.getTrackMediaUrl(projectId, track.id);
+}
+
+function getPreferredTrackPlaybackDuration(track: ProjectTrack): number {
+  const latestRender = getTrackRenderVersions(track)[0];
+  if (latestRender?.duration_after && Number.isFinite(latestRender.duration_after)) {
+    return Math.max(0.1, latestRender.duration_after);
+  }
+  if (isImageTrack(track)) return 4;
+  return Math.max(0.1, track.duration || 0.1);
+}
+
+function getBackgroundTrimStart(track: ProjectTrack): number {
+  if (!track.duration || !Number.isFinite(track.duration)) return 0;
+  return clamp(track.background_trim_start ?? 0, 0, Math.max(0, track.duration - 0.05));
+}
+
+function getBackgroundTrimEnd(track: ProjectTrack): number {
+  if (!track.duration || !Number.isFinite(track.duration)) return 0.1;
+  const start = getBackgroundTrimStart(track);
+  const rawEnd = track.background_trim_end ?? track.duration;
+  return clamp(rawEnd, start + 0.05, track.duration);
+}
+
+function getBackgroundPlaybackRate(track: ProjectTrack): number {
+  return clamp(track.background_playback_rate ?? 1, 0.5, 10);
+}
+
+function getBackgroundEffectiveDuration(track: ProjectTrack): number {
+  if (isImageTrack(track)) return 4;
+  if (isAudioTrack(track)) return Math.max(0.1, track.duration || 0.1);
+  return Math.max(0.05, getBackgroundTrimEnd(track) - getBackgroundTrimStart(track)) / getBackgroundPlaybackRate(track);
+}
+
+function formatPlaybackRate(value: number): string {
+  return `${value.toFixed(value >= 2 ? 1 : 2).replace(/\.0$/, "")}x`;
+}
+
+function getTrackSourceTimelineDuration(track: ProjectTrack): number {
+  if (track.duration && Number.isFinite(track.duration) && track.duration > 0) {
+    return Math.max(0.1, track.duration);
+  }
+  return getPreferredTrackPlaybackDuration(track);
+}
+
+function mapRenderedPlaybackToSourceTimeline(
+  playbackTime: number,
+  sourceDuration: number,
+  cuts: SpeechFilterCut[] | undefined,
+): number {
+  const safePlaybackTime = Math.max(0, playbackTime);
+  if (!cuts?.length) return Math.min(sourceDuration, safePlaybackTime);
+
+  const orderedCuts = [...cuts]
+    .filter((cut) => Number.isFinite(cut.start) && Number.isFinite(cut.end) && cut.end > cut.start)
+    .sort((left, right) => left.start - right.start);
+
+  let remainingPlayback = safePlaybackTime;
+  let cursor = 0;
+  for (const cut of orderedCuts) {
+    const keptEnd = clamp(cut.start, 0, sourceDuration);
+    const keptDuration = Math.max(0, keptEnd - cursor);
+    if (remainingPlayback <= keptDuration) {
+      return Math.min(sourceDuration, cursor + remainingPlayback);
+    }
+    remainingPlayback -= keptDuration;
+    cursor = Math.max(cursor, clamp(cut.end, 0, sourceDuration));
+  }
+  return Math.min(sourceDuration, cursor + remainingPlayback);
+}
+
+function mapSourceTimelineToRenderedPlayback(
+  sourceTime: number,
+  sourceDuration: number,
+  cuts: SpeechFilterCut[] | undefined,
+): number {
+  const safeSourceTime = clamp(sourceTime, 0, sourceDuration);
+  if (!cuts?.length) return safeSourceTime;
+
+  const orderedCuts = [...cuts]
+    .filter((cut) => Number.isFinite(cut.start) && Number.isFinite(cut.end) && cut.end > cut.start)
+    .sort((left, right) => left.start - right.start);
+
+  let removedDuration = 0;
+  for (const cut of orderedCuts) {
+    const cutStart = clamp(cut.start, 0, sourceDuration);
+    const cutEnd = clamp(cut.end, cutStart, sourceDuration);
+    if (safeSourceTime < cutStart) {
+      return Math.max(0, safeSourceTime - removedDuration);
+    }
+    if (safeSourceTime <= cutEnd) {
+      return Math.max(0, cutStart - removedDuration);
+    }
+    removedDuration += Math.max(0, cutEnd - cutStart);
+  }
+  return Math.max(0, safeSourceTime - removedDuration);
 }
 
 function getTrackSize(track: ProjectTrack): number | null {
@@ -1335,6 +1443,102 @@ function useAuthedBlobUrl(
   }, [url, token]);
 
   return { blobUrl, loading, error };
+}
+
+function TrackVideoPreview({
+  src,
+  className,
+  trimStart,
+  trimEnd,
+  playbackRate,
+  controls = false,
+  autoPlay = false,
+  muted = true,
+  previewOnly = false,
+}: {
+  src: string;
+  className: string;
+  trimStart: number;
+  trimEnd: number;
+  playbackRate: number;
+  controls?: boolean;
+  autoPlay?: boolean;
+  muted?: boolean;
+  previewOnly?: boolean;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !src) return;
+    const safeStart = Math.max(0, trimStart);
+    const safeEnd = Math.max(safeStart + 0.05, trimEnd);
+
+    const syncWindow = () => {
+      video.playbackRate = playbackRate;
+      if (previewOnly) {
+        try {
+          video.currentTime = safeStart;
+        } catch {
+          return;
+        }
+        video.pause();
+        return;
+      }
+      if (video.currentTime < safeStart || video.currentTime > safeEnd) {
+        try {
+          video.currentTime = safeStart;
+        } catch {
+          return;
+        }
+      }
+    };
+
+    const handleLoadedMetadata = () => {
+      syncWindow();
+    };
+    const handlePlay = () => {
+      video.playbackRate = playbackRate;
+      if (video.currentTime < safeStart || video.currentTime >= safeEnd - 0.01) {
+        video.currentTime = safeStart;
+      }
+    };
+    const handleTimeUpdate = () => {
+      if (video.currentTime < safeStart) {
+        video.currentTime = safeStart;
+        return;
+      }
+      if (video.currentTime >= safeEnd - 0.01) {
+        video.currentTime = safeStart;
+        if (!video.paused) {
+          void video.play().catch(() => undefined);
+        }
+      }
+    };
+
+    video.addEventListener("loadedmetadata", handleLoadedMetadata);
+    video.addEventListener("play", handlePlay);
+    video.addEventListener("timeupdate", handleTimeUpdate);
+    syncWindow();
+    return () => {
+      video.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      video.removeEventListener("play", handlePlay);
+      video.removeEventListener("timeupdate", handleTimeUpdate);
+    };
+  }, [autoPlay, playbackRate, previewOnly, src, trimEnd, trimStart]);
+
+  return (
+    <video
+      ref={videoRef}
+      className={className}
+      src={src}
+      controls={controls}
+      autoPlay={autoPlay}
+      preload="metadata"
+      playsInline
+      muted={muted}
+    />
+  );
 }
 
 function TranscriptPanel({
@@ -1505,27 +1709,19 @@ function TranscriptPanel({
 function BackgroundClipAction({
   track,
   saving,
-  onSave,
+  onMove,
 }: {
   track: ProjectTrack;
   saving: boolean;
-  onSave: (track: ProjectTrack, description: string) => void;
+  onMove: (track: ProjectTrack) => void;
 }) {
-  const [editing, setEditing] = useState(false);
-  const [description, setDescription] = useState(track.background_description || "");
-
-  useEffect(() => {
-    setEditing(false);
-    setDescription(track.background_description || "");
-  }, [track.background_description, track.id]);
-
   return (
     <div className="clipSpeechFilter">
       <button
         type="button"
         className={`clipTag clipTagButton ${saving ? "clipTagProcessing" : "clipTagActive"}`}
         disabled={saving}
-        onClick={() => setEditing(true)}
+        onClick={() => onMove(track)}
       >
         {saving ? (
           <>
@@ -1533,47 +1729,9 @@ function BackgroundClipAction({
             saving background
           </>
         ) : (
-          "use as background"
+          "make it background"
         )}
       </button>
-      {editing ? (
-        <div className="clipInlinePromptPanel">
-          <p className="muted clipInlinePromptText">
-            Describe what this background clip shows. This is used to place it against the spoken narration.
-          </p>
-          <textarea
-            className="clipInlinePromptInput"
-            rows={3}
-            value={description}
-            onChange={(event) => setDescription(event.target.value)}
-            placeholder="Example: desk setup by a window with a person talking to camera"
-          />
-          {!description.trim() ? (
-            <p className="clipSpeechFilterError">Background clips need a short description.</p>
-          ) : null}
-          <div className="clipInlinePromptActions">
-            <button
-              type="button"
-              className="btn secondary"
-              disabled={saving || !description.trim()}
-              onClick={() => onSave(track, description)}
-            >
-              Save as background
-            </button>
-            <button
-              type="button"
-              className="btn secondary"
-              disabled={saving}
-              onClick={() => {
-                setEditing(false);
-                setDescription(track.background_description || "");
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -1593,6 +1751,7 @@ function ClipCard({
   onGenerateVisualPlan,
   onMarkAsBackground,
   backgroundSaving,
+  onPrepareDrag,
   onOpen,
   onHide,
   hiding,
@@ -1618,13 +1777,14 @@ function ClipCard({
   onGenerateVisualPlan: (track: ProjectTrack) => void;
   onMarkAsBackground: (track: ProjectTrack, description: string) => void;
   backgroundSaving: boolean;
+  onPrepareDrag: (track: ProjectTrack, event: React.PointerEvent<HTMLElement>) => void;
   onOpen: (track: ProjectTrack) => void;
   onHide: (trackId: string) => void;
   hiding: boolean;
   draggable: boolean;
   dragActive: boolean;
   dragTarget: boolean;
-  onDragStart: (track: ProjectTrack) => void;
+  onDragStart: (track: ProjectTrack, event: React.DragEvent<HTMLElement>) => void;
   onDragOver: (track: ProjectTrack, event: React.DragEvent<HTMLElement>) => void;
   onDrop: (track: ProjectTrack, event: React.DragEvent<HTMLElement>) => void;
   onDragEnd: () => void;
@@ -1660,7 +1820,8 @@ function ClipCard({
     <article
       className={`clipCard ${dragActive ? "clipCardDragging" : ""} ${dragTarget ? "clipCardDropTarget" : ""}`}
       draggable={draggable}
-      onDragStart={() => onDragStart(track)}
+      onPointerDownCapture={(event) => onPrepareDrag(track, event)}
+      onDragStart={(event) => onDragStart(track, event)}
       onDragOver={(event) => onDragOver(track, event)}
       onDrop={(event) => onDrop(track, event)}
       onDragEnd={onDragEnd}
@@ -1725,7 +1886,7 @@ function ClipCard({
         <BackgroundClipAction
           track={track}
           saving={backgroundSaving}
-          onSave={onMarkAsBackground}
+          onMove={(nextTrack) => onMarkAsBackground(nextTrack, nextTrack.background_description || "")}
         />
       </div>
     </article>
@@ -1737,6 +1898,10 @@ function BackgroundTrackCard({
   token,
   track,
   saving,
+  dragActive,
+  onPrepareDrag,
+  onDragStart,
+  onDragEnd,
   onPreview,
   onSaveDescription,
   onMoveToPrimary,
@@ -1745,6 +1910,10 @@ function BackgroundTrackCard({
   token: string | undefined;
   track: ProjectTrack;
   saving: boolean;
+  dragActive: boolean;
+  onPrepareDrag: (track: ProjectTrack, event: React.PointerEvent<HTMLElement>) => void;
+  onDragStart: (track: ProjectTrack, event: React.DragEvent<HTMLElement>) => void;
+  onDragEnd: () => void;
   onPreview: (track: ProjectTrack) => void;
   onSaveDescription: (track: ProjectTrack, description: string) => void;
   onMoveToPrimary: (track: ProjectTrack) => void;
@@ -1758,20 +1927,33 @@ function BackgroundTrackCard({
   }, [track.background_description, track.id]);
 
   return (
-    <article className="clipCard backgroundClipCard">
+    <article
+      className={`clipCard backgroundClipCard ${dragActive ? "clipCardDragging" : ""}`}
+      draggable={!saving}
+      onPointerDownCapture={(event) => onPrepareDrag(track, event)}
+      onDragStart={(event) => onDragStart(track, event)}
+      onDragEnd={onDragEnd}
+    >
       <div className="clipMediaWrap">
         <button type="button" className="clipPreviewButton" onClick={() => onPreview(track)}>
           {blobUrl ? isImageTrack(track) ? (
             <img className="clipMedia" src={blobUrl} alt={track.filename} />
           ) : (
-            <video className="clipMedia" src={blobUrl} preload="metadata" playsInline muted />
+            <TrackVideoPreview
+              className="clipMedia"
+              src={blobUrl}
+              trimStart={getBackgroundTrimStart(track)}
+              trimEnd={getBackgroundTrimEnd(track)}
+              playbackRate={getBackgroundPlaybackRate(track)}
+              previewOnly
+            />
           ) : (
             <div className="clipMedia clipMediaLoading" />
           )}
           <span className="clipPreviewPlay">{isImageTrack(track) ? "Preview" : "▶ Preview"}</span>
         </button>
       </div>
-      <div className="clipMeta">
+      <div className="clipMeta backgroundClipMeta">
         <div className="stack" style={{ gap: 4 }}>
           <strong className="clipFileName" title={track.filename}>{track.filename}</strong>
           <span className="badge">Background asset</span>
@@ -1784,10 +1966,7 @@ function BackgroundTrackCard({
           onChange={(event) => setDescription(event.target.value)}
           placeholder="Example: quick workout set with push-ups and dumbbells in the gym"
         />
-        {!description.trim() ? (
-          <div className="notice">Add a short description before this clip can be used in automatic background placement.</div>
-        ) : null}
-        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+        <div className="backgroundCardActions">
           <button
             type="button"
             className="btn secondary"
@@ -1814,16 +1993,32 @@ function BackgroundUploadCard({
   uploading,
   dropActive,
   onClick,
+  onDragOver,
+  onDragLeave,
+  onDrop,
 }: {
   uploading: boolean;
   dropActive: boolean;
   onClick: () => void;
+  onDragOver: (event: React.DragEvent<HTMLElement>) => void;
+  onDragLeave: (event: React.DragEvent<HTMLElement>) => void;
+  onDrop: (event: React.DragEvent<HTMLElement>) => void;
 }) {
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       className={`clipCard backgroundUploadCard ${dropActive ? "backgroundUploadCardActive" : ""}`}
       onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick();
+        }
+      }}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
     >
       <div className="backgroundUploadCardBody">
         <strong>Upload background assets</strong>
@@ -1831,7 +2026,7 @@ function BackgroundUploadCard({
           {uploading ? "Uploading..." : "Drag here or click to upload"}
         </span>
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -2584,6 +2779,7 @@ function PreviewModal({
   onGenerateSpeechFilter,
   onGenerateVisualPlan,
   onSaveSpeechFilter,
+  onSaveBackgroundCuts,
   onUpdateBackgroundMusic,
   onRenderTrack,
   onClose,
@@ -2604,6 +2800,7 @@ function PreviewModal({
   onGenerateSpeechFilter: (track: ProjectTrack) => void;
   onGenerateVisualPlan: (track: ProjectTrack) => void;
   onSaveSpeechFilter: (track: ProjectTrack, cuts: SpeechFilterCut[]) => Promise<void>;
+  onSaveBackgroundCuts: (track: ProjectTrack, edits: { trimStart: number; trimEnd: number; playbackRate: number }) => Promise<void> | void;
   onUpdateBackgroundMusic: (track: ProjectTrack, settings: BackgroundMusicSettings) => Promise<void>;
   onRenderTrack: (track: ProjectTrack, cuts: SpeechFilterCut[]) => Promise<TrackRenderVersion | null>;
   onClose: () => void;
@@ -2611,6 +2808,9 @@ function PreviewModal({
   const renderVersions = getTrackRenderVersions(track);
   const [selectedVersionId, setSelectedVersionId] = useState<string>("source");
   const [draftCuts, setDraftCuts] = useState<SpeechFilterCut[]>(speechFilter?.cuts || []);
+  const [backgroundTrimStart, setBackgroundTrimStart] = useState(getBackgroundTrimStart(track));
+  const [backgroundTrimEnd, setBackgroundTrimEnd] = useState(getBackgroundTrimEnd(track));
+  const [backgroundPlaybackRate, setBackgroundPlaybackRate] = useState(getBackgroundPlaybackRate(track));
 
   useEffect(() => {
     setSelectedVersionId("source");
@@ -2620,11 +2820,21 @@ function PreviewModal({
     setDraftCuts(speechFilter?.cuts || []);
   }, [speechFilter, track.id]);
 
+  useEffect(() => {
+    setBackgroundTrimStart(getBackgroundTrimStart(track));
+    setBackgroundTrimEnd(getBackgroundTrimEnd(track));
+    setBackgroundPlaybackRate(getBackgroundPlaybackRate(track));
+  }, [track.background_playback_rate, track.background_trim_end, track.background_trim_start, track.duration, track.id]);
+
   const selectedMediaUrl = selectedVersionId === "source"
     ? api.getTrackMediaUrl(projectId, track.id)
     : api.getTrackRenderAssetUrl(projectId, track.id, selectedVersionId);
   const { blobUrl, loading, error } = useAuthedBlobUrl(selectedMediaUrl, token);
   const selectedRenderVersion = renderVersions.find((version) => version.id === selectedVersionId) || null;
+  const safeBackgroundDuration = Math.max(0.1, track.duration || 0.1);
+  const safeBackgroundTrimStart = clamp(backgroundTrimStart, 0, Math.max(0, safeBackgroundDuration - 0.05));
+  const safeBackgroundTrimEnd = clamp(backgroundTrimEnd, safeBackgroundTrimStart + 0.05, safeBackgroundDuration);
+  const backgroundEffectiveDuration = Math.max(0.05, safeBackgroundTrimEnd - safeBackgroundTrimStart) / backgroundPlaybackRate;
 
   return (
     <div className="previewModalBackdrop" onClick={onClose}>
@@ -2708,6 +2918,89 @@ function PreviewModal({
               src={blobUrl}
               alt={track.filename}
             />
+          ) : isBackgroundTrack(track) && selectedVersionId === "source" ? (
+            <div className="backgroundPreviewEditorWrap">
+              <TrackVideoPreview
+                className="previewModalVideo"
+                src={blobUrl}
+                trimStart={safeBackgroundTrimStart}
+                trimEnd={safeBackgroundTrimEnd}
+                playbackRate={backgroundPlaybackRate}
+                controls
+                autoPlay
+                muted={false}
+              />
+              <div className="backgroundTrimEditor backgroundTrimEditorModal">
+                <div className="backgroundTrimHeader">
+                  <strong>Saved cut window</strong>
+                  <span className="muted">{formatDuration(backgroundEffectiveDuration)}</span>
+                </div>
+                <div className="backgroundTrimTrack">
+                  <div
+                    className="backgroundTrimSelection"
+                    style={{
+                      left: `${(safeBackgroundTrimStart / safeBackgroundDuration) * 100}%`,
+                      width: `${((safeBackgroundTrimEnd - safeBackgroundTrimStart) / safeBackgroundDuration) * 100}%`,
+                    }}
+                  />
+                </div>
+                <div className="backgroundTrimRanges">
+                  <input
+                    className="backgroundTrimRange"
+                    type="range"
+                    min={0}
+                    max={Math.max(0, safeBackgroundDuration - 0.05)}
+                    step={0.05}
+                    value={safeBackgroundTrimStart}
+                    onChange={(event) => {
+                      const next = Number(event.target.value);
+                      setBackgroundTrimStart(Math.min(next, safeBackgroundTrimEnd - 0.05));
+                    }}
+                  />
+                  <input
+                    className="backgroundTrimRange"
+                    type="range"
+                    min={0.05}
+                    max={safeBackgroundDuration}
+                    step={0.05}
+                    value={safeBackgroundTrimEnd}
+                    onChange={(event) => {
+                      const next = Number(event.target.value);
+                      setBackgroundTrimEnd(Math.max(next, safeBackgroundTrimStart + 0.05));
+                    }}
+                  />
+                </div>
+                <div className="backgroundTrimLabels">
+                  <span>{formatTime(safeBackgroundTrimStart)}</span>
+                  <span>{formatTime(safeBackgroundTrimEnd)}</span>
+                </div>
+                <div className="backgroundSpeedRow">
+                  <label className="backgroundSpeedLabel" htmlFor={`background-speed-modal-${track.id}`}>Speed</label>
+                  <input
+                    id={`background-speed-modal-${track.id}`}
+                    className="backgroundSpeedSlider"
+                    type="range"
+                    min={0.5}
+                    max={10}
+                    step={0.25}
+                    value={backgroundPlaybackRate}
+                    onChange={(event) => setBackgroundPlaybackRate(Number(event.target.value))}
+                  />
+                  <strong>{formatPlaybackRate(backgroundPlaybackRate)}</strong>
+                </div>
+                <button
+                  type="button"
+                  className="btn secondary backgroundSaveCutsButton"
+                  onClick={() => onSaveBackgroundCuts(track, {
+                    trimStart: safeBackgroundTrimStart,
+                    trimEnd: safeBackgroundTrimEnd,
+                    playbackRate: backgroundPlaybackRate,
+                  })}
+                >
+                  Save cuts
+                </button>
+              </div>
+            </div>
           ) : (
             <video
               className="previewModalVideo"
@@ -2739,6 +3032,55 @@ function PreviewModal({
   );
 }
 
+function FinalTimelineSegmentPreview({
+  projectId,
+  token,
+  track,
+  start,
+  duration,
+  totalDuration,
+}: {
+  projectId: string;
+  token: string | undefined;
+  track: ProjectTrack;
+  start: number;
+  duration: number;
+  totalDuration: number;
+}) {
+  const rawUrl = api.getTrackMediaUrl(projectId, track.id);
+  const { blobUrl } = useAuthedBlobUrl(rawUrl, token);
+
+  return (
+    <div
+      className="finalSequenceSegmentPreview"
+      style={{
+        left: `${(start / totalDuration) * 100}%`,
+        width: `${(duration / totalDuration) * 100}%`,
+      }}
+      title={`${track.filename} • ${formatDuration(duration)}`}
+    >
+      {blobUrl ? (
+        isImageTrack(track) ? (
+          <img className="finalSequenceSegmentMedia" src={blobUrl} alt={track.filename} />
+        ) : (
+          <TrackVideoPreview
+            className="finalSequenceSegmentMedia"
+            src={blobUrl}
+            trimStart={0}
+            trimEnd={Math.max(0.1, track.duration || 0.1)}
+            playbackRate={1}
+            previewOnly
+          />
+        )
+      ) : (
+        <div className="finalSequenceSegmentMedia finalSequenceSegmentMediaFallback" />
+      )}
+      <div className="finalSequenceSegmentOverlay" />
+      <span className="finalSequenceSegmentLabel">{track.filename}</span>
+    </div>
+  );
+}
+
 function FinalVideo({ projectId, token }: { projectId: string; token: string | undefined }) {
   const { blobUrl, loading, error } = useAuthedBlobUrl(api.getOutputUrl(projectId), token);
   if (!blobUrl) {
@@ -2756,6 +3098,517 @@ function FinalVideo({ projectId, token }: { projectId: string; token: string | u
       preload="metadata"
       playsInline
     />
+  );
+}
+
+function FinalModeToggle({
+  mode,
+  onChange,
+}: {
+  mode: "video" | "voice";
+  onChange: (mode: "video" | "voice") => void;
+}) {
+  return (
+    <div className="finalModeToggle" role="tablist" aria-label="Final version mode">
+      <button
+        type="button"
+        className={`finalModeToggleOption ${mode === "voice" ? "finalModeToggleOptionActive" : ""}`}
+        aria-pressed={mode === "voice"}
+        onClick={() => onChange("voice")}
+        title="Arrange your voice narration first. Video clips will be matched to this audio sequence later."
+      >
+        Voice
+      </button>
+      <button
+        type="button"
+        className={`finalModeToggleOption ${mode === "video" ? "finalModeToggleOptionActive" : ""}`}
+        aria-pressed={mode === "video"}
+        onClick={() => onChange("video")}
+        title="Arrange your video clips sequentially. A traditional timeline approach."
+      >
+        Video
+      </button>
+    </div>
+  );
+}
+
+function FinalSpeechTimeline({
+  tracks,
+  speechFilters,
+  currentTime,
+}: {
+  tracks: ProjectTrack[];
+  speechFilters: Record<string, SpeechFilterArtifact | null>;
+  currentTime: number;
+}) {
+  const timeline = useMemo(() => {
+    let offset = 0;
+    const cuts: Array<{ start: number; end: number; trackId: string; filename: string }> = [];
+    const segments = tracks.map((track) => {
+      const duration = getTrackSourceTimelineDuration(track);
+      const segment = {
+        trackId: track.id,
+        filename: track.filename,
+        start: offset,
+        end: offset + duration,
+        duration,
+      };
+      const artifact = speechFilters[track.id];
+      if (artifact?.cuts?.length) {
+        artifact.cuts.forEach((cut) => {
+          cuts.push({
+            start: offset + cut.start,
+            end: Math.min(offset + duration, offset + cut.end),
+            trackId: track.id,
+            filename: track.filename,
+          });
+        });
+      }
+      offset += duration;
+      return segment;
+    });
+    return {
+      totalDuration: Math.max(offset, 0.1),
+      segments,
+      cuts,
+    };
+  }, [speechFilters, tracks]);
+
+  return (
+    <div className="finalTimelineCard">
+      <div className="row" style={{ justifyContent: "space-between", gap: 10 }}>
+        <strong>Voice Progress Timeline</strong>
+        <span className="muted">{formatTime(currentTime)} / {formatDuration(timeline.totalDuration)}</span>
+      </div>
+      <div className="finalTimelineBar">
+        {timeline.segments.map((segment, index) => (
+          <div
+            key={segment.trackId}
+            className={`finalTimelineSegment ${index % 2 === 0 ? "finalTimelineSegmentAlt" : ""}`}
+            style={{
+              left: `${(segment.start / timeline.totalDuration) * 100}%`,
+              width: `${(segment.duration / timeline.totalDuration) * 100}%`,
+            }}
+            title={`${segment.filename} • ${formatDuration(segment.duration)}`}
+          />
+        ))}
+        {timeline.cuts.map((cut, index) => (
+          <div
+            key={`${cut.trackId}-${cut.start}-${index}`}
+            className="finalTimelineCut"
+            style={{
+              left: `${(cut.start / timeline.totalDuration) * 100}%`,
+              width: `${(Math.max(0.01, cut.end - cut.start) / timeline.totalDuration) * 100}%`,
+            }}
+            title={`${cut.filename} • cut ${formatTime(cut.start)}-${formatTime(cut.end)}`}
+          />
+        ))}
+        <div
+          className="finalTimelinePlayed"
+          style={{ width: `${Math.min(100, (currentTime / timeline.totalDuration) * 100)}%` }}
+        />
+        <div
+          className="finalTimelinePlayhead"
+          style={{ left: `${Math.min(100, (currentTime / timeline.totalDuration) * 100)}%` }}
+        />
+      </div>
+      <div className="finalTimelineLegend">
+        <span><span className="finalTimelineLegendSwatch finalTimelineLegendSwatchTrack" /> clip span</span>
+        <span><span className="finalTimelineLegendSwatch finalTimelineLegendSwatchCut" /> cut segment</span>
+      </div>
+    </div>
+  );
+}
+
+function VideoBasedFinalPreview({
+  projectId,
+  token,
+  tracks,
+  timelineTracks,
+  speechFilters,
+}: {
+  projectId: string;
+  token: string | undefined;
+  tracks: ProjectTrack[];
+  timelineTracks: ProjectTrack[];
+  speechFilters: Record<string, SpeechFilterArtifact | null>;
+}) {
+  const items = useMemo(() => tracks.map((track) => ({
+    track,
+    url: getPreferredTrackPlaybackUrl(projectId, track),
+    duration: getPreferredTrackPlaybackDuration(track),
+    sourceDuration: getTrackSourceTimelineDuration(track),
+    cuts: speechFilters[track.id]?.cuts || [],
+  })), [projectId, speechFilters, tracks]);
+  const sourceOffsets = useMemo(() => {
+    let total = 0;
+    return items.map((item) => {
+      const offset = total;
+      total += item.sourceDuration;
+      return offset;
+    });
+  }, [items]);
+  const totalSourceDuration = useMemo(
+    () => items.reduce((sum, item) => sum + item.sourceDuration, 0),
+    [items],
+  );
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [sequenceTime, setSequenceTime] = useState(0);
+  const [imageElapsed, setImageElapsed] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const pendingPlaybackSeekRef = useRef<number | null>(null);
+  const currentItem = items[activeIndex] || null;
+  const { blobUrl, loading, error } = useAuthedBlobUrl(currentItem?.url || "", token);
+  const timeline = useMemo(() => {
+    let offset = 0;
+    const segments: Array<{ trackId: string; filename: string; track: ProjectTrack; start: number; duration: number }> = [];
+    const cuts: Array<{ trackId: string; filename: string; start: number; end: number }> = [];
+    for (const track of timelineTracks) {
+      const duration = getTrackSourceTimelineDuration(track);
+      segments.push({
+        trackId: track.id,
+        filename: track.filename,
+        track,
+        start: offset,
+        duration,
+      });
+      const artifact = speechFilters[track.id];
+      if (artifact?.cuts?.length) {
+        artifact.cuts.forEach((cut) => {
+          cuts.push({
+            trackId: track.id,
+            filename: track.filename,
+            start: offset + cut.start,
+            end: Math.min(offset + duration, offset + cut.end),
+          });
+        });
+      }
+      offset += duration;
+    }
+    return {
+      totalDuration: Math.max(offset, 0.1),
+      segments,
+      cuts,
+    };
+  }, [speechFilters, timelineTracks]);
+
+  useEffect(() => {
+    setActiveIndex(0);
+    setSequenceTime(0);
+    setImageElapsed(0);
+    setIsPlaying(false);
+    pendingPlaybackSeekRef.current = null;
+  }, [tracks]);
+
+  const seekSequence = (targetTime: number) => {
+    if (!items.length) return;
+    const safeTarget = clamp(targetTime, 0, Math.max(0, totalSourceDuration));
+    let nextIndex = items.length - 1;
+    for (let index = 0; index < items.length; index += 1) {
+      const start = sourceOffsets[index] || 0;
+      const end = start + items[index].sourceDuration;
+      if (safeTarget <= end || index === items.length - 1) {
+        nextIndex = index;
+        break;
+      }
+    }
+    const nextItem = items[nextIndex];
+    const localSourceTime = clamp(safeTarget - (sourceOffsets[nextIndex] || 0), 0, nextItem.sourceDuration);
+    const nextPlaybackTime = mapSourceTimelineToRenderedPlayback(localSourceTime, nextItem.sourceDuration, nextItem.cuts);
+    if (nextIndex === activeIndex) {
+      if (isImageTrack(nextItem.track)) {
+        setImageElapsed(clamp(nextPlaybackTime, 0, nextItem.duration));
+        setSequenceTime(safeTarget);
+        return;
+      }
+      const activeVideo = videoRef.current;
+      if (activeVideo) {
+        activeVideo.currentTime = nextPlaybackTime;
+        setSequenceTime(safeTarget);
+        if (isPlaying) {
+          void activeVideo.play().catch(() => undefined);
+        }
+        return;
+      }
+    }
+    pendingPlaybackSeekRef.current = nextPlaybackTime;
+    setActiveIndex(nextIndex);
+    setSequenceTime(safeTarget);
+    if (isImageTrack(nextItem.track)) {
+      setImageElapsed(clamp(nextPlaybackTime, 0, nextItem.duration));
+    }
+  };
+
+  const moveClip = (direction: -1 | 1) => {
+    if (!items.length) return;
+    const nextIndex = clamp(activeIndex + direction, 0, items.length - 1);
+    pendingPlaybackSeekRef.current = 0;
+    setActiveIndex(nextIndex);
+    setSequenceTime(sourceOffsets[nextIndex] || 0);
+    setImageElapsed(0);
+  };
+
+  useEffect(() => {
+    if (!currentItem || !isImageTrack(currentItem.track) || !blobUrl || !isPlaying) return;
+    const started = Date.now() - imageElapsed * 1000;
+    const intervalId = window.setInterval(() => {
+      const elapsed = Math.min(currentItem.duration, (Date.now() - started) / 1000);
+      setImageElapsed(elapsed);
+      setSequenceTime(
+        (sourceOffsets[activeIndex] || 0) + mapRenderedPlaybackToSourceTimeline(elapsed, currentItem.sourceDuration, currentItem.cuts),
+      );
+      if (elapsed >= currentItem.duration) {
+        window.clearInterval(intervalId);
+        if (activeIndex >= items.length - 1) {
+          setIsPlaying(false);
+          setSequenceTime(totalSourceDuration);
+          return;
+        }
+        pendingPlaybackSeekRef.current = 0;
+        setActiveIndex((index) => Math.min(items.length - 1, index + 1));
+        setImageElapsed(0);
+      }
+    }, 100);
+    return () => window.clearInterval(intervalId);
+  }, [activeIndex, blobUrl, currentItem, imageElapsed, isPlaying, items, sourceOffsets, totalSourceDuration]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !currentItem || isImageTrack(currentItem.track)) return;
+    const syncPlayback = () => {
+      video.currentTime = pendingPlaybackSeekRef.current ?? 0;
+      pendingPlaybackSeekRef.current = null;
+      if (isPlaying) {
+        void video.play().catch(() => undefined);
+      } else {
+        video.pause();
+      }
+    };
+    const sync = () => {
+      setSequenceTime(
+        (sourceOffsets[activeIndex] || 0)
+        + mapRenderedPlaybackToSourceTimeline(video.currentTime || 0, currentItem.sourceDuration, currentItem.cuts),
+      );
+    };
+    const handleEnded = () => {
+      if (activeIndex >= items.length - 1) {
+        setIsPlaying(false);
+        setSequenceTime(totalSourceDuration);
+        return;
+      }
+      pendingPlaybackSeekRef.current = 0;
+      setActiveIndex((index) => Math.min(items.length - 1, index + 1));
+    };
+    const handleLoadedMetadata = () => syncPlayback();
+    video.addEventListener("timeupdate", sync);
+    video.addEventListener("ended", handleEnded);
+    video.addEventListener("loadedmetadata", handleLoadedMetadata);
+    syncPlayback();
+    return () => {
+      video.removeEventListener("timeupdate", sync);
+      video.removeEventListener("ended", handleEnded);
+      video.removeEventListener("loadedmetadata", handleLoadedMetadata);
+    };
+  }, [activeIndex, currentItem, isPlaying, items.length, sourceOffsets, totalSourceDuration]);
+
+  useEffect(() => {
+    if (!currentItem || !blobUrl || !isImageTrack(currentItem.track)) return;
+    const nextElapsed = clamp(pendingPlaybackSeekRef.current ?? imageElapsed, 0, currentItem.duration);
+    pendingPlaybackSeekRef.current = null;
+    setImageElapsed(nextElapsed);
+    setSequenceTime((sourceOffsets[activeIndex] || 0) + nextElapsed);
+  }, [activeIndex, blobUrl, currentItem, imageElapsed, sourceOffsets]);
+
+  if (items.length === 0) {
+    return (
+      <div className="videoPlayerEmpty">
+        <span className="muted">No video or image clips available for video-based preview.</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="finalModePanel">
+      <div className="projectFinalVideoWrap projectFinalSequenceWrap">
+        {blobUrl ? (
+          currentItem && isImageTrack(currentItem.track) ? (
+            <img className="projectFinalVideo projectFinalVideoSequence" src={blobUrl} alt={currentItem.track.filename} />
+          ) : (
+            <video
+              ref={videoRef}
+              className="projectFinalVideo projectFinalVideoSequence"
+              src={blobUrl}
+              preload="metadata"
+              playsInline
+            />
+          )
+        ) : (
+          <div className="videoPlayerEmpty">
+            <span className="muted">{loading ? "Loading sequence preview..." : error || "Preview unavailable."}</span>
+          </div>
+        )}
+      </div>
+      <div className="speechEditorControls finalSequenceControls">
+        <button
+          type="button"
+          className="speechEditorIconButton"
+          onClick={() => {
+            if (!items.length) return;
+            if (sequenceTime >= totalSourceDuration && !isPlaying) {
+              seekSequence(0);
+            }
+            setIsPlaying((current) => !current);
+          }}
+          aria-label={isPlaying ? "Pause sequence preview" : "Play sequence preview"}
+          title={isPlaying ? "Pause" : "Play"}
+        >
+          {isPlaying ? <PauseIcon /> : <PlayIcon />}
+        </button>
+        <button
+          type="button"
+          className="btn secondary"
+          disabled={activeIndex === 0}
+          onClick={() => moveClip(-1)}
+        >
+          Prev Clip
+        </button>
+        <button
+          type="button"
+          className="btn secondary"
+          disabled={activeIndex >= items.length - 1}
+          onClick={() => moveClip(1)}
+        >
+          Next Clip
+        </button>
+        <div className="speechEditorTime">
+          {formatTime(sequenceTime)} / {formatDuration(timeline.totalDuration)}
+        </div>
+      </div>
+      <div className="speechEditorTimelineWrap">
+        <div
+          ref={timelineRef}
+          className="speechEditorTimeline"
+          onClick={(event) => {
+            const rect = timelineRef.current?.getBoundingClientRect();
+            if (!rect || timeline.totalDuration <= 0) return;
+            const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+            seekSequence(ratio * timeline.totalDuration);
+          }}
+        >
+          <div className="speechEditorTimelineBase" />
+          <div className="speechEditorTimelinePlayed" style={{ width: `${(sequenceTime / timeline.totalDuration) * 100}%` }} />
+          {timeline.segments.map((segment) => (
+            <FinalTimelineSegmentPreview
+              key={segment.trackId}
+              projectId={projectId}
+              token={token}
+              track={segment.track}
+              start={segment.start}
+              duration={segment.duration}
+              totalDuration={timeline.totalDuration}
+            />
+          ))}
+          {timeline.cuts.map((cut, index) => (
+            <div
+              key={`${cut.trackId}-${cut.start}-${index}`}
+              className="speechEditorCut finalSequenceCutMarker"
+              style={{
+                left: `${(cut.start / timeline.totalDuration) * 100}%`,
+                width: `${(Math.max(0.01, cut.end - cut.start) / timeline.totalDuration) * 100}%`,
+              }}
+              title={`${cut.filename} • ${formatTime(cut.start)}-${formatTime(cut.end)}`}
+            />
+          ))}
+          <div className="speechEditorPlayhead" style={{ left: `${(sequenceTime / timeline.totalDuration) * 100}%` }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VoiceBasedFinalPanel({
+  projectId,
+  token,
+  tracks,
+  uploading,
+  onUpload,
+  onMoveTrack,
+}: {
+  projectId: string;
+  token: string | undefined;
+  tracks: ProjectTrack[];
+  uploading: boolean;
+  onUpload: () => void;
+  onMoveTrack: (trackId: string, direction: -1 | 1) => void;
+}) {
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(tracks[0]?.id || null);
+
+  useEffect(() => {
+    setSelectedTrackId((current) => {
+      if (current && tracks.some((track) => track.id === current)) return current;
+      return tracks[0]?.id || null;
+    });
+  }, [tracks]);
+
+  const selectedTrack = tracks.find((track) => track.id === selectedTrackId) || null;
+  const { blobUrl, loading, error } = useAuthedBlobUrl(
+    selectedTrack ? api.getTrackMediaUrl(projectId, selectedTrack.id) : "",
+    token,
+  );
+
+  return (
+    <div className="finalModePanel">
+      <div className="row" style={{ justifyContent: "space-between", gap: 10 }}>
+        <strong>Voice-first setup</strong>
+        <button type="button" className="btn secondary" disabled={uploading} onClick={onUpload}>
+          {uploading ? "Uploading..." : tracks.length ? "Upload more voice tracks" : "Upload voice track"}
+        </button>
+      </div>
+      <span className="muted">
+        Put narration in the right order first. Video placement and suggestions can then be generated against this sequence.
+      </span>
+      {tracks.length === 0 ? (
+        <div className="finalVoiceEmpty">
+          <strong>Select or upload audio first</strong>
+          <span className="muted">
+            Build the final version around narration first. After the voice order is locked, video placement and suggestions can be generated against it.
+          </span>
+        </div>
+      ) : (
+        <>
+          {blobUrl ? (
+            <audio className="finalVoicePlayer" src={blobUrl} controls preload="metadata" />
+          ) : (
+            <div className="videoPlayerEmpty">
+              <span className="muted">{loading ? "Loading voice track..." : error || "Voice track unavailable."}</span>
+            </div>
+          )}
+          <div className="finalVoiceTrackList">
+            {tracks.map((track, index) => (
+              <div
+                key={track.id}
+                className={`finalVoiceTrackRow ${track.id === selectedTrackId ? "finalVoiceTrackRowActive" : ""}`}
+              >
+                <button type="button" className="finalVoiceTrackSelect" onClick={() => setSelectedTrackId(track.id)}>
+                  <strong>{track.filename}</strong>
+                  <span className="muted">{formatDuration(track.duration)}</span>
+                </button>
+                <div className="finalVoiceTrackActions">
+                  <button type="button" className="btn secondary" disabled={index === 0} onClick={() => onMoveTrack(track.id, -1)}>
+                    Up
+                  </button>
+                  <button type="button" className="btn secondary" disabled={index === tracks.length - 1} onClick={() => onMoveTrack(track.id, 1)}>
+                    Down
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -2787,11 +3640,19 @@ export default function ProjectDetailPage() {
   const [draggingTrackId, setDraggingTrackId] = useState<string | null>(null);
   const [dragTargetTrackId, setDragTargetTrackId] = useState<string | null>(null);
   const [reorderingTracks, setReorderingTracks] = useState(false);
+  const [finalMode, setFinalMode] = useState<"video" | "voice">("video");
   const [backgroundUploading, setBackgroundUploading] = useState(false);
+  const [voiceUploading, setVoiceUploading] = useState(false);
   const [backgroundLibraryDropActive, setBackgroundLibraryDropActive] = useState(false);
+  const [clipsDropActive, setClipsDropActive] = useState(false);
   const requestedTranscriptBackfill = useRef(false);
+  const draggingTrackIdRef = useRef<string | null>(null);
+  const pointerDragRef = useRef<{ trackId: string; startX: number; startY: number; active: boolean } | null>(null);
   const addTracksInputRef = useRef<HTMLInputElement>(null);
+  const voiceTracksInputRef = useRef<HTMLInputElement>(null);
   const backgroundUploadInputRef = useRef<HTMLInputElement>(null);
+  const clipsSectionRef = useRef<HTMLElement | null>(null);
+  const backgroundLibraryRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     const session = getStoredSession();
@@ -2885,6 +3746,34 @@ export default function ProjectDetailPage() {
   }, [activeTrack, project, speechFilters, speechFilterErrors, speechFilterLoadingIds, token]);
 
   useEffect(() => {
+    if (!project || !token) return;
+    const targetTracks = project.tracks.filter(
+      (track) =>
+        !isBackgroundTrack(track)
+        && !isTrackHidden(track)
+        && getSpeechFilterStatus(track) === "completed"
+        && !speechFilters[track.id]
+        && !speechFilterLoadingIds[track.id]
+        && !speechFilterErrors[track.id],
+    );
+    if (!targetTracks.length) return;
+
+    targetTracks.forEach((track) => {
+      setSpeechFilterLoadingIds((current) => ({ ...current, [track.id]: true }));
+      api.getTrackSpeechFilter(project.id, track.id, token)
+        .then((artifact) => {
+          setSpeechFilters((current) => ({ ...current, [track.id]: artifact }));
+        })
+        .catch((error) => {
+          setSpeechFilterErrors((current) => ({ ...current, [track.id]: String((error as Error).message || error) }));
+        })
+        .finally(() => {
+          setSpeechFilterLoadingIds((current) => ({ ...current, [track.id]: false }));
+        });
+    });
+  }, [project, speechFilters, speechFilterErrors, speechFilterLoadingIds, token]);
+
+  useEffect(() => {
     if (!activeTrack || !project || !token) return;
     if (visualPlans[activeTrack.id]) return;
     if (getVisualWorkerStatus(activeTrack) !== "completed") return;
@@ -2906,25 +3795,35 @@ export default function ProjectDetailPage() {
 
   const uploadFilesToProject = async (
     selectedFiles: File[],
-    mode: "primary" | "background",
+    mode: "primary" | "background" | "voice",
   ) => {
     if (selectedFiles.length === 0 || !token || !project) return;
     const duplicateFiles = selectedFiles.filter((file) => isDuplicateSelectedFile(file, project.tracks));
     const nextFiles = selectedFiles.filter((file) => !isDuplicateSelectedFile(file, project.tracks));
     if (nextFiles.length === 0) {
-      setMessage(mode === "background" ? "All selected background assets are already in this project." : "All selected clips are already in this project.");
+      setMessage(
+        mode === "background"
+          ? "All selected background assets are already in this project."
+          : mode === "voice"
+            ? "All selected voice tracks are already in this project."
+            : "All selected clips are already in this project.",
+      );
       return;
     }
 
     try {
       if (mode === "background") {
         setBackgroundUploading(true);
+      } else if (mode === "voice") {
+        setVoiceUploading(true);
       } else {
         setAddingTracks(true);
       }
       setMessage(
         duplicateFiles.length
-          ? `${duplicateFiles.length} duplicate ${mode === "background" ? "asset" : "clip"}${duplicateFiles.length === 1 ? "" : "s"} skipped.`
+          ? `${duplicateFiles.length} duplicate ${
+            mode === "background" ? "asset" : mode === "voice" ? "voice track" : "clip"
+          }${duplicateFiles.length === 1 ? "" : "s"} skipped.`
           : null
       );
       const response = await api.addTracksToProject(
@@ -2945,6 +3844,8 @@ export default function ProjectDetailPage() {
     } finally {
       if (mode === "background") {
         setBackgroundUploading(false);
+      } else if (mode === "voice") {
+        setVoiceUploading(false);
       } else {
         setAddingTracks(false);
       }
@@ -2961,6 +3862,12 @@ export default function ProjectDetailPage() {
     const selectedFiles = Array.from(event.target.files || []);
     event.target.value = "";
     await uploadFilesToProject(selectedFiles, "background");
+  };
+
+  const handleAddVoiceTracks = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    event.target.value = "";
+    await uploadFilesToProject(selectedFiles, "voice");
   };
 
   const handleDeleteProject = async () => {
@@ -3040,6 +3947,32 @@ export default function ProjectDetailPage() {
     }
   };
 
+  const handleSaveBackgroundCuts = async (
+    track: ProjectTrack,
+    edits: { trimStart: number; trimEnd: number; playbackRate: number },
+  ) => {
+    if (!token || !project) return;
+    setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: true }));
+    try {
+      const response = await api.updateTrackBackgroundVideo(
+        project.id,
+        track.id,
+        {
+          background_trim_start: edits.trimStart,
+          background_trim_end: edits.trimEnd,
+          background_playback_rate: edits.playbackRate,
+        },
+        token,
+      );
+      setProject(response.project);
+      setMessage("Background cuts saved.");
+    } catch (error) {
+      setMessage(String((error as Error).message || error));
+    } finally {
+      setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: false }));
+    }
+  };
+
   const handleMoveToPrimary = async (track: ProjectTrack) => {
     if (!token || !project) return;
     setBackgroundTrackSavingIds((current) => ({ ...current, [track.id]: true }));
@@ -3100,15 +4033,31 @@ export default function ProjectDetailPage() {
     }
   };
 
-  const handleDragStart = (track: ProjectTrack) => {
+  const handleDragStart = (track: ProjectTrack, event: React.DragEvent<HTMLElement>) => {
     if (reorderingTracks) return;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData(TRACK_DRAG_MIME, track.id);
+    event.dataTransfer.setData("text/plain", track.id);
+    draggingTrackIdRef.current = track.id;
     setDraggingTrackId(track.id);
     setDragTargetTrackId(track.id);
+  };
+
+  const handlePrepareDrag = (track: ProjectTrack, event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    draggingTrackIdRef.current = track.id;
+    pointerDragRef.current = {
+      trackId: track.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+    };
   };
 
   const handleDragOver = (track: ProjectTrack, event: React.DragEvent<HTMLElement>) => {
     if (!draggingTrackId || draggingTrackId === track.id || groupByDay) return;
     event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
     setDragTargetTrackId(track.id);
   };
 
@@ -3145,9 +4094,8 @@ export default function ProjectDetailPage() {
   };
 
   const handleBackgroundLibraryDragOver = (event: React.DragEvent<HTMLElement>) => {
-    const hasFiles = Array.from(event.dataTransfer?.types || []).includes("Files");
-    if (!draggingTrackId && !hasFiles) return;
     event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
     setBackgroundLibraryDropActive(true);
   };
 
@@ -3160,27 +4108,132 @@ export default function ProjectDetailPage() {
   const handleBackgroundLibraryDrop = async (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
     setBackgroundLibraryDropActive(false);
+    pointerDragRef.current = null;
 
     const droppedFiles = Array.from(event.dataTransfer?.files || []);
     if (droppedFiles.length > 0) {
       await uploadFilesToProject(droppedFiles, "background");
       setDraggingTrackId(null);
+      draggingTrackIdRef.current = null;
       setDragTargetTrackId(null);
       return;
     }
 
-    if (!draggingTrackId || !project) {
+    const droppedTrackId =
+      draggingTrackIdRef.current
+      || draggingTrackId
+      || event.dataTransfer?.getData(TRACK_DRAG_MIME)
+      || event.dataTransfer?.getData("text/plain")
+      || null;
+    if (!droppedTrackId || !project) {
       setDraggingTrackId(null);
+      draggingTrackIdRef.current = null;
       setDragTargetTrackId(null);
       return;
     }
 
-    const track = project.tracks.find((item) => item.id === draggingTrackId);
+    const track = project.tracks.find((item) => item.id === droppedTrackId);
     setDraggingTrackId(null);
+    draggingTrackIdRef.current = null;
     setDragTargetTrackId(null);
     if (!track || isBackgroundTrack(track)) return;
     await handleMarkAsBackground(track, track.background_description || null);
   };
+
+  const handleClipsLibraryDragOver = (event: React.DragEvent<HTMLElement>) => {
+    const types = new Set(Array.from(event.dataTransfer?.types || []));
+    const hasTrack = types.has(TRACK_DRAG_MIME) || types.has("text/plain") || Boolean(draggingTrackIdRef.current);
+    if (!hasTrack) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setClipsDropActive(true);
+  };
+
+  const handleClipsLibraryDragLeave = (event: React.DragEvent<HTMLElement>) => {
+    const nextTarget = event.relatedTarget;
+    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
+    setClipsDropActive(false);
+  };
+
+  const handleClipsLibraryDrop = async (event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setClipsDropActive(false);
+    pointerDragRef.current = null;
+
+    const droppedTrackId =
+      draggingTrackIdRef.current
+      || draggingTrackId
+      || event.dataTransfer?.getData(TRACK_DRAG_MIME)
+      || event.dataTransfer?.getData("text/plain")
+      || null;
+    if (!droppedTrackId || !project) {
+      setDraggingTrackId(null);
+      draggingTrackIdRef.current = null;
+      setDragTargetTrackId(null);
+      return;
+    }
+
+    const track = project.tracks.find((item) => item.id === droppedTrackId);
+    setDraggingTrackId(null);
+    draggingTrackIdRef.current = null;
+    setDragTargetTrackId(null);
+    if (!track || !isBackgroundTrack(track)) return;
+    await handleMoveToPrimary(track);
+  };
+
+  useEffect(() => {
+    const handlePointerMove = (event: PointerEvent) => {
+      const drag = pointerDragRef.current;
+      if (!drag) return;
+      const deltaX = event.clientX - drag.startX;
+      const deltaY = event.clientY - drag.startY;
+      if (!drag.active && Math.hypot(deltaX, deltaY) >= 8) {
+        drag.active = true;
+      }
+      if (!drag.active) return;
+      const hovered = document.elementFromPoint(event.clientX, event.clientY);
+      const overBackground = Boolean(
+        hovered && backgroundLibraryRef.current && backgroundLibraryRef.current.contains(hovered),
+      );
+      const overClips = Boolean(
+        hovered && clipsSectionRef.current && clipsSectionRef.current.contains(hovered),
+      );
+      setBackgroundLibraryDropActive(overBackground);
+      setClipsDropActive(overClips);
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      const drag = pointerDragRef.current;
+      if (!drag) return;
+      const hovered = document.elementFromPoint(event.clientX, event.clientY);
+      const overBackground = Boolean(
+        drag.active && hovered && backgroundLibraryRef.current && backgroundLibraryRef.current.contains(hovered),
+      );
+      const overClips = Boolean(
+        drag.active && hovered && clipsSectionRef.current && clipsSectionRef.current.contains(hovered),
+      );
+      pointerDragRef.current = null;
+      setBackgroundLibraryDropActive(false);
+      setClipsDropActive(false);
+      if (!project) return;
+      const track = project.tracks.find((item) => item.id === drag.trackId);
+      if (!track) return;
+      if (overBackground && !isBackgroundTrack(track)) {
+        void handleMarkAsBackground(track, track.background_description || null);
+        return;
+      }
+      if (overClips && isBackgroundTrack(track)) {
+        void handleMoveToPrimary(track);
+      }
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [project]);
 
   const handleGenerateSpeechFilter = async (track: ProjectTrack) => {
     if (!token || !project) return;
@@ -3304,8 +4357,12 @@ export default function ProjectDetailPage() {
     () => sortTracksForProject((project?.tracks || []).filter((track) => !isTrackHidden(track))),
     [project?.tracks],
   );
+  const voiceTracks = useMemo(
+    () => sortedTracks.filter((track) => !isBackgroundTrack(track) && isAudioTrack(track)),
+    [sortedTracks],
+  );
   const primaryTracks = useMemo(
-    () => sortedTracks.filter((track) => !isBackgroundTrack(track)),
+    () => sortedTracks.filter((track) => !isBackgroundTrack(track) && !isAudioTrack(track)),
     [sortedTracks],
   );
   const backgroundTracks = useMemo(
@@ -3348,7 +4405,14 @@ export default function ProjectDetailPage() {
 
   return (
     <div className="stack" style={{ gap: 16 }}>
-      <section className="card stack" style={{ gap: 16 }}>
+      <section
+        ref={clipsSectionRef}
+        className={`card stack ${clipsDropActive ? "backgroundLibrarySectionActive" : ""}`}
+        style={{ gap: 16 }}
+        onDragOver={handleClipsLibraryDragOver}
+        onDragLeave={handleClipsLibraryDragLeave}
+        onDrop={handleClipsLibraryDrop}
+      >
         <div className="projectOverviewHead">
           <div className="stack" style={{ gap: 6 }}>
             <h1>{project.name}</h1>
@@ -3368,21 +4432,54 @@ export default function ProjectDetailPage() {
         </div>
 
         <div className="projectFinalPreview">
-          <div className="stack" style={{ gap: 6 }}>
+          <input
+            ref={voiceTracksInputRef}
+            type="file"
+            accept="audio/*"
+            multiple
+            hidden
+            onChange={handleAddVoiceTracks}
+          />
+          <div className="projectFinalPreviewHead">
             <h2>Final Version</h2>
-            <span className="muted">Play the latest rendered version of the project.</span>
+            <FinalModeToggle mode={finalMode} onChange={setFinalMode} />
           </div>
-          {project.status === "completed" && project.output_path ? (
-            <FinalVideo projectId={project.id} token={token} />
-          ) : project.status === "error" ? (
-            <div className="videoPlayerEmpty">
-              <span className="muted">{project.error_message || "Rendering failed."}</span>
-            </div>
+          {finalMode === "video" ? (
+            <VideoBasedFinalPreview
+              projectId={project.id}
+              token={token}
+              tracks={primaryTracks}
+              timelineTracks={primaryTracks}
+              speechFilters={speechFilters}
+            />
           ) : (
-            <div className="videoPlayerEmpty">
-              <span className="muted">Final video is not ready yet.</span>
-            </div>
+            <VoiceBasedFinalPanel
+              projectId={project.id}
+              token={token}
+              tracks={voiceTracks}
+              uploading={voiceUploading}
+              onUpload={() => voiceTracksInputRef.current?.click()}
+              onMoveTrack={(trackId, direction) => {
+                const visibleTracks = [...sortedTracks];
+                const voiceIndexes = visibleTracks
+                  .map((track, index) => (!isBackgroundTrack(track) && isAudioTrack(track) ? index : -1))
+                  .filter((index) => index >= 0);
+                const currentIndex = visibleTracks.findIndex((track) => track.id === trackId);
+                const voiceOrderIndex = voiceIndexes.indexOf(currentIndex);
+                const targetIndex = voiceIndexes[voiceOrderIndex + direction];
+                if (currentIndex < 0 || targetIndex === undefined) return;
+                const reordered = [...visibleTracks];
+                [reordered[currentIndex], reordered[targetIndex]] = [reordered[targetIndex], reordered[currentIndex]];
+                void persistTrackOrder(reordered);
+              }}
+            />
           )}
+          {project.status === "completed" && project.output_path ? (
+            <details className="finalExportDisclosure">
+              <summary>Latest rendered export</summary>
+              <FinalVideo projectId={project.id} token={token} />
+            </details>
+          ) : null}
         </div>
       </section>
 
@@ -3456,6 +4553,7 @@ export default function ProjectDetailPage() {
                       onGenerateVisualPlan={handleGenerateVisualPlan}
                       onMarkAsBackground={handleMarkAsBackground}
                       backgroundSaving={Boolean(backgroundTrackSavingIds[track.id])}
+                      onPrepareDrag={handlePrepareDrag}
                       onOpen={setActiveTrack}
                       onHide={handleHideTrack}
                       hiding={hidingTrackId === track.id}
@@ -3467,8 +4565,10 @@ export default function ProjectDetailPage() {
                       onDrop={handleDrop}
                       onDragEnd={() => {
                         setDraggingTrackId(null);
+                        draggingTrackIdRef.current = null;
                         setDragTargetTrackId(null);
                         setBackgroundLibraryDropActive(false);
+                        setClipsDropActive(false);
                       }}
                     />
                   ))}
@@ -3478,7 +4578,7 @@ export default function ProjectDetailPage() {
           </div>
         ) : (
           <div className="clipGrid">
-            {sortedTracks.map((track) => (
+            {primaryTracks.map((track) => (
               <ClipCard
                 key={track.id}
                 projectId={project.id}
@@ -3495,6 +4595,7 @@ export default function ProjectDetailPage() {
                 onGenerateVisualPlan={handleGenerateVisualPlan}
                 onMarkAsBackground={handleMarkAsBackground}
                 backgroundSaving={Boolean(backgroundTrackSavingIds[track.id])}
+                onPrepareDrag={handlePrepareDrag}
                 onOpen={setActiveTrack}
                 onHide={handleHideTrack}
                 hiding={hidingTrackId === track.id}
@@ -3506,8 +4607,10 @@ export default function ProjectDetailPage() {
                 onDrop={handleDrop}
                 onDragEnd={() => {
                   setDraggingTrackId(null);
+                  draggingTrackIdRef.current = null;
                   setDragTargetTrackId(null);
                   setBackgroundLibraryDropActive(false);
+                  setClipsDropActive(false);
                 }}
               />
             ))}
@@ -3516,6 +4619,7 @@ export default function ProjectDetailPage() {
       </section>
 
       <section
+        ref={backgroundLibraryRef}
         className={`card stack backgroundLibrarySection ${backgroundLibraryDropActive ? "backgroundLibrarySectionActive" : ""}`}
         style={{ gap: 16 }}
         onDragOver={handleBackgroundLibraryDragOver}
@@ -3548,11 +4652,6 @@ export default function ProjectDetailPage() {
           onChange={handleAddBackgroundAssets}
         />
         <div className="clipGrid">
-          <BackgroundUploadCard
-            uploading={backgroundUploading}
-            dropActive={backgroundLibraryDropActive}
-            onClick={() => backgroundUploadInputRef.current?.click()}
-          />
           {backgroundTracks.map((track) => (
             <BackgroundTrackCard
               key={track.id}
@@ -3560,11 +4659,29 @@ export default function ProjectDetailPage() {
               token={token}
               track={track}
               saving={Boolean(backgroundTrackSavingIds[track.id])}
+              dragActive={draggingTrackId === track.id}
+              onPrepareDrag={handlePrepareDrag}
+              onDragStart={handleDragStart}
+              onDragEnd={() => {
+                setDraggingTrackId(null);
+                draggingTrackIdRef.current = null;
+                setDragTargetTrackId(null);
+                setBackgroundLibraryDropActive(false);
+                setClipsDropActive(false);
+              }}
               onPreview={setActiveTrack}
               onSaveDescription={handleSaveBackgroundDescription}
               onMoveToPrimary={handleMoveToPrimary}
             />
           ))}
+          <BackgroundUploadCard
+            uploading={backgroundUploading}
+            dropActive={backgroundLibraryDropActive}
+            onClick={() => backgroundUploadInputRef.current?.click()}
+            onDragOver={handleBackgroundLibraryDragOver}
+            onDragLeave={handleBackgroundLibraryDragLeave}
+            onDrop={handleBackgroundLibraryDrop}
+          />
         </div>
         <div className="notice">
           Videos with no usable transcript are auto-marked here. You can also drag clips from the main grid into this section or upload dedicated background video and image assets directly here.
@@ -3604,6 +4721,7 @@ export default function ProjectDetailPage() {
               onGenerateSpeechFilter={handleGenerateSpeechFilter}
               onGenerateVisualPlan={handleGenerateVisualPlan}
               onSaveSpeechFilter={handleSaveSpeechFilter}
+              onSaveBackgroundCuts={handleSaveBackgroundCuts}
               onUpdateBackgroundMusic={handleUpdateBackgroundMusic}
               onRenderTrack={handleRenderTrack}
               onClose={() => setActiveTrack(null)}

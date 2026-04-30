@@ -95,6 +95,18 @@ class VideoTrack(BaseModel):
         default=None,
         description="Short user-written description for background/b-roll usage",
     )
+    background_trim_start: float = Field(
+        default=0.0,
+        description="Saved trim start for background usage preview/rendering",
+    )
+    background_trim_end: Optional[float] = Field(
+        default=None,
+        description="Saved trim end for background usage preview/rendering",
+    )
+    background_playback_rate: float = Field(
+        default=1.0,
+        description="Saved playback rate for background usage preview/rendering",
+    )
     status: Literal["visible", "hidden"] = Field(default="visible", description="Visibility within the project")
     excluded: bool = Field(default=False, description="Soft-deleted from project (file kept on disk)")
 
@@ -254,10 +266,22 @@ class TrackBackgroundMusicUpdateRequest(BaseModel):
 class TrackBackgroundVideoUpdateRequest(BaseModel):
     """Persisted background-clip role and description."""
 
-    role: TrackRole = Field(default=TrackRole.PRIMARY, description="Primary editable clip or background support clip")
+    role: Optional[TrackRole] = Field(default=None, description="Primary editable clip or background support clip")
     background_description: Optional[str] = Field(
         default=None,
         description="Required semantic description when the clip is used as background",
+    )
+    background_trim_start: Optional[float] = Field(
+        default=None,
+        description="Optional background trim start in seconds",
+    )
+    background_trim_end: Optional[float] = Field(
+        default=None,
+        description="Optional background trim end in seconds",
+    )
+    background_playback_rate: Optional[float] = Field(
+        default=None,
+        description="Optional background playback rate from 0.5x to 10x",
     )
 
 

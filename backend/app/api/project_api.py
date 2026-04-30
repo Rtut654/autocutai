@@ -445,7 +445,7 @@ async def update_track_background_video(
         project = await project_service.update_track_background_video(
             project_id,
             track_id,
-            request.model_dump(),
+            request.model_dump(exclude_unset=True),
             user_id=current_user.id,
         )
     except ValueError as exc:

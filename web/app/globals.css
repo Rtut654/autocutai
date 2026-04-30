@@ -1000,12 +1000,314 @@ input, select {
   gap: 12px;
 }
 
+.projectFinalPreviewHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.finalModeToggle {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 4px;
+  border: 1px solid #d3e0ee;
+  border-radius: 999px;
+  background: #f7fbff;
+  gap: 4px;
+}
+
+.finalModeToggleOption {
+  min-height: 40px;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #56708d;
+  font-size: 14px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+
+.finalModeToggleOptionActive {
+  background: linear-gradient(180deg, #1c6cc0 0%, #185a9a 100%);
+  color: #fff;
+  box-shadow: 0 10px 22px rgba(24, 90, 154, 0.18);
+}
+
+.finalModePanel {
+  display: grid;
+  gap: 12px;
+}
+
+.finalTimelineCard {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid #dbe5ef;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #fbfdff 0%, #f5faff 100%);
+}
+
+.finalTimelineBar {
+  position: relative;
+  overflow: hidden;
+  height: 18px;
+  border-radius: 999px;
+  background: #e8f0f8;
+  border: 1px solid #d7e3f0;
+}
+
+.finalTimelineSegment {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(31, 106, 175, 0.18);
+}
+
+.finalTimelineSegmentAlt {
+  background: rgba(92, 144, 207, 0.24);
+}
+
+.finalTimelineCut {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  background: rgba(201, 43, 43, 0.72);
+}
+
+.finalTimelinePlayed {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 1;
+  background: rgba(31, 106, 175, 0.18);
+}
+
+.finalTimelinePlayhead {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  z-index: 3;
+  width: 3px;
+  border-radius: 999px;
+  background: #124f8d;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+}
+
+.finalTimelineLegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: #58718c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.finalTimelineLegend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.finalTimelineLegendSwatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+}
+
+.finalTimelineLegendSwatchTrack {
+  background: rgba(92, 144, 207, 0.38);
+  border: 1px solid rgba(31, 106, 175, 0.24);
+}
+
+.finalTimelineLegendSwatchCut {
+  background: rgba(201, 43, 43, 0.72);
+}
+
 .projectFinalVideo {
   width: 100%;
-  max-height: 560px;
+  max-height: 280px;
   border-radius: 18px;
   background: #0f1523;
   border: 1px solid #dbe5ef;
+}
+
+.projectFinalSequenceWrap {
+  overflow: hidden;
+  border-radius: 22px;
+  background: #0f1523;
+  border: 1px solid #dbe5ef;
+}
+
+.projectFinalVideoSequence {
+  display: block;
+  max-height: 320px;
+  border: 0;
+  border-radius: 0;
+}
+
+.finalSequenceControls {
+  padding-top: 4px;
+}
+
+.finalSequenceCutMarker {
+  pointer-events: none;
+  z-index: 4;
+  top: 8px;
+  height: 38px;
+  background: rgba(177, 28, 28, 0.78);
+  border-color: rgba(127, 29, 29, 0.88);
+}
+
+.finalSequenceSegmentPreview {
+  position: absolute;
+  top: 9px;
+  height: 36px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.38);
+  background: #1c3f67;
+  z-index: 2;
+}
+
+.finalSequenceSegmentMedia {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: left center;
+  opacity: 0.7;
+  display: block;
+  border: 0;
+  border-radius: 0;
+  background: #0f1523;
+}
+
+.finalSequenceSegmentMediaFallback {
+  background: linear-gradient(135deg, rgba(104, 153, 211, 0.46), rgba(45, 95, 151, 0.82));
+}
+
+.finalSequenceSegmentOverlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(9, 20, 36, 0.18), rgba(9, 20, 36, 0.36));
+}
+
+.finalSequenceSegmentLabel {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 7px;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.96);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+.finalVoiceEmpty {
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+  border: 1px dashed #c7d9ea;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #fbfdff 0%, #f3f8ff 100%);
+}
+
+.finalVoicePlayer {
+  width: 100%;
+}
+
+.finalVoiceTrackList {
+  display: grid;
+  gap: 10px;
+}
+
+.finalVoiceTrackRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid #dbe5ef;
+  border-radius: 16px;
+  background: #fff;
+}
+
+.finalVoiceTrackRowActive {
+  border-color: #9ec4ea;
+  box-shadow: 0 0 0 2px rgba(88, 150, 230, 0.12);
+  background: #fbfdff;
+}
+
+.finalVoiceTrackSelect {
+  flex: 1 1 260px;
+  display: grid;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.finalVoiceTrackActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.finalVoiceTrackActions .btn {
+  min-width: 72px;
+}
+
+.finalExportDisclosure {
+  display: grid;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid #dbe5ef;
+  border-radius: 18px;
+  background: #fbfdff;
+}
+
+.finalExportDisclosure summary {
+  cursor: pointer;
+  font-weight: 800;
+  color: #163b63;
+}
+
+@media (max-width: 720px) {
+  .projectFinalPreviewHead {
+    align-items: stretch;
+  }
+
+  .finalModeToggle {
+    width: 100%;
+  }
+
+  .finalModeToggleOption {
+    min-width: 0;
+  }
+
+  .finalVoiceTrackRow {
+    align-items: stretch;
+  }
+
+  .finalVoiceTrackActions {
+    width: 100%;
+  }
+
+  .finalVoiceTrackActions .btn {
+    flex: 1 1 0;
+  }
 }
 
 .clipGrid {
@@ -1161,15 +1463,147 @@ input, select {
   align-content: start;
 }
 
+.backgroundClipMeta {
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+
 .backgroundDescriptionInput {
   width: 100%;
-  min-height: 88px;
+  min-height: 52px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   resize: vertical;
   font: inherit;
   background: #fff;
+}
+
+.backgroundTrimEditor {
+  display: grid;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid #dbe5ef;
+  border-radius: 14px;
+  background: #fbfdff;
+}
+
+.backgroundTrimHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.backgroundTrimHeader strong {
+  font-size: 13px;
+}
+
+.backgroundTrimTrack {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  background: #e7eff8;
+  overflow: hidden;
+}
+
+.backgroundTrimSelection {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #1b6dc1 0%, #4d9be4 100%);
+}
+
+.backgroundTrimRanges {
+  position: relative;
+  display: grid;
+  gap: 0;
+}
+
+.backgroundTrimRange {
+  width: 100%;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+}
+
+.backgroundTrimRange::-webkit-slider-runnable-track {
+  height: 0;
+  background: transparent;
+}
+
+.backgroundTrimRange::-moz-range-track {
+  height: 0;
+  background: transparent;
+  border: 0;
+}
+
+.backgroundTrimRange::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -8px;
+  border: 2px solid #fff;
+  border-radius: 999px;
+  background: #1b6dc1;
+  box-shadow: 0 4px 10px rgba(27, 109, 193, 0.22);
+  cursor: pointer;
+}
+
+.backgroundTrimRange::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 2px solid #fff;
+  border-radius: 999px;
+  background: #1b6dc1;
+  box-shadow: 0 4px 10px rgba(27, 109, 193, 0.22);
+  cursor: pointer;
+}
+
+.backgroundTrimLabels {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: #61758c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.backgroundSpeedRow {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.backgroundSpeedLabel {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1f4166;
+}
+
+.backgroundSpeedSlider {
+  width: 100%;
+}
+
+.backgroundCardActions {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+}
+
+.backgroundCardActions .btn {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 8px 10px;
+  white-space: nowrap;
+}
+
+.backgroundSaveCutsButton {
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 10px;
 }
 
 .backgroundPlacementList {
@@ -1522,6 +1956,15 @@ input, select {
   border-radius: 18px;
   background: #0f1523;
   object-fit: contain;
+}
+
+.backgroundPreviewEditorWrap {
+  display: grid;
+  gap: 12px;
+}
+
+.backgroundTrimEditorModal {
+  margin-top: -4px;
 }
 
 .speechEditor {

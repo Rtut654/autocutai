@@ -203,12 +203,16 @@ export type ProjectTrack = {
   render_versions?: TrackRenderVersion[];
   role?: "primary" | "background";
   background_description?: string | null;
+  background_trim_start?: number;
+  background_trim_end?: number | null;
+  background_playback_rate?: number;
   status?: "visible" | "hidden";
   excluded?: boolean;
 };
 
 export type ProjectPipeline = {
   combined_transcript?: string;
+  combined_words?: TranscriptWord[];
   insertion_suggestions?: InsertionSuggestion[];
   background_video_suggestions?: BackgroundVideoPlacement[];
   gap_ranges?: GapRange[];

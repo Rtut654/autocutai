@@ -62,7 +62,7 @@ class BackgroundVideoWorker:
                 "track_id": track.id,
                 "filename": track.filename,
                 "description": str(track.background_description or "").strip(),
-                "duration": float(track.duration or (4.0 if track.type.value == "image" else 0.0)),
+                "duration": project_service.get_background_track_effective_duration(track),
                 "media_type": track.type.value,
             }
             for track in background_tracks

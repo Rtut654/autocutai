@@ -90,6 +90,99 @@ def test_create_project_stores_uploads_in_user_project_video_dir(tmp_path, monke
     assert payload["tracks"][1]["file_path"] == str(video_dir / "IMG_6158.MOV")
 
 
+def test_background_video_patch_persists_trim_and_speed(tmp_path, monkeypatch):
+    from backend.app.main import app
+    from backend.app.services.auth_service import auth_service
+    from backend.app.services.project_service import project_service
+
+    auth_service.configure(tmp_path / "auth.db")
+    auth_service.reset_for_tests()
+    monkeypatch.setattr(project_service, "projects_dir", tmp_path / "projects")
+    monkeypatch.setattr(project_service, "temp_dir", tmp_path / "temp")
+    project_service.projects.clear()
+
+    async def fake_backfill(project_id: str, user_id: str | None = None):
+        return None
+
+    monkeypatch.setattr(project_service, "backfill_missing_transcripts", fake_backfill)
+
+    client = TestClient(app)
+    signup_response = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "backgroundedits@example.com",
+            "password": "password123",
+            "full_name": "Background Edits User",
+        },
+    )
+    token = signup_response.json()["access_token"]
+    user_id = signup_response.json()["user_id"]
+
+    create_response = client.post(
+        "/api/projects/",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"name": "Background Edits"},
+        files=[("files", ("IMG_6157.MOV", b"video-one", "video/quicktime"))],
+    )
+    assert create_response.status_code == 200
+    project_payload = create_response.json()["project"]
+    project_id = project_payload["id"]
+    track_id = project_payload["tracks"][0]["id"]
+
+    role_response = client.patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/background-video",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "role": "background",
+            "background_description": "mountain pass b-roll",
+        },
+    )
+    assert role_response.status_code == 200
+
+    edit_response = client.patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/background-video",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "background_trim_start": 4.0,
+            "background_trim_end": 10.0,
+            "background_playback_rate": 2.0,
+        },
+    )
+
+    assert edit_response.status_code == 200
+    track_payload = edit_response.json()["project"]["tracks"][0]
+    assert track_payload["role"] == "background"
+    assert track_payload["background_description"] == "mountain pass b-roll"
+    assert track_payload["background_trim_start"] == 4.0
+    assert track_payload["background_trim_end"] == 10.0
+    assert track_payload["background_playback_rate"] == 2.0
+
+    project_file = project_service.get_project_file(user_id, project_id, create=False)
+    stored = json.loads(project_file.read_text(encoding="utf-8"))
+    assert stored["tracks"][0]["background_trim_start"] == 4.0
+    assert stored["tracks"][0]["background_trim_end"] == 10.0
+    assert stored["tracks"][0]["background_playback_rate"] == 2.0
+
+
+def test_background_effective_duration_uses_trim_window_and_speed():
+    from backend.app.models.project import TrackType, VideoTrack
+    from backend.app.services.project_service import ProjectService
+
+    track = VideoTrack(
+        id="track-1",
+        type=TrackType.VIDEO,
+        filename="clip.mov",
+        file_path="/tmp/clip.mov",
+        duration=12.0,
+        position=0,
+        background_trim_start=2.0,
+        background_trim_end=8.0,
+        background_playback_rate=2.0,
+    )
+
+    assert ProjectService.get_background_track_effective_duration(track) == 3.0
+
+
 def test_create_project_queues_transcript_backfill(tmp_path, monkeypatch):
     from backend.app.main import app
     from backend.app.services.auth_service import auth_service
