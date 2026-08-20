@@ -600,6 +600,17 @@ class ProjectService:
     TRANSCRIBE_SHARE = 0.65
     RENDER_SHARE = 0.30
 
+    @classmethod
+    def _track_transcription_settled(cls, track: VideoTrack) -> bool:
+        """Whether this track still has transcription work outstanding.
+
+        A clip with no audio is finished the moment we know it has none, even
+        though it will never have a transcript.
+        """
+        if cls._track_has_transcript(track):
+            return True
+        return cls._get_track_transcript_status(track) in {"not_applicable", "error"}
+
     def describe_progress(self, project: Project) -> ProcessingStatus:
         """Report real progress rather than a fixed number.
 
@@ -607,7 +618,10 @@ class ProjectService:
         transcript, which is the only signal that actually moves during a run.
         """
         transcribable = [track for track in project.tracks if self._track_is_transcribable(track)]
-        done = [track for track in transcribable if self._track_has_transcript(track)]
+        # A silent clip never produces a transcript, so "has a transcript" is
+        # not the same as "finished". Without this, one drone shot pins the
+        # progress bar below the transcription share for the whole render.
+        done = [track for track in transcribable if self._track_transcription_settled(track)]
         in_flight = [
             track for track in transcribable
             if self._get_track_transcript_status(track) == "processing"
@@ -657,7 +671,7 @@ class ProjectService:
         pending_seconds = sum(
             float(track.duration or 0.0)
             for track in transcribable
-            if not self._track_has_transcript(track)
+            if not self._track_transcription_settled(track)
         )
         estimate = int(pending_seconds * 0.4) + 15 if remaining else 20
 
@@ -1665,6 +1679,11 @@ class ProjectService:
                 continue
             if self._track_has_transcript(track):
                 self._set_track_transcript_status(track, "completed")
+                continue
+            if self._get_track_transcript_status(track) == "not_applicable":
+                # Already established that this clip carries no audio. Probing
+                # again on every render costs an ffprobe and briefly reports
+                # the track as unfinished, which dips the progress bar.
                 continue
 
             self._set_track_transcript_status(track, "processing")

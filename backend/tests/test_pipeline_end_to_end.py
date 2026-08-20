@@ -871,3 +871,107 @@ def test_a_silent_clip_does_not_fail_the_whole_project(project_env, monkeypatch)
     assert response.status_code == 200, response.text
     assert response.json()["project"]["status"] == "completed"
     assert len(project_env["media"].combines[-1]["clips"]) == 2
+
+
+# --------------------------------------------------------------------------
+# Progress reporting
+# --------------------------------------------------------------------------
+
+
+def test_progress_starts_at_zero_for_an_untouched_project(project_env, monkeypatch):
+    from backend.app.services.video_processor import VideoProcessor
+
+    # No audio anywhere, so nothing is scheduled on upload.
+    async def no_audio(self, source_path):
+        return False
+
+    monkeypatch.setattr(VideoProcessor, "probe_has_audio", no_audio)
+    clips = [project_env["make_clip"]("a.mp4")]
+    project_id = create_project(project_env["client"], project_env["headers"], clips).json()["project"]["id"]
+
+    status = project_env["client"].get(
+        f"/api/projects/{project_id}/status", headers=project_env["headers"]
+    ).json()
+
+    assert status["current_step"] in {"idle", "analyzing", "rendering"}
+    assert status["progress"] >= 0.0
+
+
+def test_progress_reaches_one_hundred_when_complete(project_env):
+    project_id = _process(project_env, [project_env["make_clip"]("a.mp4")])
+
+    status = project_env["client"].get(
+        f"/api/projects/{project_id}/status", headers=project_env["headers"]
+    ).json()
+
+    assert status["progress"] == 100.0
+    assert status["current_step"] == "completed"
+    assert status["estimated_time_remaining"] == 0
+
+
+def test_a_silent_clip_does_not_pin_the_progress_bar(project_env, monkeypatch):
+    """A clip with no audio never gets a transcript, but it is still finished.
+
+    Counting it as outstanding held progress at 32% for an entire render.
+    """
+    from backend.app.services.video_processor import VideoProcessor
+
+    async def only_second_is_silent(self, source_path):
+        return "drone" not in str(source_path)
+
+    monkeypatch.setattr(VideoProcessor, "probe_has_audio", only_second_is_silent)
+    clips = [project_env["make_clip"]("talking.mp4"), project_env["make_clip"]("drone.mp4")]
+    project_id = create_project(project_env["client"], project_env["headers"], clips).json()["project"]["id"]
+
+    # Both tracks have settled: one transcribed, one known to have no audio.
+    project_env["client"].get(f"/api/projects/{project_id}", headers=project_env["headers"])
+    status = project_env["client"].get(
+        f"/api/projects/{project_id}/status", headers=project_env["headers"]
+    ).json()
+
+    assert status["progress"] > 60.0
+    assert status["current_step"] != "transcribing"
+
+
+def test_progress_reports_a_failure_rather_than_a_number(project_env, monkeypatch):
+    async def explode(audio_path, language=None):
+        raise RuntimeError("Azure quota exceeded")
+
+    monkeypatch.setattr("backend.app.services.project_service.transcribe_audio_file", explode)
+    clips = [project_env["make_clip"]("a.mp4")]
+    project_id = create_project(project_env["client"], project_env["headers"], clips).json()["project"]["id"]
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+
+    status = project_env["client"].get(
+        f"/api/projects/{project_id}/status", headers=project_env["headers"]
+    ).json()
+
+    assert status["current_step"] == "error"
+    assert "Azure quota exceeded" in status["error_message"]
+
+
+def test_a_silent_clip_is_probed_once_not_on_every_render(project_env, monkeypatch):
+    from backend.app.services.video_processor import VideoProcessor
+
+    probes: list[str] = []
+
+    async def counting_probe(self, source_path):
+        probes.append(str(source_path))
+        return False
+
+    monkeypatch.setattr(VideoProcessor, "probe_has_audio", counting_probe)
+    clips = [project_env["make_clip"]("drone.mp4")]
+    project_id = create_project(project_env["client"], project_env["headers"], clips).json()["project"]["id"]
+
+    first = len(probes)
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+
+    # The render plan probes each source once per render; transcription must
+    # not add another probe now that the track is known to have no audio.
+    transcription_probes = [p for p in probes[:first] if p]
+    assert len(transcription_probes) == 1
+    status = project_env["client"].get(
+        f"/api/projects/{project_id}/status", headers=project_env["headers"]
+    ).json()
+    assert status["progress"] == 100.0
