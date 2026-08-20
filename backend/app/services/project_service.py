@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from ..models.project import (
     BackgroundMusicSettings,
+    ProcessingStatus,
     TrackRole,
     EditMode,
     HybridProjectAnalyzeRequest,
@@ -593,6 +594,81 @@ class ProjectService:
             await self._save_project(project)
 
         return project
+
+    # Rough share of the work each stage represents, used for progress
+    # reporting. Transcription dominates wall clock; rendering is second.
+    TRANSCRIBE_SHARE = 0.65
+    RENDER_SHARE = 0.30
+
+    def describe_progress(self, project: Project) -> ProcessingStatus:
+        """Report real progress rather than a fixed number.
+
+        Progress is derived from how many transcribable tracks have a
+        transcript, which is the only signal that actually moves during a run.
+        """
+        transcribable = [track for track in project.tracks if self._track_is_transcribable(track)]
+        done = [track for track in transcribable if self._track_has_transcript(track)]
+        in_flight = [
+            track for track in transcribable
+            if self._get_track_transcript_status(track) == "processing"
+        ]
+
+        if project.status == "error":
+            return ProcessingStatus(
+                project_id=project.id,
+                status=project.status,
+                progress=0.0,
+                current_step="error",
+                estimated_time_remaining=None,
+                error_message=project.error_message,
+            )
+
+        if project.status == "completed":
+            return ProcessingStatus(
+                project_id=project.id,
+                status=project.status,
+                progress=100.0,
+                current_step="completed",
+                estimated_time_remaining=0,
+                error_message=None,
+            )
+
+        if project.status == "draft" and not in_flight and not done:
+            return ProcessingStatus(
+                project_id=project.id,
+                status=project.status,
+                progress=0.0,
+                current_step="idle",
+                estimated_time_remaining=None,
+                error_message=None,
+            )
+
+        transcribed_fraction = (len(done) / len(transcribable)) if transcribable else 1.0
+        progress = transcribed_fraction * self.TRANSCRIBE_SHARE
+        step = "transcribing"
+        remaining = len(transcribable) - len(done)
+
+        if transcribed_fraction >= 1.0:
+            step = "rendering" if project.status == "processing" else "analyzing"
+            progress = self.TRANSCRIBE_SHARE + (self.RENDER_SHARE / 2)
+
+        # Rough estimate: transcription runs near real time against Azure, and
+        # the single-pass render is a fraction of the footage duration.
+        pending_seconds = sum(
+            float(track.duration or 0.0)
+            for track in transcribable
+            if not self._track_has_transcript(track)
+        )
+        estimate = int(pending_seconds * 0.4) + 15 if remaining else 20
+
+        return ProcessingStatus(
+            project_id=project.id,
+            status=project.status,
+            progress=round(progress * 100, 1),
+            current_step=step,
+            estimated_time_remaining=estimate,
+            error_message=None,
+        )
 
     async def get_track_speech_filter(
         self,

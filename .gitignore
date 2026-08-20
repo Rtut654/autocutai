@@ -15,8 +15,10 @@ backvenv/
 # Mobile/Web heavy generated folders
 mobile/node_modules/
 mobile/.expo/
-mobile/ios/build/
-mobile/android/build/
+# Native projects are generated from app.json by `expo prebuild`.
+# Do not commit them: a stale copy silently ignores config changes.
+mobile/ios/
+mobile/android/
 web/node_modules/
 web/.next/
 web/.next-dev/

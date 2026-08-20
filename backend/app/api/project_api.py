@@ -273,25 +273,7 @@ async def get_processing_status(project_id: str, current_user=Depends(get_curren
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    current_step = "idle"
-    progress = 0.0
-    if project.status == "processing":
-        current_step = "analyzing"
-        progress = 45.0
-    elif project.status == "completed":
-        current_step = "completed"
-        progress = 100.0
-    elif project.status == "error":
-        current_step = "error"
-
-    return ProcessingStatus(
-        project_id=project_id,
-        status=project.status,
-        progress=progress,
-        current_step=current_step,
-        estimated_time_remaining=None,
-        error_message=project.error_message,
-    )
+    return project_service.describe_progress(project)
 
 
 @router.get("/{project_id}/timeline")

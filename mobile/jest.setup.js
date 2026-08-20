@@ -8,18 +8,24 @@ jest.mock("@expo/vector-icons", () => {
   };
 });
 
-jest.mock("expo-in-app-purchases", () => ({
-  IAPResponseCode: {
-    OK: 0,
-    USER_CANCELED: 1,
-  },
-  connectAsync: jest.fn().mockResolvedValue({}),
-  disconnectAsync: jest.fn().mockResolvedValue({}),
-  setPurchaseListener: jest.fn(),
-  getProductsAsync: jest.fn().mockResolvedValue({ responseCode: 0, results: [] }),
-  purchaseItemAsync: jest.fn().mockResolvedValue({}),
-  finishTransactionAsync: jest.fn().mockResolvedValue({}),
+jest.mock("expo-image-picker", () => ({
+  requestMediaLibraryPermissionsAsync: jest.fn().mockResolvedValue({ granted: true }),
+  launchImageLibraryAsync: jest.fn().mockResolvedValue({ canceled: true, assets: [] }),
 }));
+
+jest.mock("expo-media-library", () => ({
+  requestPermissionsAsync: jest.fn().mockResolvedValue({ granted: true }),
+  saveToLibraryAsync: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock("expo-video", () => {
+  const React = require("react");
+  const { View } = require("react-native");
+  return {
+    useVideoPlayer: jest.fn(() => ({ loop: false, play: jest.fn(), pause: jest.fn() })),
+    VideoView: (props) => React.createElement(View, props),
+  };
+});
 
 jest.mock("expo-apple-authentication", () => ({
   AppleAuthenticationButton: "AppleAuthenticationButton",

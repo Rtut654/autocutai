@@ -2,7 +2,6 @@ export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://aut
 
 export type SubscriptionPlan = 'free' | 'pro_monthly' | 'pro_yearly';
 export type BillingPlanKey = 'monthly' | 'six_month' | 'yearly';
-export type RenderStrategy = 'on_device' | 'selected_ranges_upload';
 
 export type BillingPlan = {
   key: BillingPlanKey;
@@ -62,62 +61,29 @@ export type AuthSession = {
   user: MeUser;
 };
 
-export type ProjectSummary = {
-  id: string;
-  name: string;
-  status: string;
-  output_path?: string | null;
-  created_at?: string;
-  updated_at?: string;
-  tracks?: Array<{ duration?: number }>;
-  pipeline?: {
-    insertion_suggestions?: Array<unknown>;
-    gap_ranges?: Array<unknown>;
-  };
-};
-
-export type ProjectSettingsPayload = {
-  aspect_ratio?: 'horizontal' | 'vertical';
-  edit_mode?: 'chronological' | 'manual';
-  remove_duplicates?: boolean;
-  smart_pause_cutter?: boolean;
-  generate_subtitles?: boolean;
-  insert_suggestions?: boolean;
-  min_gap_seconds?: number;
-};
-
-export type ProjectAnalysisTrack = {
-  id: string;
-  filename: string;
-  duration: number;
-  metadata?: Record<string, unknown>;
-  transcription?: {
-    text?: string;
-    words?: Array<{ word?: string; text?: string; start: number; end: number }>;
-  } | null;
-};
-
-export type ProjectAnalysisResult = {
-  id: string;
-  name: string;
-  status: string;
-  pipeline: {
-    combined_transcript: string;
-    gap_ranges: Array<{ start: number; end: number; duration: number; reason?: string }>;
-    insertion_suggestions: Array<{ time: number; suggestion: string; media_type: string }>;
-    render_plan: Record<string, unknown>;
-    subtitle_cues?: Array<unknown>;
-  };
-  tracks: ProjectAnalysisTrack[];
-  output_path?: string | null;
-};
 
 async function check<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || `Request failed: ${res.status}`);
+    let detail = text;
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown };
+      if (typeof parsed.detail === 'string' && parsed.detail.trim()) detail = parsed.detail;
+    } catch {
+      // Not JSON; fall back to the raw body.
+    }
+    throw new Error(detail || `Request failed: ${res.status}`);
   }
   return res.json() as Promise<T>;
+}
+
+/** Authenticated JSON request. Throws with the backend's detail message. */
+export async function authorizedRequest<T>(
+  path: string,
+  token: string,
+  options: RequestInit = {},
+): Promise<T> {
+  return request<T>(path, options, token);
 }
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
@@ -279,43 +245,6 @@ export const api = {
     return api.activatePayment(token, mappedPlan);
   },
 
-  async listProjects(token: string, limit = 100, offset = 0) {
-    return request<{ projects: ProjectSummary[]; total: number }>(
-      `/api/projects/?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`,
-      { method: 'GET' },
-      token,
-    );
-  },
-
-  async analyzeHybridProject(token: string, payload: {
-    name: string;
-    description?: string;
-    tracks: Array<Record<string, unknown>>;
-    settings?: Partial<ProjectSettingsPayload>;
-    render_strategy?: RenderStrategy;
-  }) {
-    const response = await request<{ project: ProjectAnalysisResult }>(
-      '/api/projects/hybrid-analyze',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          name: payload.name,
-          description: payload.description,
-          tracks: payload.tracks,
-          settings: {
-            smart_pause_cutter: true,
-            generate_subtitles: true,
-            insert_suggestions: true,
-            ...(payload.settings || {}),
-          },
-          render_strategy: payload.render_strategy || 'on_device',
-        }),
-      },
-      token,
-    );
-    return response.project;
-  },
-
   async updateProfile(token: string, payload: { full_name?: string | null }) {
     return request<MeUser>(
       '/api/auth/me',
@@ -331,81 +260,3 @@ export const api = {
     return request<{ message: string }>('/api/auth/me', { method: 'DELETE' }, token);
   },
 };
-
-export async function createProject(
-  token: string,
-  payload: {
-    name: string;
-    files: { uri: string; name: string; mimeType?: string; recordedAt?: string }[];
-  },
-) {
-  const form = new FormData();
-  form.append('name', payload.name);
-  form.append('smart_pause_cutter', 'true');
-  form.append('generate_subtitles', 'true');
-  form.append('insert_suggestions', 'true');
-
-  const captureTimes = payload.files.map((f) => f.recordedAt || null);
-  const metadata = payload.files.map(() => ({}));
-  form.append('capture_times_json', JSON.stringify(captureTimes));
-  form.append('metadata_json', JSON.stringify(metadata));
-
-  payload.files.forEach((f) => {
-    form.append('files', {
-      uri: f.uri,
-      name: f.name,
-      type: f.mimeType || 'video/mp4',
-    } as any);
-  });
-
-  const res = await fetch(`${API_BASE_URL}/api/projects/`, {
-    method: 'POST',
-    body: form,
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  return check<{ project: { id: string } }>(res);
-}
-
-export async function processProjectSync(token: string, projectId: string) {
-  return request<any>(`/api/projects/${projectId}/process-sync`, { method: 'POST' }, token);
-}
-
-export async function getTimeline(token: string, projectId: string) {
-  return request<any>(`/api/projects/${projectId}/timeline`, { method: 'GET' }, token);
-}
-
-export async function getRenderManifest(token: string, projectId: string) {
-  return request<any>(`/api/projects/${projectId}/render-manifest`, { method: 'GET' }, token);
-}
-
-/**
- * Download URL for a finished render. The request needs an Authorization header,
- * so callers must pass one (FileSystem.downloadAsync accepts headers).
- */
-export function downloadOutput(projectId: string) {
-  return `${API_BASE_URL}/api/projects/${projectId}/download`;
-}
-
-/** Transcribe a local media file through our backend (Azure Speech server-side). */
-export async function transcribeMedia(
-  token: string,
-  file: { uri: string; name: string; mimeType?: string },
-  language = 'en-US',
-): Promise<any> {
-  const form = new FormData();
-  form.append('file', {
-    uri: file.uri,
-    name: file.name,
-    type: file.mimeType || 'video/mp4',
-  } as any);
-  form.append('language', language);
-
-  const res = await fetch(`${API_BASE_URL}/api/transcribe`, {
-    method: 'POST',
-    body: form,
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  return check<any>(res);
-}

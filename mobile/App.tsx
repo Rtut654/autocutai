@@ -11,9 +11,9 @@ import { api, AuthSession } from './src/api/client';
 import LoginScreen from './src/screens/LoginScreen';
 import OnboardingScreen from './src/screens/OnboardingScreen';
 import PricingScreen from './src/screens/PricingScreen';
-import ProjectsScreen from './src/screens/ProjectsScreen';
 import UploadScreen from './src/screens/UploadScreen';
 import HistoryScreen from './src/screens/HistoryScreen';
+import EditorScreen from './src/screens/EditorScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
 
 const PRELOGIN_ONBOARDING_KEY = 'onboarding_done_guest_v1';
@@ -24,14 +24,12 @@ function MainTabs({
   session,
   onLogout,
   onOpenPricing,
-  activeProjectId,
-  onProjectReady,
+  onOpenProject,
 }: {
   session: AuthSession;
   onLogout: () => Promise<void>;
   onOpenPricing: () => void;
-  activeProjectId: string | null;
-  onProjectReady: (projectId: string) => void;
+  onOpenProject: (projectId: string) => void;
 }) {
   const insets = useSafeAreaInsets();
   const tabIcon = (name: React.ComponentProps<typeof MaterialCommunityIcons>['name'], focused: boolean, color: string) => (
@@ -40,7 +38,7 @@ function MainTabs({
 
   return (
     <Tab.Navigator
-      initialRouteName="Upload"
+      initialRouteName="New"
       screenOptions={{
         headerShown: false,
         tabBarActiveTintColor: '#173e75',
@@ -60,39 +58,32 @@ function MainTabs({
       }}
     >
       <Tab.Screen
-        name="Upload"
+        name="New"
         options={{ tabBarIcon: ({ focused, color }) => tabIcon('movie-open-plus-outline', focused, color) }}
       >
-        {() => <UploadScreen token={session.access_token} onProjectReady={onProjectReady} />}
+        {() => <UploadScreen token={session.access_token} onProjectCreated={onOpenProject} />}
       </Tab.Screen>
       <Tab.Screen
         name="Projects"
-        options={{ tabBarIcon: ({ focused, color }) => tabIcon('folder-multiple-outline', focused, color) }}
-      >
-        {(props: any) => (
-          <ProjectsScreen
-            {...props}
-            projectId={activeProjectId}
-            status={activeProjectId ? 'Hybrid analysis ready' : 'Idle'}
-            onGoCreate={() => props.navigation.navigate('Upload')}
-          />
-        )}
-      </Tab.Screen>
-      <Tab.Screen
-        name="History"
         options={{
-          tabBarIcon: ({ focused, color }) => tabIcon('history', focused, color),
+          tabBarIcon: ({ focused, color }) => tabIcon('folder-multiple-outline', focused, color),
           unmountOnBlur: true,
         }}
       >
-        {(props: any) => <HistoryScreen {...props} token={session.access_token} />}
+        {() => <HistoryScreen token={session.access_token} onOpenProject={onOpenProject} />}
       </Tab.Screen>
       <Tab.Screen
         name="Profile"
         options={{ tabBarIcon: ({ focused, color }) => tabIcon('account-circle-outline', focused, color) }}
       >
         {(props: any) => (
-            <ProfileScreen {...props} token={session.access_token} session={session} onLogout={onLogout} onOpenPricing={onOpenPricing} />
+          <ProfileScreen
+            {...props}
+            token={session.access_token}
+            session={session}
+            onLogout={onLogout}
+            onOpenPricing={onOpenPricing}
+          />
         )}
       </Tab.Screen>
     </Tab.Navigator>
@@ -215,10 +206,23 @@ export default function App() {
                     session={session}
                     onLogout={onLogout}
                     onOpenPricing={() => props.navigation.navigate('Pricing')}
-                    activeProjectId={activeProjectId}
-                    onProjectReady={setActiveProjectId}
+                    onOpenProject={(projectId: string) => {
+                      setActiveProjectId(projectId);
+                      props.navigation.navigate('Editor');
+                    }}
                   />
                 )}
+              </RootStack.Screen>
+              <RootStack.Screen name="Editor">
+                {(props: any) =>
+                  activeProjectId ? (
+                    <EditorScreen
+                      token={session.access_token}
+                      projectId={activeProjectId}
+                      onClose={() => props.navigation.goBack()}
+                    />
+                  ) : null
+                }
               </RootStack.Screen>
               <RootStack.Screen name="Pricing">
                 {(props: any) => <PricingScreen {...props} token={session.access_token} onRequireAccount={onLogout} />}
