@@ -34,6 +34,12 @@ from ..models.project import (
     TrackRenderResponse,
     VisualPlanArtifact,
 )
+from ..services.project_limits import (
+    ProjectLimitError,
+    max_upload_bytes,
+    check_clip_count,
+    check_total_duration,
+)
 from ..services.project_service import project_service
 from ..services.background_video_worker_service import background_video_worker_service
 from ..services.video_processor import video_processor
@@ -41,6 +47,30 @@ from ..services.visual_worker_service import visual_worker_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+
+CHUNK_BYTES = 4 * 1024 * 1024
+
+
+async def _stream_upload_to(upload: UploadFile, destination: Path) -> int:
+    """Copy an upload to disk in chunks and return the byte count.
+
+    Reading a multi-gigabyte clip with ``await upload.read()`` would hold the
+    whole file in memory; travel footage is exactly the case that breaks.
+    """
+    written = 0
+    limit = max_upload_bytes()
+    with destination.open("wb") as handle:
+        while chunk := await upload.read(CHUNK_BYTES):
+            written += len(chunk)
+            if written > limit:
+                handle.close()
+                destination.unlink(missing_ok=True)
+                raise ProjectLimitError(
+                    f"{upload.filename} is larger than the {limit // (1024 * 1024)} MB per-file limit."
+                )
+            handle.write(chunk)
+    return written
 
 
 def _is_duplicate_track_upload(project, filename: str, size: int) -> bool:
@@ -78,6 +108,12 @@ async def hybrid_analyze_project(
     current_user=Depends(get_current_user),
 ):
     try:
+        check_clip_count(len(request.tracks))
+        check_total_duration(track.duration for track in request.tracks)
+    except ProjectLimitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
         project = await project_service.analyze_hybrid_project(request, user_id=current_user.id)
         return ProjectResponse(project=project, message="Hybrid analysis completed")
     except Exception as exc:
@@ -102,15 +138,25 @@ async def create_project(
     files: List[UploadFile] = File(...),
 ):
     try:
-        project_id = str(uuid4())
+        check_clip_count(len(files))
+    except ProjectLimitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        saved_files: List[str] = []
+    project_id = str(uuid4())
+    saved_files: List[str] = []
+    try:
         for upload in files:
             if not upload.filename:
                 raise HTTPException(status_code=400, detail="Each file needs a filename")
             destination = project_service.reserve_project_video_path(current_user.id, project_id, upload.filename)
-            destination.write_bytes(await upload.read())
+            await _stream_upload_to(upload, destination)
             saved_files.append(str(destination))
+    except ProjectLimitError as exc:
+        for path in saved_files:
+            Path(path).unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
 
         capture_times: Optional[List[Optional[datetime]]] = None
         if capture_times_json:
@@ -141,6 +187,13 @@ async def create_project(
         )
 
         project = await project_service.create_project_with_id(project_id, request, user_id=current_user.id)
+
+        try:
+            check_total_duration(track.duration for track in project.tracks)
+        except ProjectLimitError as exc:
+            await project_service.delete_project(project_id, user_id=current_user.id)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         if project_service.project_has_missing_transcripts(project):
             background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
         return ProjectResponse(project=project, message="Project created successfully")
@@ -341,18 +394,29 @@ async def add_tracks_to_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    existing_tracks = [track for track in project.tracks if not track.excluded]
+    try:
+        check_clip_count(len(files), existing_clips=len(existing_tracks))
+    except ProjectLimitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     saved_files: List[str] = []
     skipped_duplicates = 0
-    for upload in files:
-        if not upload.filename:
-            raise HTTPException(status_code=400, detail="Each file needs a filename")
-        payload = await upload.read()
-        if _is_duplicate_track_upload(project, upload.filename, len(payload)):
-            skipped_duplicates += 1
-            continue
-        destination = project_service.reserve_project_video_path(current_user.id, project_id, upload.filename)
-        destination.write_bytes(payload)
-        saved_files.append(str(destination))
+    try:
+        for upload in files:
+            if not upload.filename:
+                raise HTTPException(status_code=400, detail="Each file needs a filename")
+            destination = project_service.reserve_project_video_path(current_user.id, project_id, upload.filename)
+            written = await _stream_upload_to(upload, destination)
+            if _is_duplicate_track_upload(project, upload.filename, written):
+                destination.unlink(missing_ok=True)
+                skipped_duplicates += 1
+                continue
+            saved_files.append(str(destination))
+    except ProjectLimitError as exc:
+        for path in saved_files:
+            Path(path).unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     capture_times = None
     if capture_times_json:
@@ -375,6 +439,15 @@ async def add_tracks_to_project(
             file_path, start_position + i, captured, extra_meta
         )
         project.tracks.append(track)
+
+    try:
+        check_total_duration(track.duration for track in project.tracks if not track.excluded)
+    except ProjectLimitError as exc:
+        for path in saved_files:
+            Path(path).unlink(missing_ok=True)
+        project.tracks = [track for track in project.tracks if track.file_path not in saved_files]
+        await project_service._save_project(project)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     project.tracks = project_service._ordered_tracks(project.tracks, project.settings.edit_mode)
     project_service.mark_missing_transcripts_pending(project)

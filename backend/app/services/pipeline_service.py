@@ -47,7 +47,29 @@ def normalize_words(raw_words: Sequence[dict]) -> List[WordTimestamp]:
     return result
 
 
+def _words_within_segments(words: Sequence[WordTimestamp], segments: Sequence[dict]) -> List[WordTimestamp]:
+    """Keep only the words that fall inside a surviving segment.
+
+    Providers return both a flat word list and per-segment words. When a
+    segment is dropped as a hallucination its words have to go with it,
+    otherwise the flat list silently reintroduces the text we just removed.
+    """
+    if not segments:
+        return []
+    spans = [
+        (float(segment.get("start", 0.0)), float(segment.get("end", 0.0)))
+        for segment in segments
+    ]
+    kept: List[WordTimestamp] = []
+    for word in words:
+        midpoint = (word.start + word.end) / 2
+        if any(start - 0.05 <= midpoint <= end + 0.05 for start, end in spans):
+            kept.append(word)
+    return kept
+
+
 def sanitize_transcription_payload(raw_transcription: dict, clip_duration: float) -> dict:
+    """Drop hallucinated and empty output from a raw provider transcript."""
     raw_segments = raw_transcription.get("segments") or []
     sanitized_segments: List[dict] = []
 
@@ -56,8 +78,7 @@ def sanitize_transcription_payload(raw_transcription: dict, clip_duration: float
         end = float(raw_segment.get("end", start))
         text = str(raw_segment.get("text") or "").strip()
         normalized_text = _normalize_text_key(text)
-        word_dicts = raw_segment.get("words") or []
-        words = normalize_words(word_dicts)
+        words = normalize_words(raw_segment.get("words") or [])
         duration = max(0.0, end - start)
         is_known_hallucination = normalized_text in HALLUCINATION_PHRASES
         is_tiny_tail_segment = (
@@ -75,25 +96,28 @@ def sanitize_transcription_payload(raw_transcription: dict, clip_duration: float
         sanitized_segment["words"] = [word.model_dump() for word in words]
         sanitized_segments.append(sanitized_segment)
 
-    sanitized_words = normalize_words(
-        raw_transcription.get("words")
-        or [
-            word
-            for segment in sanitized_segments
-            for word in segment.get("words", [])
-        ]
-    )
+    top_level_words = normalize_words(raw_transcription.get("words") or [])
+    if raw_segments:
+        # Segments are authoritative: a word only survives if its segment did.
+        sanitized_words = (
+            _words_within_segments(top_level_words, sanitized_segments)
+            if top_level_words
+            else normalize_words(
+                [word for segment in sanitized_segments for word in segment.get("words", [])]
+            )
+        )
+    else:
+        sanitized_words = top_level_words
 
     joined_text = " ".join(
         str(segment.get("text") or "").strip()
         for segment in sanitized_segments
         if str(segment.get("text") or "").strip()
     ).strip()
+    if not joined_text and not sanitized_segments:
+        joined_text = str(raw_transcription.get("text") or "").strip()
 
-    if not sanitized_words and _normalize_text_key(joined_text) in HALLUCINATION_PHRASES:
-        joined_text = ""
-        sanitized_segments = []
-
+    # A transcript that is nothing but a known hallucination is not a transcript.
     if len(sanitized_words) <= 4 and _normalize_text_key(joined_text) in HALLUCINATION_PHRASES:
         joined_text = ""
         sanitized_words = []

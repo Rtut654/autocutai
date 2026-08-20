@@ -30,5 +30,15 @@ dist/
 
 # Local project media and render artifacts
 backend/projects/
-# projects/
+projects/
 temp/
+
+# Local state, databases and secrets - never commit these
+*.db
+*.sqlite
+*.sqlite3
+backend/.runtime/
+.env
+.env.*
+!.env.example
+!.env.docker.example

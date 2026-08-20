@@ -16,7 +16,6 @@ dotenv.load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 from .api.auth_api import router as auth_router
 from .api.project_api import router as project_router
 from .api.transcription_api import router as transcription_router
-from .api.pipeline_api import router as pipeline_router
 
 app = FastAPI(title="BestShotAI API", version="0.1.0")
 
@@ -51,4 +50,3 @@ async def health() -> dict[str, str]:
 app.include_router(auth_router)
 app.include_router(transcription_router)
 app.include_router(project_router)
-app.include_router(pipeline_router)

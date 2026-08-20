@@ -1,14 +1,13 @@
-"""
-Data models for transcription responses.
-"""
+"""Data models for transcription responses."""
 
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from typing import List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class WordTimestamp(BaseModel):
-    """Model for word-level timestamp data."""
-    
+    """A single transcribed word with its position in the clip."""
+
     word: str = Field(..., description="The transcribed word")
     start: float = Field(..., description="Start time in seconds")
     end: float = Field(..., description="End time in seconds")
@@ -16,50 +15,22 @@ class WordTimestamp(BaseModel):
 
 
 class Segment(BaseModel):
-    """Model for audio segment data."""
-    
-    id: int = Field(..., description="Segment ID")
+    """A recognised phrase, as returned by one Azure recognition event."""
+
+    id: int = Field(..., description="Segment index within the clip")
     start: float = Field(..., description="Start time in seconds")
     end: float = Field(..., description="End time in seconds")
     text: str = Field(..., description="Transcribed text for this segment")
-    words: List[WordTimestamp] = Field(..., description="Word-level timestamps for this segment")
-
-
-class TranscriptionMetadata(BaseModel):
-    """Model for transcription metadata."""
-    
-    model: str = Field(..., description="Model used for transcription")
-    processing_time: float = Field(..., description="Processing time in seconds")
-    timestamp: float = Field(..., description="Unix timestamp of processing")
-    language: Optional[str] = Field(None, description="Detected or specified language")
+    words: List[WordTimestamp] = Field(default_factory=list, description="Word-level timestamps")
 
 
 class TranscriptionResponse(BaseModel):
-    """Model for complete transcription response."""
-    
-    transcript: str = Field(..., description="Full transcribed text")
-    language: str = Field(..., description="Language code")
-    duration: float = Field(..., description="Audio duration in seconds")
-    words: List[WordTimestamp] = Field(..., description="Word-level timestamps")
-    segments: List[Segment] = Field(..., description="Audio segments")
-    metadata: TranscriptionMetadata = Field(..., description="Processing metadata")
-    
-    class Config:
-        json_encoders = {
-            # Add any custom encoders if needed
-        }
+    """Complete transcription payload returned by POST /api/transcribe."""
 
+    model_config = ConfigDict(populate_by_name=True)
 
-class TranscriptionRequest(BaseModel):
-    """Model for transcription request parameters."""
-    
-    language: str = Field(default="en", description="Language code for transcription")
-    filename: Optional[str] = Field(None, description="Original filename")
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "language": "en",
-                "filename": "audio.wav"
-            }
-        }
+    text: str = Field(..., description="Full transcribed text")
+    language: str = Field(..., description="BCP-47 locale of the transcript")
+    duration: float = Field(default=0.0, description="Transcribed audio duration in seconds")
+    words: List[WordTimestamp] = Field(default_factory=list, description="Word-level timestamps")
+    segments: List[Segment] = Field(default_factory=list, description="Recognised segments")

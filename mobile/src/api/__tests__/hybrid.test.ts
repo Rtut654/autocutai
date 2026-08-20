@@ -8,7 +8,7 @@ jest.mock('expo-file-system', () => ({
   })),
 }));
 
-const mockAnalyzeHybridProject = jest.fn(async (payload: any) => ({
+const mockAnalyzeHybridProject = jest.fn(async (_token: string, payload: any) => ({
   id: 'project-123',
   name: payload.name,
   status: 'completed',
@@ -21,76 +21,156 @@ const mockAnalyzeHybridProject = jest.fn(async (payload: any) => ({
   tracks: [],
 }));
 
-jest.mock('../client', () => ({
-  api: {
-    analyzeHybridProject: (payload: any) => mockAnalyzeHybridProject(payload),
-  },
+const mockTranscribeMedia = jest.fn(async () => ({
+  text: 'hello world',
+  language: 'en-US',
+  words: [
+    { word: 'hello', start: 0.1, end: 0.5, confidence: 0.9 },
+    { word: 'world', start: 0.6, end: 1.2, confidence: 0.9 },
+  ],
+  segments: [
+    {
+      start: 0.1,
+      end: 1.2,
+      text: 'hello world',
+      words: [
+        { word: 'hello', start: 0.1, end: 0.5 },
+        { word: 'world', start: 0.6, end: 1.2 },
+      ],
+    },
+  ],
 }));
 
-import { analyzeHybridProjectOnBackend, buildHybridTrackPayload } from '../hybrid';
+jest.mock('../client', () => ({
+  api: {
+    analyzeHybridProject: (token: string, payload: any) => mockAnalyzeHybridProject(token, payload),
+  },
+  transcribeMedia: (...args: any[]) => (mockTranscribeMedia as any)(...args),
+}));
 
-describe('hybrid mobile analysis', () => {
+import {
+  analyzeHybridProjectOnBackend,
+  buildHybridTrackPayload,
+  validateClipSelection,
+  MAX_CLIPS_PER_PROJECT,
+} from '../hybrid';
+
+const TOKEN = 'test-token';
+
+function clip(name: string, durationSeconds?: number) {
+  return { uri: `file:///tmp/${name}`, name, mimeType: 'video/mp4', durationSeconds };
+}
+
+describe('clip selection limits', () => {
+  it('accepts a selection inside the limits', () => {
+    expect(validateClipSelection([clip('a.mp4', 60), clip('b.mp4', 60)])).toBeNull();
+  });
+
+  it('rejects an empty selection', () => {
+    expect(validateClipSelection([])).toMatch(/at least one clip/i);
+  });
+
+  it('rejects more clips than the backend allows', () => {
+    const tooMany = Array.from({ length: MAX_CLIPS_PER_PROJECT + 1 }, (_, i) => clip(`c${i}.mp4`, 10));
+    expect(validateClipSelection(tooMany)).toMatch(/at most 10 clips/i);
+  });
+
+  it('rejects a selection over the total duration cap', () => {
+    const long = [clip('a.mp4', 600), clip('b.mp4', 600)];
+    expect(validateClipSelection(long)).toMatch(/15 minutes/i);
+  });
+
+  it('allows the selection through when durations are unknown', () => {
+    // The backend re-checks once ffprobe has read the real durations.
+    expect(validateClipSelection([clip('a.mp4'), clip('b.mp4')])).toBeNull();
+  });
+});
+
+describe('hybrid track payload', () => {
   beforeEach(() => {
     mockAnalyzeHybridProject.mockClear();
-    global.fetch = jest.fn(async () => ({
-      ok: true,
-      json: async () => ({
-        text: 'hello world',
-        language: 'en',
-        words: [
-          { text: 'hello', start: 0.0, end: 0.4 },
-          { text: 'world', start: 0.6, end: 1.0 },
-        ],
-        segments: [
-          {
-            start: 0.0,
-            end: 1.0,
-            text: 'hello world',
-            words: [
-              { text: 'hello', start: 0.0, end: 0.4 },
-              { text: 'world', start: 0.6, end: 1.0 },
-            ],
-          },
-        ],
+    mockTranscribeMedia.mockClear();
+  });
+
+  it('transcribes through the backend rather than a third-party endpoint', async () => {
+    await buildHybridTrackPayload(TOKEN, clip('a.mp4'));
+
+    expect(mockTranscribeMedia).toHaveBeenCalledTimes(1);
+    expect((mockTranscribeMedia as any).mock.calls[0][0]).toBe(TOKEN);
+  });
+
+  it('keeps the local file reference so the source never leaves the device', async () => {
+    const payload = await buildHybridTrackPayload(TOKEN, clip('a.mp4'));
+
+    expect(payload.source_reference).toBe('file:///tmp/a.mp4');
+    expect(payload.metadata.hybrid_prepared_on_device).toBe(true);
+  });
+
+  it('prefers a known duration over one estimated from the transcript', async () => {
+    const payload = await buildHybridTrackPayload(TOKEN, clip('a.mp4', 42));
+
+    expect(payload.duration).toBe(42);
+  });
+
+  it('falls back to the transcript end when duration is unknown', async () => {
+    const payload = await buildHybridTrackPayload(TOKEN, clip('a.mp4'));
+
+    expect(payload.duration).toBe(1.2);
+  });
+
+  it('derives recorded_at from the file modification time', async () => {
+    const payload = await buildHybridTrackPayload(TOKEN, clip('a.mp4'));
+
+    expect(payload.recorded_at).toBe(new Date(1711900800 * 1000).toISOString());
+  });
+});
+
+describe('analyzeHybridProjectOnBackend', () => {
+  beforeEach(() => {
+    mockAnalyzeHybridProject.mockClear();
+    mockTranscribeMedia.mockClear();
+  });
+
+  it('sends the auth token and one track per clip', async () => {
+    const result = await analyzeHybridProjectOnBackend({
+      token: TOKEN,
+      name: 'Trip',
+      files: [clip('a.mp4', 30), clip('b.mp4', 30)],
+    });
+
+    expect(result.id).toBe('project-123');
+    const [token, payload] = mockAnalyzeHybridProject.mock.calls[0] as any[];
+    expect(token).toBe(TOKEN);
+    expect(payload.tracks).toHaveLength(2);
+    expect(payload.render_strategy).toBe('on_device');
+  });
+
+  it('reports progress as each clip is transcribed', async () => {
+    const seen: Array<[number, number]> = [];
+
+    await analyzeHybridProjectOnBackend({
+      token: TOKEN,
+      name: 'Trip',
+      files: [clip('a.mp4', 30), clip('b.mp4', 30)],
+      onProgress: (done, total) => seen.push([done, total]),
+    });
+
+    expect(seen).toEqual([
+      [1, 2],
+      [2, 2],
+    ]);
+  });
+
+  it('refuses an oversized selection before uploading anything', async () => {
+    await expect(
+      analyzeHybridProjectOnBackend({
+        token: TOKEN,
+        name: 'Trip',
+        files: [clip('a.mp4', 600), clip('b.mp4', 600)],
       }),
-      text: async () => '',
-    })) as any;
-  });
+    ).rejects.toThrow(/15 minutes/i);
 
-  it('builds a hybrid track payload from local clip metadata and direct whisper transcription', async () => {
-    const payload = await buildHybridTrackPayload({
-      uri: 'file:///clips/clip-a.mov',
-      name: 'clip-a.mov',
-      mimeType: 'video/quicktime',
-      lastModified: 1711900800000,
-    });
-
-    expect(payload.filename).toBe('clip-a.mov');
-    expect(payload.duration).toBe(1);
-    expect(payload.recorded_at).toBe('2024-03-31T16:00:00.000Z');
-    expect(payload.metadata.size_bytes).toBe(4096);
-    expect(payload.transcription.text).toBe('hello world');
-  });
-
-  it('sends only compact track analysis payloads to the backend', async () => {
-    const project = await analyzeHybridProjectOnBackend({
-      name: 'Hybrid Edit',
-      files: [
-        {
-          uri: 'file:///clips/clip-a.mov',
-          name: 'clip-a.mov',
-          mimeType: 'video/quicktime',
-        },
-      ],
-    });
-
-    expect(project.id).toBe('project-123');
-    expect(mockAnalyzeHybridProject).toHaveBeenCalledTimes(1);
-    const request = mockAnalyzeHybridProject.mock.calls[0][0] as any;
-    expect(request.render_strategy).toBe('on_device');
-    expect(request.tracks).toHaveLength(1);
-    expect(request.tracks[0].filename).toBe('clip-a.mov');
-    expect(request.tracks[0].source_reference).toBe('file:///clips/clip-a.mov');
-    expect(request.tracks[0].transcription.text).toBe('hello world');
+    expect(mockTranscribeMedia).not.toHaveBeenCalled();
+    expect(mockAnalyzeHybridProject).not.toHaveBeenCalled();
   });
 });

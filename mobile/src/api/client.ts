@@ -62,7 +62,7 @@ export type AuthSession = {
   user: MeUser;
 };
 
-type ProjectSummary = {
+export type ProjectSummary = {
   id: string;
   name: string;
   status: string;
@@ -279,14 +279,15 @@ export const api = {
     return api.activatePayment(token, mappedPlan);
   },
 
-  async listProjects(limit = 100, offset = 0) {
+  async listProjects(token: string, limit = 100, offset = 0) {
     return request<{ projects: ProjectSummary[]; total: number }>(
       `/api/projects/?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`,
       { method: 'GET' },
+      token,
     );
   },
 
-  async analyzeHybridProject(payload: {
+  async analyzeHybridProject(token: string, payload: {
     name: string;
     description?: string;
     tracks: Array<Record<string, unknown>>;
@@ -310,6 +311,7 @@ export const api = {
           render_strategy: payload.render_strategy || 'on_device',
         }),
       },
+      token,
     );
     return response.project;
   },
@@ -330,10 +332,13 @@ export const api = {
   },
 };
 
-export async function createProject(payload: {
-  name: string;
-  files: { uri: string; name: string; mimeType?: string; recordedAt?: string }[];
-}) {
+export async function createProject(
+  token: string,
+  payload: {
+    name: string;
+    files: { uri: string; name: string; mimeType?: string; recordedAt?: string }[];
+  },
+) {
   const form = new FormData();
   form.append('name', payload.name);
   form.append('smart_pause_cutter', 'true');
@@ -356,26 +361,51 @@ export async function createProject(payload: {
   const res = await fetch(`${API_BASE_URL}/api/projects/`, {
     method: 'POST',
     body: form,
+    headers: { Authorization: `Bearer ${token}` },
   });
 
   return check<{ project: { id: string } }>(res);
 }
 
-export async function processProjectSync(projectId: string) {
-  const res = await fetch(`${API_BASE_URL}/api/projects/${projectId}/process-sync`, { method: 'POST' });
-  return check<any>(res);
+export async function processProjectSync(token: string, projectId: string) {
+  return request<any>(`/api/projects/${projectId}/process-sync`, { method: 'POST' }, token);
 }
 
-export async function getTimeline(projectId: string) {
-  const res = await fetch(`${API_BASE_URL}/api/projects/${projectId}/timeline`);
-  return check<any>(res);
+export async function getTimeline(token: string, projectId: string) {
+  return request<any>(`/api/projects/${projectId}/timeline`, { method: 'GET' }, token);
 }
 
-export async function getRenderManifest(projectId: string) {
-  const res = await fetch(`${API_BASE_URL}/api/projects/${projectId}/render-manifest`);
-  return check<any>(res);
+export async function getRenderManifest(token: string, projectId: string) {
+  return request<any>(`/api/projects/${projectId}/render-manifest`, { method: 'GET' }, token);
 }
 
+/**
+ * Download URL for a finished render. The request needs an Authorization header,
+ * so callers must pass one (FileSystem.downloadAsync accepts headers).
+ */
 export function downloadOutput(projectId: string) {
   return `${API_BASE_URL}/api/projects/${projectId}/download`;
+}
+
+/** Transcribe a local media file through our backend (Azure Speech server-side). */
+export async function transcribeMedia(
+  token: string,
+  file: { uri: string; name: string; mimeType?: string },
+  language = 'en-US',
+): Promise<any> {
+  const form = new FormData();
+  form.append('file', {
+    uri: file.uri,
+    name: file.name,
+    type: file.mimeType || 'video/mp4',
+  } as any);
+  form.append('language', language);
+
+  const res = await fetch(`${API_BASE_URL}/api/transcribe`, {
+    method: 'POST',
+    body: form,
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  return check<any>(res);
 }

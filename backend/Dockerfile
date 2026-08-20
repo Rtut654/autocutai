@@ -5,13 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
     UVICORN_RELOAD=false \
-    UPLOAD_DIR=/app/data/uploads \
-    OUTPUT_DIR=/app/data/outputs
+    AUTOCUT_DATA_DIR=/app/data
 
 WORKDIR /app
 
+# ffmpeg for media work; libssl/ca-certificates are required by the
+# Azure Speech SDK's native library.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -23,7 +24,7 @@ COPY app ./app
 COPY main.py ./main.py
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /app/data/uploads /app/data/outputs \
+    && mkdir -p /app/data \
     && chown -R appuser:appuser /app
 
 USER appuser

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -39,7 +40,7 @@ from ..services.pipeline_service import (
     write_word_level_srt,
 )
 from ..services.video_processor import VideoProcessor
-from ..services.whisper_service import transcribe_audio
+from ..services.azure_speech_service import transcribe_file as transcribe_audio_file
 from ..models.transcription import WordTimestamp
 
 logger = logging.getLogger(__name__)
@@ -55,14 +56,20 @@ VISUAL_STOP_WORDS = {
 class ProjectService:
     """Service for managing video editing projects."""
 
-    def __init__(self, projects_dir: str = "projects", temp_dir: str = "temp"):
-        repo_root = Path(__file__).resolve().parents[3]
-        self.projects_dir = (repo_root / projects_dir).resolve() if not Path(projects_dir).is_absolute() else Path(projects_dir)
-        self.temp_dir = (repo_root / temp_dir).resolve() if not Path(temp_dir).is_absolute() else Path(temp_dir)
+    def __init__(self, projects_dir: str | None = None, temp_dir: str | None = None):
+        # AUTOCUT_DATA_DIR is the deployment knob: in Docker it points at a
+        # mounted volume. Without it we fall back to the repo checkout, which
+        # is what local development wants.
+        data_root = Path(os.getenv("AUTOCUT_DATA_DIR") or Path(__file__).resolve().parents[3])
+        projects_dir = projects_dir or os.getenv("AUTOCUT_PROJECTS_DIR") or "projects"
+        temp_dir = temp_dir or os.getenv("AUTOCUT_TEMP_DIR") or "temp"
+        self.projects_dir = Path(projects_dir) if Path(projects_dir).is_absolute() else (data_root / projects_dir).resolve()
+        self.temp_dir = Path(temp_dir) if Path(temp_dir).is_absolute() else (data_root / temp_dir).resolve()
         self.projects_dir.mkdir(parents=True, exist_ok=True)
-        self.temp_dir.mkdir(exist_ok=True)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.projects: Dict[str, Project] = {}
         self._active_transcription_jobs: set[str] = set()
+        self.transcription_language = os.getenv("AZURE_SPEECH_LANGUAGE", "en-US")
         logger.info("ProjectService initialized")
 
     async def create_project(self, request: ProjectCreateRequest, user_id: Optional[str] = None) -> Project:
@@ -199,6 +206,11 @@ class ProjectService:
                 project = await self._load_project(project_file)
                 if self._sync_background_track_defaults(project):
                     await self._save_project(project)
+                # Repair state written by earlier versions: re-sanitise stored
+                # transcripts, refresh capture times and geometry from the media,
+                # and re-sort. Only on the disk-load path - a cache hit has
+                # already been through this.
+                await self._sanitize_existing_project_state(project)
                 self.projects[project_id] = project
                 if not user_id or project.user_id == user_id:
                     return project
@@ -1604,32 +1616,19 @@ class ProjectService:
         audio_dir: Path,
         transcript_dir: Path,
     ) -> None:
-        audio_path = track.file_path
-        if track.type == TrackType.VIDEO:
-            audio_output_path = self._reserve_named_output(audio_dir, Path(track.filename).stem, ".wav")
-            extracted_audio_path = await processor.extract_audio_for_transcription(track.file_path, str(audio_output_path))
-            audio_path = extracted_audio_path
-            track.metadata["audio_path"] = extracted_audio_path
+        # Azure only accepts uncompressed WAV, so every track - audio or video -
+        # goes through the same 16 kHz mono extraction.
+        audio_output_path = self._reserve_named_output(audio_dir, Path(track.filename).stem, ".wav")
+        audio_path = await processor.extract_audio_for_transcription(track.file_path, str(audio_output_path))
+        track.metadata["audio_path"] = audio_path
 
         try:
             silence_ranges = await processor.detect_silence_ranges(audio_path, noise_db=-40.0, min_silence_duration=0.08)
         except Exception:
             silence_ranges = []
 
-        chunked_transcription = await self._transcribe_audio_with_chunking(
-            audio_path,
-            track.duration,
-            silence_ranges,
-            processor=processor,
-        )
-        if chunked_transcription is not None:
-            sanitized = sanitize_transcription_payload(chunked_transcription, track.duration)
-        else:
-            with open(audio_path, "rb") as handle:
-                audio_data = handle.read()
-            transcription_filename = Path(audio_path).name
-            raw_transcription = await transcribe_audio(audio_data, transcription_filename, "en")
-            sanitized = sanitize_transcription_payload(raw_transcription, track.duration)
+        raw_transcription = await transcribe_audio_file(audio_path, self.transcription_language)
+        sanitized = sanitize_transcription_payload(raw_transcription, track.duration)
 
         if silence_ranges:
             sanitized = self._align_transcription_to_detected_silence(sanitized, silence_ranges, track.duration)
@@ -1640,7 +1639,7 @@ class ProjectService:
             {
                 "text": sanitized.get("text", ""),
                 "words": [word.model_dump() for word in words],
-                "language": sanitized.get("language", "en"),
+                "language": sanitized.get("language", self.transcription_language),
                 "segments": sanitized.get("segments", []),
             }
             if words or sanitized.get("text")
@@ -1650,111 +1649,6 @@ class ProjectService:
         transcript_text_path = self._reserve_named_output(transcript_dir, Path(track.filename).stem, ".txt")
         transcript_text_path.write_text((track.transcription or {}).get("text", ""), encoding="utf-8")
         track.metadata["transcript_path"] = str(transcript_text_path)
-
-    async def _transcribe_audio_with_chunking(
-        self,
-        audio_path: str,
-        duration: float,
-        silence_ranges: List[tuple[float, float]],
-        *,
-        processor: VideoProcessor,
-    ) -> Optional[Dict[str, Any]]:
-        windows = self._build_transcription_windows(silence_ranges, duration)
-        if len(windows) <= 1:
-            return None
-
-        chunk_dir = self.temp_dir / "transcription_chunks"
-        chunk_dir.mkdir(parents=True, exist_ok=True)
-        merged_words: List[Dict[str, Any]] = []
-        merged_segments: List[Dict[str, Any]] = []
-        segment_id = 0
-
-        for idx, (nominal_start, nominal_end) in enumerate(windows):
-            padded_start = max(0.0, nominal_start - 0.15)
-            padded_end = min(float(duration), nominal_end + 0.15)
-            if padded_end - padded_start < 0.2:
-                continue
-
-            chunk_path = chunk_dir / f"{Path(audio_path).stem}-{idx + 1}.wav"
-            await processor.extract_audio_segment(audio_path, chunk_path, padded_start, padded_end)
-            try:
-                chunk_bytes = chunk_path.read_bytes()
-                raw_chunk = await transcribe_audio(chunk_bytes, chunk_path.name, "en")
-            finally:
-                chunk_path.unlink(missing_ok=True)
-
-            sanitized_chunk = sanitize_transcription_payload(raw_chunk, padded_end - padded_start)
-            chunk_words = normalize_words(sanitized_chunk.get("words", []))
-            kept_words: List[Dict[str, Any]] = []
-            for word in chunk_words:
-                absolute_start = padded_start + float(word.start)
-                absolute_end = padded_start + float(word.end)
-                midpoint = (absolute_start + absolute_end) / 2
-                if midpoint < nominal_start - 0.03 or midpoint > nominal_end + 0.03:
-                    continue
-                kept_words.append(
-                    {
-                        "word": word.word,
-                        "start": round(max(0.0, absolute_start), 3),
-                        "end": round(max(absolute_start, absolute_end), 3),
-                        "confidence": word.confidence,
-                    }
-                )
-
-            if not kept_words:
-                continue
-
-            merged_words.extend(kept_words)
-            merged_segments.append(
-                {
-                    "id": segment_id,
-                    "start": kept_words[0]["start"],
-                    "end": kept_words[-1]["end"],
-                    "text": " ".join(word["word"] for word in kept_words).strip(),
-                    "words": kept_words,
-                }
-            )
-            segment_id += 1
-
-        if not merged_words:
-            return None
-
-        return {
-            "text": " ".join(word["word"] for word in merged_words).strip(),
-            "words": merged_words,
-            "segments": merged_segments,
-            "language": "en",
-        }
-
-    @staticmethod
-    def _build_transcription_windows(
-        silence_ranges: List[tuple[float, float]],
-        duration: float,
-        *,
-        min_window_duration: float = 0.3,
-        max_window_duration: float = 3.5,
-    ) -> List[tuple[float, float]]:
-        if duration <= 0:
-            return []
-
-        sorted_silences = sorted((max(0.0, start), max(0.0, end)) for start, end in silence_ranges if end > start)
-        speech_ranges: List[tuple[float, float]] = []
-        cursor = 0.0
-        for silence_start, silence_end in sorted_silences:
-            if silence_start - cursor >= min_window_duration:
-                speech_ranges.append((cursor, silence_start))
-            cursor = max(cursor, silence_end)
-        if duration - cursor >= min_window_duration:
-            speech_ranges.append((cursor, duration))
-
-        windows: List[tuple[float, float]] = []
-        for speech_start, speech_end in speech_ranges:
-            current = speech_start
-            while current < speech_end - min_window_duration:
-                next_end = min(speech_end, current + max_window_duration)
-                windows.append((round(current, 3), round(next_end, 3)))
-                current = next_end
-        return windows
 
     def _create_track_from_hybrid_input(self, track: HybridTrackInput, position: int) -> VideoTrack:
         transcription = sanitize_transcription_payload(track.transcription or {}, float(track.duration or 0.0))

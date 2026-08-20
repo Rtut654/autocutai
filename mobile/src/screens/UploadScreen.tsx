@@ -10,17 +10,23 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as DocumentPicker from "expo-document-picker";
-import { analyzeHybridProjectOnBackend } from "../api/hybrid";
+import {
+  analyzeHybridProjectOnBackend,
+  validateClipSelection,
+  LocalHybridClip,
+  MAX_CLIPS_PER_PROJECT,
+  MAX_TOTAL_DURATION_SECONDS,
+} from "../api/hybrid";
 
 type Props = {
+  token: string;
   onProjectReady: (projectId: string) => void;
 };
 
-export default function UploadScreen({ onProjectReady }: Props) {
-  const [clips, setClips] = useState<
-    { uri: string; name: string; mimeType?: string; lastModified?: number | null }[]
-  >([]);
+export default function UploadScreen({ token, onProjectReady }: Props) {
+  const [clips, setClips] = useState<LocalHybridClip[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
   const pickClips = async () => {
     try {
@@ -30,14 +36,18 @@ export default function UploadScreen({ onProjectReady }: Props) {
         copyToCacheDirectory: true,
       });
       if (!result.canceled) {
-        setClips(
-          result.assets.map((a) => ({
-            uri: a.uri,
-            name: a.name,
-            mimeType: a.mimeType,
-            lastModified: typeof a.lastModified === "number" ? a.lastModified : null,
-          }))
-        );
+        const picked = result.assets.map((a) => ({
+          uri: a.uri,
+          name: a.name,
+          mimeType: a.mimeType,
+          lastModified: typeof a.lastModified === "number" ? a.lastModified : null,
+        }));
+        const problem = validateClipSelection(picked);
+        if (problem) {
+          Alert.alert("Too much footage", problem);
+          return;
+        }
+        setClips(picked);
       }
     } catch (err: any) {
       Alert.alert("Selection failed", err?.message || "Unable to pick videos.");
@@ -47,21 +57,25 @@ export default function UploadScreen({ onProjectReady }: Props) {
   const startProcessing = async () => {
     if (clips.length === 0) return;
     setUploading(true);
+    setProgress({ done: 0, total: clips.length });
     try {
       const result = await analyzeHybridProjectOnBackend({
-        name: `Hybrid Edit ${new Date().toLocaleDateString()}`,
+        token,
+        name: `Trip edit ${new Date().toLocaleDateString()}`,
         files: clips,
         settings: {
           smart_pause_cutter: true,
           generate_subtitles: true,
           insert_suggestions: true,
         },
+        onProgress: (done, total) => setProgress({ done, total }),
       });
       onProjectReady(result.id);
     } catch (err: any) {
       Alert.alert("Analysis failed", err?.message || "Unknown error");
     } finally {
       setUploading(false);
+      setProgress(null);
     }
   };
 
@@ -69,7 +83,8 @@ export default function UploadScreen({ onProjectReady }: Props) {
     <SafeAreaView style={styles.container} edges={["top"]}>
       <Text style={styles.title}>Upload</Text>
       <Text style={styles.subtitle}>
-        Select clips. The app transcribes them directly from your device, then sends only analysis data to the backend.
+        Pick up to {MAX_CLIPS_PER_PROJECT} clips, {MAX_TOTAL_DURATION_SECONDS / 60} minutes total. Your footage stays on
+        this device; only the audio is sent for transcription.
       </Text>
 
       <View style={styles.card}>
@@ -92,7 +107,14 @@ export default function UploadScreen({ onProjectReady }: Props) {
             />
 
             {uploading ? (
-              <ActivityIndicator size="large" color="#031b33" />
+              <View style={styles.progressBlock}>
+                <ActivityIndicator size="large" color="#031b33" />
+                {progress ? (
+                  <Text style={styles.count}>
+                    Transcribing clip {Math.min(progress.done + 1, progress.total)} of {progress.total}
+                  </Text>
+                ) : null}
+              </View>
             ) : (
               <Pressable style={styles.processButton} onPress={startProcessing}>
                 <Text style={styles.buttonText}>
@@ -156,6 +178,11 @@ const styles = StyleSheet.create({
   },
   list: {
     flex: 1,
+  },
+  progressBlock: {
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 8,
   },
   item: {
     paddingVertical: 6,

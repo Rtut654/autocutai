@@ -63,7 +63,7 @@ function MainTabs({
         name="Upload"
         options={{ tabBarIcon: ({ focused, color }) => tabIcon('movie-open-plus-outline', focused, color) }}
       >
-        {() => <UploadScreen onProjectReady={onProjectReady} />}
+        {() => <UploadScreen token={session.access_token} onProjectReady={onProjectReady} />}
       </Tab.Screen>
       <Tab.Screen
         name="Projects"
@@ -85,7 +85,7 @@ function MainTabs({
           unmountOnBlur: true,
         }}
       >
-        {(props: any) => <HistoryScreen {...props} />}
+        {(props: any) => <HistoryScreen {...props} token={session.access_token} />}
       </Tab.Screen>
       <Tab.Screen
         name="Profile"

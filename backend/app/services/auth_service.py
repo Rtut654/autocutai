@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import uuid
 from pathlib import Path
@@ -13,9 +14,10 @@ from ..models.auth import AuthUser, LoginRequest, OnboardingData, SignupRequest
 
 
 class AuthService:
-    def __init__(self) -> None:
+    def __init__(self, state_file: Optional[Path] = None) -> None:
         backend_root = Path(__file__).resolve().parents[2]
-        self.state_file = backend_root / ".runtime" / "auth_state.json"
+        default_state = Path(os.getenv("AUTOCUT_AUTH_STATE_FILE") or backend_root / ".runtime" / "auth_state.json")
+        self.state_file = Path(state_file) if state_file else default_state
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.users_by_email: Dict[str, AuthUser] = {}
         self.tokens_to_user_id: Dict[str, str] = {}
@@ -24,8 +26,22 @@ class AuthService:
         self.users_by_provider_identity: Dict[str, str] = {}
         self._load_state()
 
-    def configure(self, _db_path=None) -> None:
-        """Compatibility no-op for older tests and startup paths."""
+    def configure(self, state_file=None) -> None:
+        """Point the service at a different state file.
+
+        Tests use this so a run never writes session tokens into the
+        repository's checked-in state file.
+        """
+        if state_file is None:
+            return None
+        self.state_file = Path(state_file)
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.users_by_email.clear()
+        self.tokens_to_user_id.clear()
+        self.refresh_tokens_to_user_id.clear()
+        self.users_by_id.clear()
+        self.users_by_provider_identity.clear()
+        self._load_state()
         return None
 
     def reset_for_tests(self) -> None:

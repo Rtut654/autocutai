@@ -7,6 +7,6 @@ pydantic==2.7.4
 python-multipart==0.0.9
 aiofiles==23.2.1
 openai==1.35.0
-scenedetect==0.6.3
 Pillow==10.3.0
 numpy==1.26.4
+azure-cognitiveservices-speech==1.38.0
