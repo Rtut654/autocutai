@@ -36,7 +36,11 @@ def test_backend_dockerfile_uses_ffmpeg_and_uvicorn_entrypoint():
     dockerfile = read("backend/Dockerfile")
 
     assert "FROM python:3.11-slim" in dockerfile
-    assert "apt-get install -y --no-install-recommends ffmpeg" in dockerfile
+    assert "ffmpeg" in dockerfile
+    # Runtime dependencies of the Azure Speech SDK's native libraries. Missing
+    # these fails at first request, not at build time.
+    for package in ("libssl3", "libuuid1", "libasound2"):
+        assert package in dockerfile
     assert "COPY requirements.txt ./" in dockerfile
     assert "pip install -r requirements.txt" in dockerfile
     assert 'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]' in dockerfile

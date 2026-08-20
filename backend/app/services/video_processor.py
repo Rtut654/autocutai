@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import re
 import wave
 import uuid
@@ -13,7 +14,8 @@ from typing import Any, Dict, List
 
 from PIL import Image, ImageDraw, ImageFont
 
-from ..models.project import EditMode, Project, SubtitleCue, VideoTrack, VisualPlanPart, ZoomPreviewBeat
+from ..models.project import Project, SubtitleCue, VideoTrack, VisualPlanPart, ZoomPreviewBeat
+from .final_render import DEFAULT_SAMPLE_RATE, RenderPlan, build_filter_graph
 
 logger = logging.getLogger(__name__)
 
@@ -122,34 +124,108 @@ class VideoProcessor:
             overlay_dir.rmdir()
         return str(target)
 
-    async def process_project(self, project: Project) -> str:
-        output_dir = self._project_output_dir(project)
-        tracks = project.tracks
-        if project.settings.edit_mode == EditMode.CHRONOLOGICAL:
-            tracks = sorted(tracks, key=lambda t: t.position)
+    async def render_final_video(self, plan: RenderPlan, output_path: str | Path) -> str:
+        """Render a whole project in one encode.
 
-        processed_tracks: List[VideoTrack] = []
-        for track in tracks:
-            processed_tracks.append(await self._process_track(track, project))
+        Every segment is normalised onto the plan's canvas before concatenation,
+        so mixed resolutions, frame rates and rotations - the normal case for
+        travel footage - assemble correctly instead of failing or tearing.
+        """
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-        merged = await self._combine_tracks(
-            processed_tracks,
-            apply_gap_cuts=project.settings.smart_pause_cutter,
-            output_dir=output_dir,
+        try:
+            await self._run_final_render(plan, target, include_subtitles=True)
+        except RuntimeError as exc:
+            if plan.subtitle_path and self._can_skip_subtitle_burn(exc):
+                logger.warning("Subtitles filter unavailable, rendering without burn-in: %s", exc)
+                await self._run_final_render(plan, target, include_subtitles=False)
+            else:
+                raise
+        return str(target)
+
+    async def _run_final_render(self, plan: RenderPlan, target: Path, *, include_subtitles: bool) -> None:
+        graph, extra_inputs, video_label, audio_label = build_filter_graph(
+            plan, include_subtitles=include_subtitles
         )
 
-        if project.settings.generate_subtitles and project.pipeline.subtitle_path:
-            subtitle_file = Path(project.pipeline.subtitle_path)
-            if subtitle_file.exists():
-                try:
-                    merged = await self._burn_subtitles(merged, subtitle_file, output_dir)
-                except RuntimeError as exc:
-                    if self._can_skip_subtitle_burn(exc):
-                        logger.warning("Skipping subtitle burn-in: %s", exc)
-                    else:
-                        raise
+        # Long graphs blow past command-line length limits, so pass via a file.
+        script_path = target.parent / f".filter_{uuid.uuid4().hex}.txt"
+        script_path.write_text(graph, encoding="utf-8")
 
-        return merged
+        inputs: List[str] = []
+        for clip in plan.clips:
+            inputs.extend(["-i", str(Path(clip.source_path).resolve())])
+
+        cmd = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            *inputs,
+            *extra_inputs,
+            "-filter_complex_script",
+            str(script_path),
+            "-map",
+            f"[{video_label}]",
+            "-map",
+            f"[{audio_label}]",
+            *self._video_encoder_args(),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            str(DEFAULT_SAMPLE_RATE),
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(target),
+        ]
+        try:
+            await self._run_ffmpeg_command(cmd)
+        finally:
+            script_path.unlink(missing_ok=True)
+
+    def _video_encoder_args(self) -> List[str]:
+        """Encoder settings, overridable for GPU hosts.
+
+        Set AUTOCUT_VIDEO_ENCODER=h264_nvenc on a GPU box for roughly an order
+        of magnitude more throughput; the default is CPU x264.
+        """
+        encoder = os.getenv("AUTOCUT_VIDEO_ENCODER", "libx264")
+        if encoder == "libx264":
+            return [
+                "-c:v",
+                "libx264",
+                "-preset",
+                os.getenv("AUTOCUT_VIDEO_PRESET", "veryfast"),
+                "-crf",
+                os.getenv("AUTOCUT_VIDEO_CRF", "20"),
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        return [
+            "-c:v",
+            encoder,
+            "-preset",
+            os.getenv("AUTOCUT_VIDEO_PRESET", "p4"),
+            "-cq",
+            os.getenv("AUTOCUT_VIDEO_CRF", "23"),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+    async def probe_has_audio(self, source_path: str | Path) -> bool:
+        """Whether a source carries an audio stream.
+
+        Silent clips are common in travel footage - drone shots, timelapses -
+        and the concat filter needs matching stream counts on every input.
+        """
+        try:
+            info = await self.get_video_info(str(source_path))
+        except Exception:
+            return True
+        streams = info.get("streams") or []
+        return any(stream.get("codec_type") == "audio" for stream in streams)
 
     async def extract_audio_for_transcription(self, source_path: str, output_path: str) -> str:
         """Extract a mono 16 kHz WAV track for Whisper-style transcription."""
@@ -1023,92 +1099,6 @@ class VideoProcessor:
             "idea_burst": "Idea",
         }
         return mapping.get(str(part.animation_kind or ""), "Visual")
-
-    async def _process_track(self, track: VideoTrack, project: Project) -> VideoTrack:
-        return track
-
-    def _keep_segments_for_track(self, track: VideoTrack, apply_gap_cuts: bool) -> List[tuple[float, float]]:
-        if not apply_gap_cuts or not track.local_gap_ranges:
-            if track.duration <= 0:
-                return []
-            return [(0.0, track.duration)]
-
-        gaps = sorted(track.local_gap_ranges, key=lambda g: g.start)
-        keep_segments: List[tuple[float, float]] = []
-        current = 0.0
-        for gap in gaps:
-            if gap.start > current:
-                keep_segments.append((current, gap.start))
-            current = max(current, gap.end)
-        if current < track.duration:
-            keep_segments.append((current, track.duration))
-
-        filtered_segments = [(start, end) for start, end in keep_segments if end - start >= 0.08]
-        if filtered_segments:
-            return filtered_segments
-        if track.duration <= 0:
-            return []
-        return [(0.0, min(track.duration, 0.1))]
-
-    async def _combine_tracks(self, tracks: List[VideoTrack], apply_gap_cuts: bool = False, output_dir: Path | None = None) -> str:
-        target_dir = output_dir or self.temp_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        concat_lines: List[str] = []
-        for track in tracks:
-            source_path = str(Path(track.file_path).resolve())
-            keep_segments = self._keep_segments_for_track(track, apply_gap_cuts)
-            for start, end in keep_segments:
-                concat_lines.append(f"file '{source_path}'")
-                if start > 0:
-                    concat_lines.append(f"inpoint {start:.3f}")
-                if end > 0:
-                    concat_lines.append(f"outpoint {end:.3f}")
-
-        if not concat_lines:
-            raise RuntimeError("No usable video ranges were available to render")
-
-        concat_file = target_dir / f"concat_all_{uuid.uuid4().hex}.txt"
-        concat_file.write_text("\n".join(concat_lines), encoding="utf-8")
-        out = target_dir / "output.mp4"
-        cmd = [
-            self.ffmpeg_path,
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-            "-y",
-            str(out),
-        ]
-        try:
-            await self._run_ffmpeg_command(cmd)
-        finally:
-            concat_file.unlink(missing_ok=True)
-        return str(out)
-
-    async def _burn_subtitles(self, video_path: str, subtitle_path: Path, output_dir: Path) -> str:
-        out = output_dir / f"subbed_{uuid.uuid4().hex}.mp4"
-        subtitle_filter = f"subtitles=filename='{self._escape_filter_value(subtitle_path.resolve().as_posix())}'"
-        cmd = [
-            self.ffmpeg_path,
-            "-i",
-            video_path,
-            "-vf",
-            subtitle_filter,
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-            "-y",
-            str(out),
-        ]
-        await self._run_ffmpeg_command(cmd)
-        return str(out)
 
     def _project_output_dir(self, project: Project) -> Path:
         if project.output_path:

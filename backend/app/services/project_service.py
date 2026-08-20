@@ -39,6 +39,13 @@ from ..services.pipeline_service import (
     write_subtitles_srt,
     write_word_level_srt,
 )
+from ..services.final_render import (
+    RenderClip,
+    RenderPlan,
+    canvas_for_aspect_ratio,
+    clamp_time_to_output,
+    remap_time_to_output,
+)
 from ..services.video_processor import VideoProcessor
 from ..services.azure_speech_service import transcribe_file as transcribe_audio_file
 from ..models.transcription import WordTimestamp
@@ -1590,14 +1597,14 @@ class ProjectService:
                 await self._save_project(project)
 
             try:
-                await self._transcribe_track(
+                status = await self._transcribe_track(
                     project,
                     track,
                     processor=processor,
                     audio_dir=audio_dir,
                     transcript_dir=transcript_dir,
                 )
-                self._set_track_transcript_status(track, "completed")
+                self._set_track_transcript_status(track, status)
             except Exception as exc:
                 self._set_track_transcript_status(track, "error", str(exc))
                 if not continue_on_error:
@@ -1615,9 +1622,20 @@ class ProjectService:
         processor: VideoProcessor,
         audio_dir: Path,
         transcript_dir: Path,
-    ) -> None:
-        # Azure only accepts uncompressed WAV, so every track - audio or video -
-        # goes through the same 16 kHz mono extraction.
+    ) -> str:
+        """Transcribe one track and return its resulting transcript status."""
+        # Silent sources are normal in travel footage - drone shots, timelapses,
+        # muted clips. ffmpeg cannot write a WAV with no input stream, so
+        # extracting first would fail the whole project. Skip straight to
+        # "no narration" instead, which also saves a billed Azure call.
+        if not await processor.probe_has_audio(track.file_path):
+            track.has_voice = False
+            track.transcription = None
+            track.local_gap_ranges = []
+            return "not_applicable"
+
+        # Azure only accepts uncompressed WAV, so every track goes through the
+        # same 16 kHz mono extraction.
         audio_output_path = self._reserve_named_output(audio_dir, Path(track.filename).stem, ".wav")
         audio_path = await processor.extract_audio_for_transcription(track.file_path, str(audio_output_path))
         track.metadata["audio_path"] = audio_path
@@ -1649,6 +1667,7 @@ class ProjectService:
         transcript_text_path = self._reserve_named_output(transcript_dir, Path(track.filename).stem, ".txt")
         transcript_text_path.write_text((track.transcription or {}).get("text", ""), encoding="utf-8")
         track.metadata["transcript_path"] = str(transcript_text_path)
+        return "completed"
 
     def _create_track_from_hybrid_input(self, track: HybridTrackInput, position: int) -> VideoTrack:
         transcription = sanitize_transcription_payload(track.transcription or {}, float(track.duration or 0.0))
@@ -1783,8 +1802,114 @@ class ProjectService:
         }
 
     async def _generate_final_video(self, project: Project) -> str:
+        if not project.user_id:
+            raise ValueError("Project owner missing")
+
         processor = VideoProcessor()
-        return await processor.process_project(project)
+        plan, output_words = await self._build_final_render_plan(project, processor=processor)
+        if not plan.clips:
+            raise RuntimeError("No usable clips were available to render")
+
+        # Subtitles must be timed against the *rendered* timeline, not the raw
+        # one, or every cut shifts them out of sync.
+        if project.settings.generate_subtitles and output_words:
+            transcript_dir = self.get_project_transcript_dir(project.user_id, project.id)
+            final_subtitle_path = transcript_dir / f"{project.id}_final_subtitles.srt"
+            write_subtitles_srt(build_subtitle_cues(output_words), final_subtitle_path)
+            plan.subtitle_path = str(final_subtitle_path)
+
+        output_dir = self.get_project_renders_dir(project.user_id, project.id)
+        output_path = self._reserve_named_output(output_dir, "final", ".mp4")
+        return await processor.render_final_video(plan, output_path)
+
+    async def _build_final_render_plan(
+        self,
+        project: Project,
+        *,
+        processor: VideoProcessor,
+    ) -> tuple[RenderPlan, List[WordTimestamp]]:
+        """Turn the project's current edit state into a renderable plan.
+
+        Per-clip cuts come from the speech-filter artifact when the user has
+        one - that is where their manual edits live - and fall back to the
+        automatic gap ranges. Excluded and background clips are left out.
+        """
+        width, height = canvas_for_aspect_ratio(
+            project.settings.aspect_ratio.value
+            if hasattr(project.settings.aspect_ratio, "value")
+            else str(project.settings.aspect_ratio)
+        )
+        plan = RenderPlan(clips=[], width=width, height=height)
+        output_words: List[WordTimestamp] = []
+        output_offset = 0.0
+
+        for track in self._ordered_tracks(project.tracks, project.settings.edit_mode):
+            if track.excluded:
+                continue
+            if track.type != TrackType.VIDEO:
+                continue
+            # Background clips are included inline, in their chronological slot.
+            # They are auto-classified from "has no narration", which is exactly
+            # what silent drone and landscape footage looks like - dropping them
+            # would make the clip disappear from the user's export. Once overlay
+            # compositing exists, clips with an accepted placement move there.
+
+            source_path = self._resolve_project_media_path(project, track.file_path)
+            if source_path is None or not source_path.exists():
+                logger.warning("Skipping track %s: media not found", track.id)
+                continue
+
+            segments = await self._effective_keep_segments(project, track)
+            if not segments:
+                continue
+
+            plan.clips.append(
+                RenderClip(
+                    source_path=str(source_path),
+                    segments=segments,
+                    has_audio=await processor.probe_has_audio(source_path),
+                )
+            )
+
+            for word in normalize_words((track.transcription or {}).get("words", [])):
+                start = remap_time_to_output(word.start, segments)
+                if start is None:
+                    continue
+                end = clamp_time_to_output(word.end, segments)
+                output_words.append(
+                    word.model_copy(
+                        update={
+                            "start": round(output_offset + start, 3),
+                            "end": round(output_offset + max(start, end), 3),
+                        }
+                    )
+                )
+
+            output_offset += sum(end - start for start, end in segments)
+
+        return plan, output_words
+
+    async def _effective_keep_segments(self, project: Project, track: VideoTrack) -> List[tuple[float, float]]:
+        """The ranges of a clip that survive into the final cut."""
+        duration = float(track.duration or 0.0)
+        if duration <= 0:
+            return []
+
+        artifact = await self.get_track_speech_filter(project.id, track.id, user_id=project.user_id)
+        if artifact is not None:
+            # The user has reviewed this clip; their cuts win over the automatic ones.
+            return self._segments_from_cut_ranges(duration, artifact.cuts)
+
+        if not track.has_voice:
+            # A clip with no narration is b-roll, not one long pause. Travel
+            # edits are full of silent drone and landscape shots and the pause
+            # cutter must not delete them.
+            return [(0.0, round(duration, 3))]
+
+        if project.settings.smart_pause_cutter and track.local_gap_ranges:
+            return self._segments_from_cut_ranges(duration, track.local_gap_ranges)
+
+        return [(0.0, round(duration, 3))]
 
     @staticmethod
     def _build_keep_ranges(duration: float, gaps: List[Any], auto_cut_enabled: bool) -> List[Dict[str, float]]:

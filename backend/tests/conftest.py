@@ -170,12 +170,29 @@ def fake_media_tools(monkeypatch, media_calls):
             ],
         }
 
-    async def process_project(self, project):
-        output_dir = self._project_output_dir(project)
+    async def probe_has_audio(self, source_path):
+        return True
+
+    async def render_final_video(self, plan, output_path):
+        # Exercise the real graph builder so a broken filter chain fails here
+        # rather than silently at render time on a real device.
+        from backend.app.services.final_render import build_filter_graph
+
+        graph, extra_inputs, video_label, audio_label = build_filter_graph(plan)
         media_calls.combines.append(
-            {"project_id": project.id, "tracks": [track.id for track in project.tracks if not track.excluded]}
+            {
+                "clips": [clip.source_path for clip in plan.clips],
+                "segments": [clip.usable_segments() for clip in plan.clips],
+                "width": plan.width,
+                "height": plan.height,
+                "subtitle_path": plan.subtitle_path,
+                "graph": graph,
+                "extra_inputs": extra_inputs,
+                "video_label": video_label,
+                "audio_label": audio_label,
+            }
         )
-        return _touch(Path(output_dir) / f"{project.id}_final.mp4")
+        return _touch(output_path)
 
     for name, impl in [
         ("extract_audio_for_transcription", extract_audio_for_transcription),
@@ -189,7 +206,8 @@ def fake_media_tools(monkeypatch, media_calls):
         ("burn_subtitles", burn_subtitles),
         ("ensure_browser_playable_video", ensure_browser_playable_video),
         ("get_video_info", get_video_info),
-        ("process_project", process_project),
+        ("probe_has_audio", probe_has_audio),
+        ("render_final_video", render_final_video),
     ]:
         monkeypatch.setattr(VideoProcessor, name, impl)
 

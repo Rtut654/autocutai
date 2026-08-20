@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -682,3 +683,191 @@ def test_deleting_a_project_removes_it(project_env):
     assert project_env["client"].get(
         f"/api/projects/{project_id}", headers=project_env["headers"]
     ).status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Final render plan
+# --------------------------------------------------------------------------
+
+
+def _last_cue_end_seconds(srt_body: str) -> float:
+    """End timestamp of the final cue in an SRT, in seconds."""
+    ends = [line.split(" --> ")[1].strip() for line in srt_body.splitlines() if " --> " in line]
+    hours, minutes, rest = ends[-1].split(":")
+    seconds, millis = rest.split(",")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
+
+
+def _process(env, clips, **settings):
+    project_id = create_project(env["client"], env["headers"], clips, **settings).json()["project"]["id"]
+    env["client"].post(f"/api/projects/{project_id}/process-sync", headers=env["headers"])
+    return project_id
+
+
+def test_projects_render_onto_the_canvas_their_aspect_ratio_asks_for(project_env):
+    _process(project_env, [project_env["make_clip"]("a.mp4")], aspect_ratio="vertical")
+
+    render = project_env["media"].combines[-1]
+    assert (render["width"], render["height"]) == (1080, 1920)
+
+
+def test_horizontal_projects_render_onto_a_landscape_canvas(project_env):
+    _process(project_env, [project_env["make_clip"]("a.mp4")], aspect_ratio="horizontal")
+
+    render = project_env["media"].combines[-1]
+    assert (render["width"], render["height"]) == (1920, 1080)
+
+
+def test_auto_cut_removes_the_detected_pause_from_the_render(project_env):
+    _process(project_env, [project_env["make_clip"]("a.mp4")])
+
+    segments = project_env["media"].combines[-1]["segments"][0]
+    # The fixture transcript pauses from 1.95s to 3.60s and the last word ends
+    # at 5.60s, so both the mid-clip pause and the trailing dead air come out.
+    assert segments == [(0.0, 1.95), (3.6, 5.6)]
+
+
+def test_auto_cut_off_keeps_the_whole_clip(project_env):
+    _process(project_env, [project_env["make_clip"]("a.mp4")], smart_pause_cutter=False)
+
+    assert project_env["media"].combines[-1]["segments"][0] == [(0.0, 12.0)]
+
+
+def test_user_cuts_override_the_automatic_ones(project_env):
+    """Option B: the render must reflect what the user actually edited."""
+    project_id = _process(project_env, [project_env["make_clip"]("a.mp4")])
+    track_id = project_env["client"].get(
+        f"/api/projects/{project_id}", headers=project_env["headers"]
+    ).json()["project"]["tracks"][0]["id"]
+    project_env["client"].post(
+        f"/api/projects/{project_id}/tracks/{track_id}/speech-filter", headers=project_env["headers"]
+    )
+    project_env["client"].patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/speech-filter",
+        json={"cuts": [{"start": 5.0, "end": 9.0, "duration": 4.0, "reason": "manual", "transcript": "", "confidence": 1.0}]},
+        headers=project_env["headers"],
+    )
+
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+
+    assert project_env["media"].combines[-1]["segments"][0] == [(0.0, 5.0), (9.0, 12.0)]
+
+
+def test_excluded_clips_are_left_out_of_the_render(project_env):
+    clips = [project_env["make_clip"]("a.mp4"), project_env["make_clip"]("b.mp4")]
+    project_id = create_project(project_env["client"], project_env["headers"], clips).json()["project"]["id"]
+    track_id = project_env["client"].get(
+        f"/api/projects/{project_id}", headers=project_env["headers"]
+    ).json()["project"]["tracks"][0]["id"]
+    project_env["client"].patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/exclude", headers=project_env["headers"]
+    )
+
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+
+    assert len(project_env["media"].combines[-1]["clips"]) == 1
+
+
+def test_silent_broll_survives_the_pause_cutter(project_env, monkeypatch):
+    """A clip with no narration is b-roll, not one long removable pause."""
+    async def silent(audio_path, language=None):
+        return {"text": "", "words": [], "segments": [], "language": "en-US"}
+
+    monkeypatch.setattr("backend.app.services.project_service.transcribe_audio_file", silent)
+
+    _process(project_env, [project_env["make_clip"]("drone.mp4")])
+
+    render = project_env["media"].combines[-1]
+    assert len(render["clips"]) == 1
+    assert render["segments"][0] == [(0.0, 12.0)]
+
+
+def test_subtitles_are_retimed_onto_the_cut_timeline(project_env):
+    """Cutting a pause must move every later subtitle earlier by the same amount."""
+    project_id = _process(project_env, [project_env["make_clip"]("a.mp4")])
+
+    render = project_env["media"].combines[-1]
+    assert render["subtitle_path"] is not None
+    body = Path(render["subtitle_path"]).read_text(encoding="utf-8")
+
+    kept = sum(end - start for start, end in render["segments"][0])
+    last_cue_end = _last_cue_end_seconds(body)
+
+    # Subtitles must fit inside the cut timeline. Against the source timeline
+    # the final word ends at 5.60s; after the pause is removed it lands at 3.95s.
+    assert last_cue_end == pytest.approx(kept, abs=0.01)
+    assert last_cue_end < 5.6
+
+
+def test_no_subtitles_are_generated_when_the_setting_is_off(project_env):
+    _process(project_env, [project_env["make_clip"]("a.mp4")], generate_subtitles=False)
+
+    assert project_env["media"].combines[-1]["subtitle_path"] is None
+
+
+def test_each_render_writes_a_new_file_rather_than_overwriting(project_env):
+    project_id = _process(project_env, [project_env["make_clip"]("a.mp4")])
+    first = project_env["client"].get(
+        f"/api/projects/{project_id}", headers=project_env["headers"]
+    ).json()["project"]["output_path"]
+
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+    second = project_env["client"].get(
+        f"/api/projects/{project_id}", headers=project_env["headers"]
+    ).json()["project"]["output_path"]
+
+    assert first != second
+
+
+def test_multi_clip_render_offsets_subtitles_across_clips(project_env):
+    _process(project_env, [project_env["make_clip"]("a.mp4"), project_env["make_clip"]("b.mp4")])
+
+    render = project_env["media"].combines[-1]
+    assert len(render["clips"]) == 2
+
+    kept = sum(end - start for clip in render["segments"] for start, end in clip)
+    body = Path(render["subtitle_path"]).read_text(encoding="utf-8")
+
+    # The second clip's words are offset by the first clip's *kept* duration,
+    # not its source duration, so the cues span the whole rendered output.
+    assert _last_cue_end_seconds(body) == pytest.approx(kept, abs=0.01)
+    assert kept == pytest.approx(2 * 3.95, abs=0.01)
+
+
+def test_a_source_with_no_audio_stream_is_not_sent_for_transcription(project_env, monkeypatch):
+    """ffmpeg cannot extract a WAV from a silent source; do not try."""
+    from backend.app.services.video_processor import VideoProcessor
+
+    async def no_audio(self, source_path):
+        return False
+
+    monkeypatch.setattr(VideoProcessor, "probe_has_audio", no_audio)
+
+    project_id = _process(project_env, [project_env["make_clip"]("drone.mp4")])
+
+    assert project_env["transcription"] == []
+    assert project_env["media"].audio_extractions == []
+    track = project_env["client"].get(
+        f"/api/projects/{project_id}", headers=project_env["headers"]
+    ).json()["project"]["tracks"][0]
+    assert track["has_voice"] is False
+    assert track["metadata"]["transcript_status"] == "not_applicable"
+
+
+def test_a_silent_clip_does_not_fail_the_whole_project(project_env, monkeypatch):
+    from backend.app.services.video_processor import VideoProcessor
+
+    async def only_second_clip_is_silent(self, source_path):
+        return "drone" not in str(source_path)
+
+    monkeypatch.setattr(VideoProcessor, "probe_has_audio", only_second_clip_is_silent)
+    clips = [project_env["make_clip"]("talking.mp4"), project_env["make_clip"]("drone.mp4")]
+
+    project_id = create_project(project_env["client"], project_env["headers"], clips).json()["project"]["id"]
+    response = project_env["client"].post(
+        f"/api/projects/{project_id}/process-sync", headers=project_env["headers"]
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["project"]["status"] == "completed"
+    assert len(project_env["media"].combines[-1]["clips"]) == 2
