@@ -24,6 +24,7 @@ from ..models.project import (
     ProjectListResponse,
     ProjectResponse,
     ProjectSettings,
+    ProjectSettingsPatch,
     TrackReorderRequest,
     ProjectUpdateRequest,
     SpeechFilterArtifact,
@@ -84,22 +85,10 @@ def _is_duplicate_track_upload(project, filename: str, size: int) -> bool:
 
 
 def _resolve_existing_project_path(path_value: str | None, project_id: str, current_user_id: str) -> Path:
-    if not path_value:
+    resolved = project_service.resolve_owned_path(current_user_id, project_id, path_value)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Media file not found")
-
-    candidates = [
-        Path(path_value),
-        Path.cwd() / path_value,
-        Path.cwd().parent / path_value,
-        project_service.get_project_dir(current_user_id, project_id, create=True) / Path(path_value).name,
-        project_service.get_project_video_dir(current_user_id, project_id) / Path(path_value).name,
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    raise HTTPException(status_code=404, detail="Media file not found")
+    return resolved
 
 
 @router.post("/hybrid-analyze", response_model=ProjectResponse)
@@ -242,6 +231,25 @@ async def update_project(project_id: str, request: ProjectUpdateRequest, current
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return ProjectResponse(project=project, message="Project updated successfully")
+
+
+@router.patch("/{project_id}/settings", response_model=ProjectResponse)
+async def update_project_settings(
+    project_id: str,
+    request: ProjectSettingsPatch,
+    current_user=Depends(get_current_user),
+):
+    """Change how the edit looks. Takes effect on the next render."""
+    project = await project_service.get_project(project_id, user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    changes = request.model_dump(exclude_none=True)
+    merged = project.settings.model_copy(update=changes)
+    updated = await project_service.update_project(
+        project_id, ProjectUpdateRequest(settings=ProjectSettings(**merged.model_dump())), user_id=current_user.id
+    )
+    return ProjectResponse(project=updated, message="Settings updated")
 
 
 @router.delete("/{project_id}")

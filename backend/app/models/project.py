@@ -455,7 +455,27 @@ class ProjectUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, description="Project name")
     description: Optional[str] = Field(None, description="Project description")
     settings: Optional[ProjectSettings] = Field(None, description="Project settings")
-    tracks: Optional[List[VideoTrack]] = Field(None, description="Project tracks")
+    # Tracks are deliberately not updatable here. Each track carries a server
+    # file path, and accepting them from a client let it point a track at any
+    # file on the server and download it through the media endpoint. Tracks
+    # change through the reorder, exclude and add-tracks endpoints instead.
+
+    model_config = {"extra": "forbid"}
+
+
+class ProjectSettingsPatch(BaseModel):
+    """A partial settings change; fields left out keep their current value."""
+
+    model_config = {"extra": "forbid"}
+
+    caption_style: Optional[Literal["bold", "boxed", "clean", "none"]] = None
+    fill_mode: Optional[Literal["blur", "crop", "black"]] = None
+    audio_cleanup: Optional[bool] = None
+    broll_max_seconds: Optional[float] = Field(default=None, ge=0.0, le=60.0)
+    generate_subtitles: Optional[bool] = None
+    smart_pause_cutter: Optional[bool] = None
+    aspect_ratio: Optional[AspectRatio] = None
+    min_gap_seconds: Optional[float] = Field(default=None, ge=0.3, le=10.0)
 
 
 class TrackReorderRequest(BaseModel):

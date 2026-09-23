@@ -247,8 +247,6 @@ class ProjectService:
             project.description = request.description
         if request.settings is not None:
             project.settings = request.settings
-        if request.tracks is not None:
-            project.tracks = request.tracks
 
         project.tracks = self._ordered_tracks(project.tracks, project.settings.edit_mode)
         project.updated_at = datetime.utcnow()
@@ -487,22 +485,39 @@ class ProjectService:
             changed = True
         return changed
 
-    def _resolve_project_media_path(self, project: Project, path_value: str | None) -> Optional[Path]:
-        if not path_value or not project.user_id:
+    def resolve_owned_path(self, user_id: str, project_id: str, path_value: str | None) -> Optional[Path]:
+        """Resolve a stored media path, but only inside the owner's project.
+
+        Paths come from project state, which has at times been writable by
+        clients. Anything that resolves outside this project's directory -
+        another user's footage, the auth state file, /etc/passwd - is refused,
+        including via symlinks.
+        """
+        if not path_value or not user_id or not project_id:
             return None
 
+        project_dir = self.get_project_dir(user_id, project_id, create=True).resolve()
+        name = Path(path_value).name
         candidates = [
             Path(path_value),
             Path.cwd() / path_value,
             Path.cwd().parent / path_value,
-            self.get_project_dir(project.user_id, project.id, create=True) / Path(path_value).name,
-            self.get_project_video_dir(project.user_id, project.id) / Path(path_value).name,
+            project_dir / name,
+            self.get_project_video_dir(user_id, project_id) / name,
         ]
-
         for candidate in candidates:
-            if candidate.exists():
-                return candidate
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if resolved.is_relative_to(project_dir) and resolved.is_file():
+                return resolved
         return None
+
+    def _resolve_project_media_path(self, project: Project, path_value: str | None) -> Optional[Path]:
+        if not project.user_id:
+            return None
+        return self.resolve_owned_path(project.user_id, project.id, path_value)
 
     @classmethod
     def _align_transcription_to_detected_silence(

@@ -1011,3 +1011,178 @@ def test_a_silent_clip_is_probed_once_not_on_every_render(project_env, monkeypat
         f"/api/projects/{project_id}/status", headers=project_env["headers"]
     ).json()
     assert status["progress"] == 100.0
+
+
+# --------------------------------------------------------------------------
+# Media access is confined to the owner's project
+# --------------------------------------------------------------------------
+
+
+def test_tracks_cannot_be_rewritten_through_project_update(project_env, isolated_storage):
+    """A client used to be able to point a track at any server file and download it."""
+    secret = isolated_storage.root / "server_secret.txt"
+    secret.write_text("SERVER SECRET", encoding="utf-8")
+    project = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")]
+    ).json()["project"]
+    project["tracks"][0]["file_path"] = str(secret)
+
+    response = project_env["client"].put(
+        f"/api/projects/{project['id']}", json={"tracks": project["tracks"]}, headers=project_env["headers"]
+    )
+
+    assert response.status_code == 422
+    media = project_env["client"].get(
+        f"/api/projects/{project['id']}/tracks/{project['tracks'][0]['id']}/media", headers=project_env["headers"]
+    )
+    assert b"SERVER SECRET" not in media.content
+
+
+def test_a_stored_path_outside_the_project_is_never_served(project_env, isolated_storage):
+    """Defence in depth for state written before the update endpoint was closed."""
+    from backend.app.services.project_service import project_service
+
+    secret = isolated_storage.root / "other_users_video.mp4"
+    secret.write_bytes(b"NOT YOURS")
+    project_id = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")]
+    ).json()["project"]["id"]
+    project = next(iter(project_service.projects.values()))
+    project.tracks[0].file_path = str(secret)
+
+    media = project_env["client"].get(
+        f"/api/projects/{project_id}/tracks/{project.tracks[0].id}/media", headers=project_env["headers"]
+    )
+
+    assert media.status_code == 404
+    assert b"NOT YOURS" not in media.content
+
+
+def test_symlinks_out_of_the_project_are_refused(project_env, isolated_storage):
+    from backend.app.services.project_service import project_service
+
+    secret = isolated_storage.root / "elsewhere.txt"
+    secret.write_text("OUTSIDE", encoding="utf-8")
+    project_id = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")]
+    ).json()["project"]["id"]
+    project = next(iter(project_service.projects.values()))
+    link = Path(project.tracks[0].file_path).with_name("link.mp4")
+    link.symlink_to(secret)
+    project.tracks[0].file_path = str(link)
+
+    media = project_env["client"].get(
+        f"/api/projects/{project_id}/tracks/{project.tracks[0].id}/media", headers=project_env["headers"]
+    )
+
+    assert media.status_code == 404
+
+
+def test_the_owners_own_media_is_still_served(project_env):
+    project = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")]
+    ).json()["project"]
+
+    media = project_env["client"].get(
+        f"/api/projects/{project['id']}/tracks/{project['tracks'][0]['id']}/media", headers=project_env["headers"]
+    )
+
+    assert media.status_code == 200
+
+
+# --------------------------------------------------------------------------
+# Changing the look after upload
+# --------------------------------------------------------------------------
+
+
+def test_new_projects_get_the_research_backed_defaults(project_env):
+    settings = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")]
+    ).json()["project"]["settings"]
+
+    assert settings["caption_style"] == "bold"
+    assert settings["fill_mode"] == "blur"
+    assert settings["audio_cleanup"] is True
+    assert settings["broll_max_seconds"] == 6.0
+
+
+def test_upload_accepts_the_edit_options(project_env):
+    settings = create_project(
+        project_env["client"],
+        project_env["headers"],
+        [project_env["make_clip"]("a.mp4")],
+        caption_style="clean",
+        fill_mode="crop",
+        audio_cleanup=False,
+        broll_max_seconds=10,
+    ).json()["project"]["settings"]
+
+    assert (settings["caption_style"], settings["fill_mode"]) == ("clean", "crop")
+    assert settings["audio_cleanup"] is False
+    assert settings["broll_max_seconds"] == 10.0
+
+
+def test_settings_patch_changes_only_what_is_sent(project_env):
+    project_id = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")], aspect_ratio="vertical"
+    ).json()["project"]["id"]
+
+    response = project_env["client"].patch(
+        f"/api/projects/{project_id}/settings", json={"caption_style": "boxed"}, headers=project_env["headers"]
+    )
+
+    settings = response.json()["project"]["settings"]
+    assert settings["caption_style"] == "boxed"
+    assert settings["aspect_ratio"] == "vertical"
+    assert settings["fill_mode"] == "blur"
+
+
+def test_settings_patch_rejects_unknown_values(project_env):
+    project_id = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")]
+    ).json()["project"]["id"]
+
+    bad_style = project_env["client"].patch(
+        f"/api/projects/{project_id}/settings", json={"caption_style": "comic-sans"}, headers=project_env["headers"]
+    )
+    unknown_field = project_env["client"].patch(
+        f"/api/projects/{project_id}/settings", json={"output_path": "/etc/passwd"}, headers=project_env["headers"]
+    )
+
+    assert bad_style.status_code == 422
+    assert unknown_field.status_code == 422
+
+
+def test_a_changed_style_is_used_by_the_next_render(project_env):
+    project_id = _process(project_env, [project_env["make_clip"]("a.mp4")])
+    project_env["client"].patch(
+        f"/api/projects/{project_id}/settings",
+        json={"caption_style": "none", "fill_mode": "black"},
+        headers=project_env["headers"],
+    )
+
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+
+    render = project_env["media"].combines[-1]
+    assert render["subtitle_path"] is None
+    # The fixture clip is portrait on the default landscape canvas, so the
+    # chosen fill decides the framing.
+    assert "color=black" in render["graph"]
+    assert "boxblur" not in render["graph"]
+
+
+def test_another_user_cannot_change_my_settings(project_env, client):
+    project_id = create_project(
+        project_env["client"], project_env["headers"], [project_env["make_clip"]("a.mp4")]
+    ).json()["project"]["id"]
+    other = client.post(
+        "/api/auth/signup", json={"email": "intruder@example.com", "password": "password123"}
+    ).json()["access_token"]
+
+    response = client.patch(
+        f"/api/projects/{project_id}/settings",
+        json={"caption_style": "none"},
+        headers={"Authorization": f"Bearer {other}"},
+    )
+
+    assert response.status_code == 404
