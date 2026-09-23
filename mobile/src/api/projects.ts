@@ -56,10 +56,30 @@ export type ProjectTrack = {
   metadata?: Record<string, unknown>;
 };
 
+export type CaptionStyle = 'bold' | 'boxed' | 'clean' | 'none';
+export type FillMode = 'blur' | 'crop' | 'black';
+
+/** How the finished edit looks. Mirrors ProjectSettings on the backend. */
+export type EditOptions = {
+  caption_style: CaptionStyle;
+  fill_mode: FillMode;
+  audio_cleanup: boolean;
+  broll_max_seconds: number;
+};
+
+/** The defaults the backend applies; chosen from creator research. */
+export const DEFAULT_EDIT_OPTIONS: EditOptions = {
+  caption_style: 'bold',
+  fill_mode: 'blur',
+  audio_cleanup: true,
+  broll_max_seconds: 6,
+};
+
 export type Project = {
   id: string;
   name: string;
   status: 'draft' | 'processing' | 'completed' | 'error';
+  settings?: Partial<EditOptions> & { aspect_ratio?: 'vertical' | 'horizontal' };
   output_path?: string | null;
   error_message?: string | null;
   created_at?: string;
@@ -121,6 +141,7 @@ export async function createProjectFromClips(
   name: string,
   clips: PickedClip[],
   onProgress?: (progress: UploadProgress & { clipIndex: number; clipCount: number }) => void,
+  options: EditOptions = DEFAULT_EDIT_OPTIONS,
 ): Promise<Project> {
   const problem = validateSelection(clips);
   if (problem) throw new Error(problem);
@@ -141,8 +162,12 @@ export async function createProjectFromClips(
           name,
           aspect_ratio: 'vertical',
           smart_pause_cutter: 'true',
-          generate_subtitles: 'true',
           insert_suggestions: 'false',
+          caption_style: options.caption_style,
+          generate_subtitles: options.caption_style === 'none' ? 'false' : 'true',
+          fill_mode: options.fill_mode,
+          audio_cleanup: String(options.audio_cleanup),
+          broll_max_seconds: String(options.broll_max_seconds),
           capture_times_json: JSON.stringify([clip.recordedAt]),
           metadata_json: JSON.stringify([{ source: 'ios_photo_library' }]),
         };
@@ -203,6 +228,34 @@ export async function getProject(token: string, projectId: string): Promise<Proj
 export async function listProjects(token: string): Promise<Project[]> {
   const response = await authorizedRequest<{ projects: Project[] }>('/api/projects/?limit=100&offset=0', token);
   return response.projects;
+}
+
+/** Change how the edit looks. Takes effect on the next render. */
+export async function updateEditOptions(
+  token: string,
+  projectId: string,
+  changes: Partial<EditOptions>,
+): Promise<Project> {
+  const body: Record<string, unknown> = { ...changes };
+  if (changes.caption_style) {
+    body.generate_subtitles = changes.caption_style !== 'none';
+  }
+  const response = await authorizedRequest<{ project: Project }>(`/api/projects/${projectId}/settings`, token, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
+  return response.project;
+}
+
+/** The edit options stored on a project, with defaults for anything missing. */
+export function editOptionsOf(project: Project | null | undefined): EditOptions {
+  const settings = project?.settings || {};
+  return {
+    caption_style: settings.caption_style ?? DEFAULT_EDIT_OPTIONS.caption_style,
+    fill_mode: settings.fill_mode ?? DEFAULT_EDIT_OPTIONS.fill_mode,
+    audio_cleanup: settings.audio_cleanup ?? DEFAULT_EDIT_OPTIONS.audio_cleanup,
+    broll_max_seconds: settings.broll_max_seconds ?? DEFAULT_EDIT_OPTIONS.broll_max_seconds,
+  };
 }
 
 export async function deleteProject(token: string, projectId: string): Promise<void> {

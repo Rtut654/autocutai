@@ -15,11 +15,14 @@ import * as MediaLibrary from 'expo-media-library';
 import { useVideoPlayer, VideoView } from 'expo-video';
 
 import {
+  EditOptions,
   Project,
   ProjectTrack,
   SpeechFilterArtifact,
   SpeechFilterCut,
   downloadFinalVideo,
+  editOptionsOf,
+  updateEditOptions,
   generateSpeechFilter,
   getProject,
   getSpeechFilter,
@@ -30,6 +33,7 @@ import {
   toggleTrackExcluded,
   trackMediaUrl,
 } from '../api/projects';
+import EditOptionsPanel from '../components/EditOptionsPanel';
 
 type Props = {
   token: string;
@@ -69,6 +73,13 @@ export default function EditorScreen({ token, projectId, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [exportedUri, setExportedUri] = useState<string | null>(null);
+  const [options, setOptions] = useState<EditOptions | null>(null);
+  const [optionsDirty, setOptionsDirty] = useState(false);
+  const [lookOpen, setLookOpen] = useState(false);
+  // Read inside load() without making load's identity depend on it, which
+  // would refetch the project and restart polling on every toggle.
+  const optionsDirtyRef = useRef(false);
+  optionsDirtyRef.current = optionsDirty;
 
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -77,6 +88,8 @@ export default function EditorScreen({ token, projectId, onClose }: Props) {
       setError(null);
       const fresh = await getProject(token, projectId);
       setProject(fresh);
+      // Keep unsaved choices if the user is mid-edit when a poll refreshes.
+      setOptions((current) => (current && optionsDirtyRef.current ? current : editOptionsOf(fresh)));
       return fresh;
     } catch (err: any) {
       setError(err?.message || 'Could not load this project.');
@@ -191,9 +204,18 @@ export default function EditorScreen({ token, projectId, onClose }: Props) {
     }
   };
 
+  const changeOptions = (next: EditOptions) => {
+    setOptions(next);
+    setOptionsDirty(true);
+  };
+
   const renderFinal = async () => {
     setBusy('Starting render');
     try {
+      if (options && optionsDirty) {
+        await updateEditOptions(token, projectId, options);
+        setOptionsDirty(false);
+      }
       // Persist every clip the user opened before rendering.
       for (const track of visibleTracks) {
         if (cutsByTrack[track.id]) await saveTrack(track);
@@ -290,6 +312,25 @@ export default function EditorScreen({ token, projectId, onClose }: Props) {
             busy={busy}
             exported={Boolean(exportedUri)}
           />
+        ) : null}
+
+        {options ? (
+          <View style={styles.lookCard}>
+            <Pressable style={styles.lookHead} onPress={() => setLookOpen((open) => !open)}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.statusTitle}>Look of the edit</Text>
+                <Text style={styles.trackMeta}>
+                  {optionsDirty ? 'Changed — applies when you render' : 'Captions, framing, scenery and audio'}
+                </Text>
+              </View>
+              <MaterialCommunityIcons name={lookOpen ? 'chevron-up' : 'chevron-down'} size={22} color="#60748a" />
+            </Pressable>
+            {lookOpen ? (
+              <View style={styles.lookBody}>
+                <EditOptionsPanel value={options} onChange={changeOptions} disabled={isProcessing} />
+              </View>
+            ) : null}
+          </View>
         ) : null}
 
         <Text style={styles.sectionTitle}>Clips</Text>
@@ -408,7 +449,7 @@ export default function EditorScreen({ token, projectId, onClose }: Props) {
             <ActivityIndicator color="#fff" size="small" />
           ) : (
             <Text style={styles.saveButtonText}>
-              {isReady ? 'Re-render with my changes' : 'Render my cut'}
+              {isReady || optionsDirty ? 'Re-render with my changes' : 'Render my cut'}
             </Text>
           )}
         </Pressable>
@@ -510,6 +551,9 @@ const styles = StyleSheet.create({
   trackMeta: { color: '#60748a', fontSize: 13, marginTop: 3 },
   trackBody: { paddingHorizontal: 14, paddingBottom: 14, gap: 12, borderTopWidth: 1, borderTopColor: '#eef2f7' },
   preview: { width: '100%', height: 190, borderRadius: 10, backgroundColor: '#0b1a2b', marginTop: 12 },
+  lookCard: { backgroundColor: '#fff', borderRadius: 12, borderWidth: 1, borderColor: '#cfdded', overflow: 'hidden' },
+  lookHead: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 14 },
+  lookBody: { paddingHorizontal: 14, paddingBottom: 16, borderTopWidth: 1, borderTopColor: '#eef2f7', paddingTop: 14 },
   finalCard: { backgroundColor: '#fff', borderRadius: 12, borderWidth: 1, borderColor: '#cfdded', padding: 14, gap: 12 },
   finalPreview: { width: '100%', height: 260, borderRadius: 10, backgroundColor: '#0b1a2b' },
   bulkRow: { flexDirection: 'row', gap: 18 },

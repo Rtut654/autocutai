@@ -13,6 +13,13 @@ jest.mock('../../api/projects', () => ({
   downloadFinalVideo: jest.fn(),
   listProjects: jest.fn(),
   deleteProject: jest.fn(),
+  updateEditOptions: jest.fn(),
+  editOptionsOf: (project: any) => ({
+    caption_style: project?.settings?.caption_style ?? 'bold',
+    fill_mode: project?.settings?.fill_mode ?? 'blur',
+    audio_cleanup: project?.settings?.audio_cleanup ?? true,
+    broll_max_seconds: project?.settings?.broll_max_seconds ?? 6,
+  }),
   trackMediaUrl: () => 'https://example.test/media',
   projectDownloadUrl: () => 'https://example.test/download',
 }));
@@ -33,6 +40,7 @@ const MOCKED_CALLS = [
   'downloadFinalVideo',
   'listProjects',
   'deleteProject',
+  'updateEditOptions',
 ];
 
 function resetMocks() {
@@ -235,6 +243,64 @@ describe('EditorScreen', () => {
     const { getByText } = render(<EditorScreen token={TOKEN} projectId="project-1" onClose={jest.fn()} />);
 
     await waitFor(() => expect(getByText('Network unreachable')).toBeTruthy());
+  });
+});
+
+describe('EditorScreen: look of the edit', () => {
+  beforeEach(() => {
+    resetMocks();
+    projectsApi.getProject.mockResolvedValue(project({ settings: { caption_style: 'bold' } }) as never);
+    projectsApi.getSpeechFilter.mockResolvedValue({ cuts: CUTS } as never);
+    projectsApi.startProcessing.mockResolvedValue(undefined as never);
+    projectsApi.updateEditOptions.mockResolvedValue(project() as never);
+  });
+
+  it('shows the current look collapsed until asked', async () => {
+    const { getByText, queryByText } = render(
+      <EditorScreen token={TOKEN} projectId="project-1" onClose={jest.fn()} />,
+    );
+
+    await waitFor(() => expect(getByText('Look of the edit')).toBeTruthy());
+    expect(queryByText('Captions')).toBeNull();
+
+    fireEvent.press(getByText('Look of the edit'));
+
+    expect(getByText('Captions')).toBeTruthy();
+    expect(getByText('Framing')).toBeTruthy();
+    expect(getByText('Clean up audio')).toBeTruthy();
+  });
+
+  it('saves a changed style before rendering, and only then', async () => {
+    const { getByText, getByLabelText } = render(
+      <EditorScreen token={TOKEN} projectId="project-1" onClose={jest.fn()} />,
+    );
+    await waitFor(() => getByText('Look of the edit'));
+    fireEvent.press(getByText('Look of the edit'));
+
+    fireEvent.press(getByLabelText('Captions: Clean'));
+
+    expect(getByText(/applies when you render/i)).toBeTruthy();
+    expect(projectsApi.updateEditOptions).not.toHaveBeenCalled();
+
+    fireEvent.press(getByText('Re-render with my changes'));
+
+    await waitFor(() => expect(projectsApi.startProcessing).toHaveBeenCalled());
+    const [, , options] = projectsApi.updateEditOptions.mock.calls[0] as any[];
+    expect(options.caption_style).toBe('clean');
+    // Settings are saved before the render starts, so the render uses them.
+    expect(projectsApi.updateEditOptions.mock.invocationCallOrder[0]).toBeLessThan(
+      projectsApi.startProcessing.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('does not touch settings when nothing changed', async () => {
+    const { getByText } = render(<EditorScreen token={TOKEN} projectId="project-1" onClose={jest.fn()} />);
+    await waitFor(() => getByText('Render my cut'));
+
+    fireEvent.press(getByText('Render my cut'));
+
+    await waitFor(() => expect(projectsApi.startProcessing).toHaveBeenCalled());
+    expect(projectsApi.updateEditOptions).not.toHaveBeenCalled();
   });
 });
 

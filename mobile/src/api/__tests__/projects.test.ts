@@ -27,7 +27,13 @@ jest.mock('expo-file-system', () => {
   };
 });
 
+const mockFetch = jest.fn();
+(global as any).fetch = mockFetch;
+
 import {
+  DEFAULT_EDIT_OPTIONS,
+  editOptionsOf,
+  updateEditOptions,
   MAX_CLIPS_PER_PROJECT,
   MAX_TOTAL_DURATION_SECONDS,
   PickedClip,
@@ -226,5 +232,78 @@ describe('downloadFinalVideo', () => {
     mockDownloadFileAsync.mockRejectedValueOnce(new Error('HTTP 404') as never);
 
     await expect(downloadFinalVideo(TOKEN, 'p1')).rejects.toThrow(/could not download/i);
+  });
+});
+
+describe('edit options', () => {
+  beforeEach(() => {
+    mockCreateUploadTask.mockClear();
+    mockUploadAsync.mockReset();
+    mockFetch.mockReset();
+  });
+
+  it('uploads with the research-backed defaults', async () => {
+    mockUploadAsync.mockResolvedValueOnce(uploadResponse('project-1') as never);
+
+    await createProjectFromClips(TOKEN, 'Trip', [clip('a.mov')]);
+
+    const { parameters } = (mockCreateUploadTask.mock.calls[0] as any[])[1];
+    expect(parameters.caption_style).toBe('bold');
+    expect(parameters.fill_mode).toBe('blur');
+    expect(parameters.audio_cleanup).toBe('true');
+    expect(parameters.broll_max_seconds).toBe('6');
+    expect(parameters.generate_subtitles).toBe('true');
+  });
+
+  it('sends the options the user picked', async () => {
+    mockUploadAsync.mockResolvedValueOnce(uploadResponse('project-1') as never);
+
+    await createProjectFromClips(TOKEN, 'Trip', [clip('a.mov')], undefined, {
+      caption_style: 'none',
+      fill_mode: 'crop',
+      audio_cleanup: false,
+      broll_max_seconds: 0,
+    });
+
+    const { parameters } = (mockCreateUploadTask.mock.calls[0] as any[])[1];
+    expect(parameters.caption_style).toBe('none');
+    expect(parameters.generate_subtitles).toBe('false');
+    expect(parameters.fill_mode).toBe('crop');
+    expect(parameters.audio_cleanup).toBe('false');
+    expect(parameters.broll_max_seconds).toBe('0');
+  });
+
+  it('only sends options with the first clip; later clips just add tracks', async () => {
+    mockUploadAsync
+      .mockResolvedValueOnce(uploadResponse('project-1') as never)
+      .mockResolvedValueOnce(uploadResponse('project-1') as never);
+
+    await createProjectFromClips(TOKEN, 'Trip', [clip('a.mov'), clip('b.mov')]);
+
+    const second = (mockCreateUploadTask.mock.calls[1] as any[])[1];
+    expect(second.parameters.caption_style).toBeUndefined();
+  });
+
+  it('patches only what changed, and switches subtitles with the caption style', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ project: { id: 'p1', settings: { caption_style: 'none' } } }),
+    } as never);
+
+    await updateEditOptions(TOKEN, 'p1', { caption_style: 'none' });
+
+    const [url, init] = mockFetch.mock.calls[0] as any[];
+    expect(url).toMatch(/\/api\/projects\/p1\/settings$/);
+    expect(init.method).toBe('PATCH');
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    expect(JSON.parse(init.body)).toEqual({ caption_style: 'none', generate_subtitles: false });
+  });
+
+  it('fills in defaults for projects created before these options existed', () => {
+    expect(editOptionsOf({ id: 'p', name: 'x', status: 'draft', tracks: [] })).toEqual(DEFAULT_EDIT_OPTIONS);
+    expect(
+      editOptionsOf({ id: 'p', name: 'x', status: 'draft', tracks: [], settings: { caption_style: 'clean' } })
+        .caption_style,
+    ).toBe('clean');
   });
 });

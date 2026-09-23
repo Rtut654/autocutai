@@ -2,8 +2,8 @@ import React, { useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -17,10 +17,13 @@ import {
   validateSelection,
   totalDuration,
   totalBytes,
+  DEFAULT_EDIT_OPTIONS,
+  EditOptions,
   MAX_CLIPS_PER_PROJECT,
   MAX_TOTAL_DURATION_SECONDS,
   PickedClip,
 } from '../api/projects';
+import EditOptionsPanel from '../components/EditOptionsPanel';
 
 type Props = {
   token: string;
@@ -54,6 +57,7 @@ export default function UploadScreen({ token, onProjectCreated }: Props) {
   const [clips, setClips] = useState<PickedClip[]>([]);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<{ clip: number; of: number; fraction: number } | null>(null);
+  const [options, setOptions] = useState<EditOptions>(DEFAULT_EDIT_OPTIONS);
 
   const pickClips = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -98,6 +102,7 @@ export default function UploadScreen({ token, onProjectCreated }: Props) {
         clips,
         ({ clipIndex, clipCount, fraction }) =>
           setProgress({ clip: clipIndex + 1, of: clipCount, fraction }),
+        options,
       );
       setClips([]);
       onProjectCreated(project.id);
@@ -120,7 +125,7 @@ export default function UploadScreen({ token, onProjectCreated }: Props) {
         transcribes them, removes filler words and long pauses, and gives you a first cut to adjust.
       </Text>
 
-      <View style={styles.card}>
+      <ScrollView style={styles.card} contentContainerStyle={styles.cardContent}>
         <Pressable style={styles.primaryButton} onPress={pickClips} disabled={uploading}>
           <MaterialCommunityIcons name="image-multiple-outline" size={18} color="#fff" />
           <Text style={styles.primaryButtonText}>
@@ -137,12 +142,9 @@ export default function UploadScreen({ token, onProjectCreated }: Props) {
               {bytes > 0 ? <Text style={styles.summaryMuted}>{formatSize(bytes)} to upload</Text> : null}
             </View>
 
-            <FlatList
-              data={clips}
-              keyExtractor={(item, index) => `${item.uri}-${index}`}
-              style={styles.list}
-              renderItem={({ item, index }) => (
-                <View style={styles.clipRow}>
+            <View style={styles.list}>
+              {clips.map((item, index) => (
+                <View key={`${item.uri}-${index}`} style={styles.clipRow}>
                   <Text style={styles.clipIndex}>{index + 1}</Text>
                   <Text style={styles.clipName} numberOfLines={1}>
                     {item.fileName}
@@ -151,8 +153,13 @@ export default function UploadScreen({ token, onProjectCreated }: Props) {
                     {item.durationSeconds ? formatDuration(item.durationSeconds) : '—'}
                   </Text>
                 </View>
-              )}
-            />
+              ))}
+            </View>
+
+            <View style={styles.divider} />
+            <Text style={styles.sectionTitle}>Look of the edit</Text>
+            <EditOptionsPanel value={options} onChange={setOptions} disabled={uploading} />
+            <View style={styles.divider} />
 
             {uploading ? (
               <View style={styles.progressBlock}>
@@ -180,7 +187,7 @@ export default function UploadScreen({ token, onProjectCreated }: Props) {
             <Text style={styles.emptyText}>No clips selected yet.</Text>
           </View>
         )}
-      </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -194,10 +201,11 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     borderWidth: 1,
     borderColor: '#cfdded',
-    padding: 14,
-    gap: 12,
     flex: 1,
   },
+  cardContent: { padding: 14, gap: 12, flexGrow: 1 },
+  divider: { height: 1, backgroundColor: '#eef2f7', marginVertical: 2 },
+  sectionTitle: { color: '#031b33', fontWeight: '700', fontSize: 16 },
   primaryButton: {
     backgroundColor: '#031b33',
     borderRadius: 10,
@@ -217,7 +225,7 @@ const styles = StyleSheet.create({
   summaryRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   summary: { color: '#0b2845', fontWeight: '600', fontSize: 14 },
   summaryMuted: { color: '#60748a', fontSize: 13 },
-  list: { flex: 1 },
+  list: { gap: 2 },
   clipRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8 },
   clipIndex: {
     width: 22,
@@ -242,6 +250,6 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   progressFill: { height: 6, backgroundColor: '#185FA5' },
-  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10 },
+  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10, paddingVertical: 60 },
   emptyText: { color: '#60748a' },
 });
