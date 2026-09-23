@@ -2010,9 +2010,12 @@ class ProjectService:
             )
 
             for word in normalize_words((track.transcription or {}).get("words", [])):
-                start = remap_time_to_output(word.start, segments)
-                if start is None:
+                # A word belongs to the edit when most of it survives. Testing
+                # its start alone keeps a cut "um" that begins exactly where the
+                # kept speech before it ends.
+                if remap_time_to_output((word.start + word.end) / 2, segments) is None:
                     continue
+                start = clamp_time_to_output(word.start, segments)
                 end = clamp_time_to_output(word.end, segments)
                 output_words.append(
                     word.model_copy(

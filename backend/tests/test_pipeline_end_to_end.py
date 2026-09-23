@@ -835,6 +835,35 @@ def test_subtitles_are_retimed_onto_the_cut_timeline(project_env):
     assert last_caption_end < 5.6
 
 
+def test_a_cut_filler_word_disappears_from_the_captions(project_env):
+    """The "um" starts exactly where the kept "So" ends; it must not be captioned."""
+    project_id = _process(project_env, [project_env["make_clip"]("a.mp4")])
+    track_id = project_env["client"].get(
+        f"/api/projects/{project_id}", headers=project_env["headers"]
+    ).json()["project"]["tracks"][0]["id"]
+    project_env["client"].post(
+        f"/api/projects/{project_id}/tracks/{track_id}/speech-filter", headers=project_env["headers"]
+    )
+    project_env["client"].patch(
+        f"/api/projects/{project_id}/tracks/{track_id}/speech-filter",
+        json={"cuts": [{"start": 0.5, "end": 0.75, "duration": 0.25, "reason": "filler_word", "transcript": "um", "confidence": 0.9}]},
+        headers=project_env["headers"],
+    )
+
+    project_env["client"].post(f"/api/projects/{project_id}/process-sync", headers=project_env["headers"])
+
+    render = project_env["media"].combines[-1]
+    assert render["segments"][0][0] == (0.0, 0.5)
+    captions = [
+        line.split(",", 9)[9]
+        for line in Path(render["subtitle_path"]).read_text(encoding="utf-8").splitlines()
+        if line.startswith("Dialogue:")
+    ]
+    spoken = " ".join(captions)
+    assert "SO" in spoken and "THIS" in spoken
+    assert "UM" not in spoken
+
+
 def test_no_subtitles_are_generated_when_the_setting_is_off(project_env):
     _process(project_env, [project_env["make_clip"]("a.mp4")], generate_subtitles=False)
 
