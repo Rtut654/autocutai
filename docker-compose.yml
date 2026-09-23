@@ -16,6 +16,10 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       AUTOCUT_DATA_DIR: /app/data
+      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-643423102814-odqhn4m5k5jq7uuoitvbpolcvmhpfe94.apps.googleusercontent.com}
+      APPLE_AUDIENCES: ${APPLE_AUDIENCES:-com.bestshotai.app}
+      AUTOCUT_ALLOW_UNVERIFIED_PURCHASES: ${AUTOCUT_ALLOW_UNVERIFIED_PURCHASES:-false}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:

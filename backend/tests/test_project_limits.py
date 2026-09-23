@@ -83,3 +83,13 @@ def test_malformed_environment_values_fall_back_to_defaults(monkeypatch):
     monkeypatch.setenv("AUTOCUT_MAX_CLIPS", "not-a-number")
 
     assert max_clips() == 10
+
+
+@pytest.mark.parametrize("user_id", ["../../etc", "a/b", "..", "", "x\\y"])
+def test_user_ids_cannot_escape_the_projects_directory(user_id, tmp_path):
+    from backend.app.services.project_service import ProjectService
+
+    service = ProjectService(projects_dir=str(tmp_path / "projects"), temp_dir=str(tmp_path / "temp"))
+
+    with pytest.raises(ValueError, match="Invalid user id"):
+        service.get_user_projects_dir(user_id)

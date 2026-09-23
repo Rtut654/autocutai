@@ -149,6 +149,11 @@ class ProjectService:
         return project
 
     def get_user_projects_dir(self, user_id: str, *, create: bool = True) -> Path:
+        # User IDs are server-generated UUIDs now, but accounts created before
+        # that could carry an ID chosen by the client. Never let one escape
+        # the projects directory.
+        if not user_id or "/" in user_id or "\\" in user_id or user_id in {".", ".."} or "\x00" in user_id:
+            raise ValueError("Invalid user id")
         root = self.projects_dir / user_id
         if create:
             root.mkdir(parents=True, exist_ok=True)
