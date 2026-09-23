@@ -40,6 +40,8 @@ from ..services.pipeline_service import (
     write_subtitles_srt,
     write_word_level_srt,
 )
+from ..services.captions import FONTS_DIR, resolve_style, write_ass
+from ..services.cut_policy import broll_window, keep_segments, refine_cuts
 from ..services.final_render import (
     RenderClip,
     RenderPlan,
@@ -970,19 +972,30 @@ class ProjectService:
             Path(dry_output_path).unlink(missing_ok=True)
             bgm_path.unlink(missing_ok=True)
 
-        if project.settings.generate_subtitles:
+        caption_style = resolve_style(project.settings.caption_style)
+        if project.settings.generate_subtitles and caption_style is not None:
             remapped_words = self._remap_track_words_to_render_timeline(track, keep_segments)
             subtitle_cues = build_subtitle_cues(remapped_words)
             if subtitle_cues:
                 subtitle_srt_path = render_dir / f"{Path(output_path).stem}__subtitles.srt"
+                captions_path = render_dir / f"{Path(output_path).stem}__captions.ass"
                 subtitled_path = render_dir / f"{Path(output_path).stem}__subtitled.mp4"
                 write_subtitles_srt(subtitle_cues, subtitle_srt_path)
+                write_ass(
+                    remapped_words,
+                    captions_path,
+                    width=int(track.width or 1080),
+                    height=int(track.height or 1920),
+                    style=caption_style,
+                    duration=sum(end - start for start, end in keep_segments),
+                )
                 previous_rendered_path = Path(rendered_path)
                 try:
                     rendered_path = await processor.burn_subtitles(
                         video_input=previous_rendered_path,
-                        subtitle_path=subtitle_srt_path,
+                        subtitle_path=captions_path,
                         output_path=subtitled_path,
+                        fonts_dir=FONTS_DIR,
                     )
                     if previous_rendered_path != source_path and previous_rendered_path.exists():
                         previous_rendered_path.unlink(missing_ok=True)
@@ -1008,6 +1021,7 @@ class ProjectService:
                         raise
                 finally:
                     subtitle_srt_path.unlink(missing_ok=True)
+                    captions_path.unlink(missing_ok=True)
 
         duration_after = round(sum(max(0.0, end - start) for start, end in keep_segments), 3)
         version = TrackRenderVersion(
@@ -1125,24 +1139,12 @@ class ProjectService:
 
     @staticmethod
     def _segments_from_cut_ranges(duration: float, cuts: List[Any]) -> List[tuple[float, float]]:
-        safe_duration = max(0.0, float(duration or 0.0))
-        if safe_duration <= 0:
-            return []
-        if not cuts:
-            return [(0.0, safe_duration)]
+        """Ranges of a clip that survive its cuts, after the cut policy.
 
-        ordered = sorted(cuts, key=lambda cut: (float(cut.start), float(cut.end)))
-        segments: List[tuple[float, float]] = []
-        cursor = 0.0
-        for cut in ordered:
-            start = max(0.0, min(safe_duration, float(cut.start)))
-            end = max(start, min(safe_duration, float(cut.end)))
-            if start > cursor + 0.001:
-                segments.append((round(cursor, 3), round(start, 3)))
-            cursor = max(cursor, end)
-        if cursor < safe_duration - 0.001:
-            segments.append((round(cursor, 3), round(safe_duration, 3)))
-        return [(start, end) for start, end in segments if end - start >= 0.05]
+        Pause cuts keep a little air around the speech and are dropped when
+        too small to be worth a jump cut; manual and word-level cuts are exact.
+        """
+        return keep_segments(duration, refine_cuts(cuts or [], duration))
 
     @staticmethod
     def _map_time_to_render_timeline(time_value: float, keep_segments: List[tuple[float, float]]) -> Optional[float]:
@@ -1910,13 +1912,25 @@ class ProjectService:
         if not plan.clips:
             raise RuntimeError("No usable clips were available to render")
 
-        # Subtitles must be timed against the *rendered* timeline, not the raw
+        # Captions must be timed against the *rendered* timeline, not the raw
         # one, or every cut shifts them out of sync.
-        if project.settings.generate_subtitles and output_words:
+        style = resolve_style(project.settings.caption_style)
+        if project.settings.generate_subtitles and output_words and style is not None:
             transcript_dir = self.get_project_transcript_dir(project.user_id, project.id)
-            final_subtitle_path = transcript_dir / f"{project.id}_final_subtitles.srt"
-            write_subtitles_srt(build_subtitle_cues(output_words), final_subtitle_path)
-            plan.subtitle_path = str(final_subtitle_path)
+            captions_path = transcript_dir / f"{project.id}_final_captions.ass"
+            write_ass(
+                output_words,
+                captions_path,
+                width=plan.width,
+                height=plan.height,
+                style=style,
+                duration=plan.total_duration(),
+            )
+            plan.subtitle_path = str(captions_path)
+            # A plain SRT alongside, for people who upload captions separately.
+            write_subtitles_srt(
+                build_subtitle_cues(output_words), transcript_dir / f"{project.id}_final_subtitles.srt"
+            )
 
         output_dir = self.get_project_renders_dir(project.user_id, project.id)
         output_path = self._reserve_named_output(output_dir, "final", ".mp4")
@@ -1939,7 +1953,14 @@ class ProjectService:
             if hasattr(project.settings.aspect_ratio, "value")
             else str(project.settings.aspect_ratio)
         )
-        plan = RenderPlan(clips=[], width=width, height=height)
+        plan = RenderPlan(
+            clips=[],
+            width=width,
+            height=height,
+            fill_mode=project.settings.fill_mode,
+            audio_cleanup=project.settings.audio_cleanup,
+            fonts_dir=str(FONTS_DIR),
+        )
         output_words: List[WordTimestamp] = []
         output_offset = 0.0
 
@@ -1968,6 +1989,8 @@ class ProjectService:
                     source_path=str(source_path),
                     segments=segments,
                     has_audio=await processor.probe_has_audio(source_path),
+                    width=track.width,
+                    height=track.height,
                 )
             )
 
@@ -2001,10 +2024,15 @@ class ProjectService:
             return self._segments_from_cut_ranges(duration, artifact.cuts)
 
         if not track.has_voice:
-            # A clip with no narration is b-roll, not one long pause. Travel
-            # edits are full of silent drone and landscape shots and the pause
-            # cutter must not delete them.
-            return [(0.0, round(duration, 3))]
+            # A clip with no narration is b-roll, not one long pause: it is
+            # kept, but a long one is paced down to its best window so a
+            # two-minute drone flight does not stall the edit.
+            return broll_window(
+                duration,
+                project.settings.broll_max_seconds,
+                trim_start=track.background_trim_start,
+                trim_end=track.background_trim_end,
+            )
 
         if project.settings.smart_pause_cutter and track.local_gap_ranges:
             return self._segments_from_cut_ranges(duration, track.local_gap_ranges)

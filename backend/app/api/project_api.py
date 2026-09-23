@@ -7,7 +7,7 @@ import logging
 import mimetypes
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
@@ -133,6 +133,10 @@ async def create_project(
     generate_subtitles: bool = Form(default=True),
     insert_suggestions: bool = Form(default=True),
     min_gap_seconds: float = Form(default=1.0),
+    caption_style: Literal["bold", "boxed", "clean", "none"] = Form(default="bold"),
+    fill_mode: Literal["blur", "crop", "black"] = Form(default="blur"),
+    audio_cleanup: bool = Form(default=True),
+    broll_max_seconds: float = Form(default=6.0, ge=0.0, le=60.0),
     capture_times_json: Optional[str] = Form(default=None),
     metadata_json: Optional[str] = Form(default=None),
     files: List[UploadFile] = File(...),
@@ -175,6 +179,10 @@ async def create_project(
             generate_subtitles=generate_subtitles,
             insert_suggestions=insert_suggestions,
             min_gap_seconds=min_gap_seconds,
+            caption_style=caption_style,
+            fill_mode=fill_mode,
+            audio_cleanup=audio_cleanup,
+            broll_max_seconds=broll_max_seconds,
         )
 
         request = ProjectCreateRequest(

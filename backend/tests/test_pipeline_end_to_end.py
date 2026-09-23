@@ -698,6 +698,17 @@ def _last_cue_end_seconds(srt_body: str) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
 
 
+def _last_ass_end_seconds(ass_body: str) -> float:
+    """End time of the last caption event in an ASS document, in seconds."""
+    ends = []
+    for line in ass_body.splitlines():
+        if line.startswith("Dialogue:"):
+            end = line.split(",")[2]
+            hours, minutes, seconds = end.split(":")
+            ends.append(int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+    return max(ends)
+
+
 def _process(env, clips, **settings):
     project_id = create_project(env["client"], env["headers"], clips, **settings).json()["project"]["id"]
     env["client"].post(f"/api/projects/{project_id}/process-sync", headers=env["headers"])
@@ -723,8 +734,10 @@ def test_auto_cut_removes_the_detected_pause_from_the_render(project_env):
 
     segments = project_env["media"].combines[-1]["segments"][0]
     # The fixture transcript pauses from 1.95s to 3.60s and the last word ends
-    # at 5.60s, so both the mid-clip pause and the trailing dead air come out.
-    assert segments == [(0.0, 1.95), (3.6, 5.6)]
+    # at 5.60s, so both the mid-clip pause and the trailing dead air come out,
+    # keeping 0.10s after the last word and 0.06s before the next one so no
+    # word is clipped.
+    assert segments == [(0.0, 2.05), (3.54, 5.7)]
 
 
 def test_auto_cut_off_keeps_the_whole_clip(project_env):
@@ -779,11 +792,34 @@ def test_silent_broll_survives_the_pause_cutter(project_env, monkeypatch):
 
     render = project_env["media"].combines[-1]
     assert len(render["clips"]) == 1
-    assert render["segments"][0] == [(0.0, 12.0)]
+    assert render["segments"][0]  # kept, not deleted
+
+
+def test_long_broll_is_paced_down_to_its_middle(project_env, monkeypatch):
+    """A 12s silent clip is trimmed to a 6s beat from the middle, after the lead-in."""
+    async def silent(audio_path, language=None):
+        return {"text": "", "words": [], "segments": [], "language": "en-US"}
+
+    monkeypatch.setattr("backend.app.services.project_service.transcribe_audio_file", silent)
+
+    _process(project_env, [project_env["make_clip"]("drone.mp4")])
+
+    assert project_env["media"].combines[-1]["segments"][0] == [(3.25, 9.25)]
+
+
+def test_broll_pacing_can_be_switched_off(project_env, monkeypatch):
+    async def silent(audio_path, language=None):
+        return {"text": "", "words": [], "segments": [], "language": "en-US"}
+
+    monkeypatch.setattr("backend.app.services.project_service.transcribe_audio_file", silent)
+
+    _process(project_env, [project_env["make_clip"]("drone.mp4")], broll_max_seconds=0)
+
+    assert project_env["media"].combines[-1]["segments"][0] == [(0.0, 12.0)]
 
 
 def test_subtitles_are_retimed_onto_the_cut_timeline(project_env):
-    """Cutting a pause must move every later subtitle earlier by the same amount."""
+    """Cutting a pause must move every later caption earlier by the same amount."""
     project_id = _process(project_env, [project_env["make_clip"]("a.mp4")])
 
     render = project_env["media"].combines[-1]
@@ -791,12 +827,12 @@ def test_subtitles_are_retimed_onto_the_cut_timeline(project_env):
     body = Path(render["subtitle_path"]).read_text(encoding="utf-8")
 
     kept = sum(end - start for start, end in render["segments"][0])
-    last_cue_end = _last_cue_end_seconds(body)
+    last_caption_end = _last_ass_end_seconds(body)
 
-    # Subtitles must fit inside the cut timeline. Against the source timeline
-    # the final word ends at 5.60s; after the pause is removed it lands at 3.95s.
-    assert last_cue_end == pytest.approx(kept, abs=0.01)
-    assert last_cue_end < 5.6
+    # Against the source timeline the final word ends at 5.60s. After the
+    # pause is removed the edit is 4.21s long and no caption runs past it.
+    assert last_caption_end == pytest.approx(kept, abs=0.01)
+    assert last_caption_end < 5.6
 
 
 def test_no_subtitles_are_generated_when_the_setting_is_off(project_env):
@@ -829,9 +865,9 @@ def test_multi_clip_render_offsets_subtitles_across_clips(project_env):
     body = Path(render["subtitle_path"]).read_text(encoding="utf-8")
 
     # The second clip's words are offset by the first clip's *kept* duration,
-    # not its source duration, so the cues span the whole rendered output.
-    assert _last_cue_end_seconds(body) == pytest.approx(kept, abs=0.01)
-    assert kept == pytest.approx(2 * 3.95, abs=0.01)
+    # not its source duration, so the captions span the whole rendered output.
+    assert _last_ass_end_seconds(body) == pytest.approx(kept, abs=0.01)
+    assert kept == pytest.approx(2 * 4.21, abs=0.01)
 
 
 def test_a_source_with_no_audio_stream_is_not_sent_for_transcription(project_env, monkeypatch):

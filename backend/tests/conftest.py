@@ -149,8 +149,8 @@ def fake_media_tools(monkeypatch, media_calls):
         media_calls.music_mixes.append({"volume": music_volume, "ducking": ducking})
         return _touch(output_path)
 
-    async def burn_subtitles(self, *, video_input, subtitle_path, output_path):
-        media_calls.subtitle_burns.append({"subtitles": str(subtitle_path)})
+    async def burn_subtitles(self, *, video_input, subtitle_path, output_path, fonts_dir=None):
+        media_calls.subtitle_burns.append({"subtitles": str(subtitle_path), "fonts_dir": fonts_dir})
         return _touch(output_path)
 
     async def ensure_browser_playable_video(self, source_path, output_path):

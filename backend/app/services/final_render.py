@@ -8,8 +8,14 @@ produces garbled output on exactly this input.
 
 This module builds a concat *filter* graph instead. Every segment is
 normalised to one canvas, one frame rate, one pixel format and one audio
-layout before concatenation, and the whole thing - trim, scale, concat and
-subtitle burn-in - runs as a single encode rather than one pass per stage.
+layout before concatenation, and the whole thing - trim, scale, concat,
+audio cleanup and caption burn-in - runs as a single encode rather than one
+pass per stage.
+
+A clip whose shape does not match the canvas (a landscape drone shot in a
+vertical edit) is placed over a blurred, enlarged copy of itself rather than
+on black bars. TikTok down-ranks letterboxed video, and blurred fill is what
+viewers are used to from every major editor.
 """
 
 from __future__ import annotations
@@ -28,6 +34,23 @@ CANVAS = {
 DEFAULT_FPS = 30
 DEFAULT_SAMPLE_RATE = 48000
 
+FILL_MODES = ("blur", "crop", "black")
+DEFAULT_FILL_MODE = "blur"
+# A clip within this fraction of the canvas's aspect ratio just gets scaled.
+ASPECT_TOLERANCE = 0.03
+
+# Voice cleanup for outdoor footage, then loudness normalisation:
+#   highpass    removes wind rumble and handling noise below the voice
+#   afftdn      light broadband denoise (hiss, steady background noise)
+#   loudnorm    -14 LUFS integrated, the level TikTok, Reels and YouTube
+#               normalise to, with headroom so it never clips
+AUDIO_CLEANUP_CHAIN = (
+    "highpass=f=90,"
+    "afftdn=nf=-25,"
+    "loudnorm=I=-14:TP=-1.5:LRA=11,"
+    f"aresample={DEFAULT_SAMPLE_RATE}"
+)
+
 
 @dataclass
 class RenderClip:
@@ -36,6 +59,17 @@ class RenderClip:
     source_path: str
     segments: List[Segment] = field(default_factory=list)
     has_audio: bool = True
+    # Display dimensions after rotation, when known. Used to skip the blurred
+    # fill for clips that already match the canvas.
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+    def matches_canvas(self, canvas_width: int, canvas_height: int) -> bool:
+        if not self.width or not self.height:
+            return False
+        clip_ratio = self.width / self.height
+        canvas_ratio = canvas_width / canvas_height
+        return abs(clip_ratio - canvas_ratio) / canvas_ratio <= ASPECT_TOLERANCE
 
     def usable_segments(self, min_duration: float = 0.04) -> List[Segment]:
         return [(start, end) for start, end in self.segments if end - start >= min_duration]
@@ -50,6 +84,10 @@ class RenderPlan:
     height: int
     fps: int = DEFAULT_FPS
     subtitle_path: Optional[str] = None
+    # Directory libass searches for the caption font.
+    fonts_dir: Optional[str] = None
+    fill_mode: str = DEFAULT_FILL_MODE
+    audio_cleanup: bool = True
 
     def total_duration(self) -> float:
         return sum(end - start for clip in self.clips for start, end in clip.usable_segments())
@@ -114,16 +152,17 @@ def build_filter_graph(plan: RenderPlan, *, include_subtitles: bool = True) -> T
             video_label = f"v{part}"
             audio_label = f"a{part}"
 
-            # Normalise onto the shared canvas: letterbox rather than crop, so
-            # a vertical phone clip and a horizontal drone clip can sit in the
-            # same timeline without losing content.
-            chains.append(
-                f"[{video_pads[n]}]"
-                f"trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                f"setsar=1,fps={fps},format=yuv420p"
-                f"[{video_label}]"
+            chains.extend(
+                _segment_video_chain(
+                    source=video_pads[n],
+                    label=video_label,
+                    start=start,
+                    end=end,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    fill_mode="crop" if clip.matches_canvas(width, height) else plan.fill_mode,
+                )
             )
 
             if clip.has_audio:
@@ -153,10 +192,70 @@ def build_filter_graph(plan: RenderPlan, *, include_subtitles: bool = True) -> T
 
     video_out = "cv"
     if include_subtitles and plan.subtitle_path:
-        chains.append(f"[cv]subtitles=filename='{escape_filter_path(plan.subtitle_path)}'[sv]")
+        subtitle_filter = f"subtitles=filename='{escape_filter_path(plan.subtitle_path)}'"
+        if plan.fonts_dir:
+            subtitle_filter += f":fontsdir='{escape_filter_path(plan.fonts_dir)}'"
+        chains.append(f"[cv]{subtitle_filter}[sv]")
         video_out = "sv"
 
-    return ";".join(chains), extra_inputs, video_out, "ca"
+    audio_out = "ca"
+    # loudnorm cannot normalise pure digital silence (it computes an infinite
+    # gain), so an edit made only of silent clips is left as it is.
+    has_any_audio = any(clip.has_audio for clip in plan.clips if clip.usable_segments())
+    if plan.audio_cleanup and has_any_audio:
+        chains.append(f"[ca]{AUDIO_CLEANUP_CHAIN}[cleanaudio]")
+        audio_out = "cleanaudio"
+
+    return ";".join(chains), extra_inputs, video_out, audio_out
+
+
+def _even(value: float) -> int:
+    return max(2, int(round(value / 2)) * 2)
+
+
+def _segment_video_chain(
+    *,
+    source: str,
+    label: str,
+    start: float,
+    end: float,
+    width: int,
+    height: int,
+    fps: int,
+    fill_mode: str,
+) -> List[str]:
+    """Filters that turn one trimmed range of a clip into a canvas-sized stream."""
+    trim = f"trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS"
+    finish = f"setsar=1,fps={fps},format=yuv420p"
+
+    if fill_mode == "crop":
+        # Fill the canvas, cropping the overflow. Also the path for clips that
+        # already match the canvas, where it is a plain scale.
+        return [
+            f"[{source}]{trim},"
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},{finish}[{label}]"
+        ]
+
+    if fill_mode == "black":
+        return [
+            f"[{source}]{trim},"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,{finish}[{label}]"
+        ]
+
+    # Blurred fill. The background is blurred at quarter resolution and scaled
+    # back up, which looks the same and costs a fraction of a full-size blur.
+    small_w, small_h = _even(width / 4), _even(height / 4)
+    fg, bg, bg_blur, fg_fit = f"{label}fg", f"{label}bg", f"{label}bgb", f"{label}fit"
+    return [
+        f"[{source}]{trim},split=2[{fg}][{bg}]",
+        f"[{bg}]scale={small_w}:{small_h}:force_original_aspect_ratio=increase,"
+        f"crop={small_w}:{small_h},boxblur=12:2,"
+        f"scale={width}:{height},eq=brightness=-0.06:saturation=1.1[{bg_blur}]",
+        f"[{fg}]scale={width}:{height}:force_original_aspect_ratio=decrease[{fg_fit}]",
+        f"[{bg_blur}][{fg_fit}]overlay=(W-w)/2:(H-h)/2,{finish}[{label}]",
+    ]
 
 
 def remap_time_to_output(time_value: float, segments: Sequence[Segment]) -> Optional[float]:

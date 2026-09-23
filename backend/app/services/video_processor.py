@@ -134,15 +134,30 @@ class VideoProcessor:
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            await self._run_final_render(plan, target, include_subtitles=True)
-        except RuntimeError as exc:
-            if plan.subtitle_path and self._can_skip_subtitle_burn(exc):
-                logger.warning("Subtitles filter unavailable, rendering without burn-in: %s", exc)
-                await self._run_final_render(plan, target, include_subtitles=False)
-            else:
+        include_subtitles = True
+        for _attempt in range(3):
+            try:
+                await self._run_final_render(plan, target, include_subtitles=include_subtitles)
+                return str(target)
+            except RuntimeError as exc:
+                if include_subtitles and plan.subtitle_path and self._can_skip_subtitle_burn(exc):
+                    logger.warning("Subtitles filter unavailable, rendering without burn-in: %s", exc)
+                    include_subtitles = False
+                    continue
+                if plan.audio_cleanup and self._is_audio_encode_failure(exc):
+                    # A clip with an audio track that is entirely silent (a
+                    # muted recording) defeats loudness normalisation. Keep
+                    # the edit and skip the cleanup rather than fail it.
+                    logger.warning("Audio cleanup failed, rendering with untouched audio: %s", exc)
+                    plan.audio_cleanup = False
+                    continue
                 raise
-        return str(target)
+        raise RuntimeError("Final render failed after fallbacks")
+
+    @staticmethod
+    def _is_audio_encode_failure(error: RuntimeError) -> bool:
+        message = str(error)
+        return "Error submitting audio frame" in message or "loudnorm" in message
 
     async def _run_final_render(self, plan: RenderPlan, target: Path, *, include_subtitles: bool) -> None:
         graph, extra_inputs, video_label, audio_label = build_filter_graph(
@@ -913,10 +928,13 @@ class VideoProcessor:
         video_input: str | Path,
         subtitle_path: str | Path,
         output_path: str | Path,
+        fonts_dir: str | Path | None = None,
     ) -> str:
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         subtitle_filter = f"subtitles=filename='{self._escape_filter_value(Path(subtitle_path).resolve().as_posix())}'"
+        if fonts_dir:
+            subtitle_filter += f":fontsdir='{self._escape_filter_value(Path(fonts_dir).resolve().as_posix())}'"
         cmd = [
             self.ffmpeg_path,
             "-i",

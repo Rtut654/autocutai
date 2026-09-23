@@ -121,6 +121,24 @@ class ProjectSettings(BaseModel):
     generate_subtitles: bool = Field(default=False, description="Generate subtitles (pro feature)")
     insert_suggestions: bool = Field(default=False, description="Insert media suggestions (pro feature)")
     min_gap_seconds: float = Field(default=1.0, description="Minimum silence gap to auto-cut")
+    caption_style: Literal["bold", "boxed", "clean", "none"] = Field(
+        default="bold",
+        description="Burned-in caption look: word-by-word highlight (bold, boxed), plain lines (clean), or none",
+    )
+    fill_mode: Literal["blur", "crop", "black"] = Field(
+        default="blur",
+        description="How clips whose shape differs from the canvas are framed",
+    )
+    audio_cleanup: bool = Field(
+        default=True,
+        description="Reduce wind rumble and background noise, and normalise loudness to -14 LUFS",
+    )
+    broll_max_seconds: float = Field(
+        default=6.0,
+        ge=0.0,
+        le=60.0,
+        description="Longest a clip without narration may run in the edit; 0 keeps it whole",
+    )
 
 
 class GapRange(BaseModel):

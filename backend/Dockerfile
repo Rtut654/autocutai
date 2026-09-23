@@ -9,7 +9,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# ffmpeg for media work. The rest are runtime dependencies of the Azure
+# ffmpeg for media work. Captions use the Montserrat files bundled in
+# app/assets/fonts, which cover Latin (including Vietnamese) and Cyrillic.
+# DejaVu is the fallback for Greek, Hebrew and Arabic. Narration in Thai,
+# Chinese, Japanese, Korean or Hindi needs a Noto package added here
+# (fonts-noto-cjk, fonts-thai-tlwg) or those captions render as boxes.
+# The rest are runtime dependencies of the Azure
 # Speech SDK's native libraries: OpenSSL 3 for transport, ALSA and libuuid
 # for its audio extension. Without libasound the SDK import fails at runtime,
 # not at build time, so it is easy to miss.
@@ -17,6 +22,8 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
+        fontconfig \
+        fonts-dejavu-core \
         ca-certificates \
         libssl3 \
         libuuid1 \
