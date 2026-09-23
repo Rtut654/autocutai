@@ -6,7 +6,7 @@
  * shows the result and lets the user adjust it.
  */
 
-import * as FileSystem from 'expo-file-system';
+import { File, Paths, UploadType } from 'expo-file-system';
 
 import { API_BASE_URL, authorizedRequest } from './client';
 
@@ -147,29 +147,32 @@ export async function createProjectFromClips(
           metadata_json: JSON.stringify([{ source: 'ios_photo_library' }]),
         };
 
-    const task = FileSystem.createUploadTask(
-      `${API_BASE_URL}${path}`,
-      clip.uri,
-      {
-        httpMethod: 'POST',
-        uploadType: FileSystem.FileSystemUploadType.MULTIPART,
-        fieldName: 'files',
-        mimeType: clip.mimeType || 'video/quicktime',
-        parameters,
-        headers: { Authorization: `Bearer ${token}` },
-      },
-      ({ totalBytesSent, totalBytesExpectedToSend }) => {
+    // Background session (the iOS default) lets a large upload keep going if
+    // the user switches apps, which matters for multi-gigabyte 4K footage.
+    const task = new File(clip.uri).createUploadTask(`${API_BASE_URL}${path}`, {
+      httpMethod: 'POST',
+      uploadType: UploadType.MULTIPART,
+      fieldName: 'files',
+      mimeType: clip.mimeType || 'video/quicktime',
+      parameters,
+      headers: { Authorization: `Bearer ${token}` },
+      onProgress: ({ bytesSent, totalBytes }) => {
         onProgress?.({
-          sentBytes: totalBytesSent,
-          totalBytes: totalBytesExpectedToSend,
-          fraction: totalBytesExpectedToSend > 0 ? totalBytesSent / totalBytesExpectedToSend : 0,
+          sentBytes: bytesSent,
+          totalBytes,
+          fraction: totalBytes > 0 ? Math.min(1, bytesSent / totalBytes) : 0,
           clipIndex: index,
           clipCount: clips.length,
         });
       },
-    );
+    });
 
-    const result = await task.uploadAsync();
+    let result: { status: number; body: string } | undefined;
+    try {
+      result = await task.uploadAsync();
+    } catch (error: any) {
+      throw new Error(`Upload of ${clip.fileName} failed: ${error?.message || 'network error'}`);
+    }
     if (!result || result.status < 200 || result.status >= 300) {
       throw new Error(readUploadError(result?.body) || `Upload failed (${result?.status ?? 'no response'})`);
     }
@@ -282,21 +285,18 @@ export async function downloadFinalVideo(
   projectId: string,
   onProgress?: (fraction: number) => void,
 ): Promise<string> {
-  const target = `${FileSystem.cacheDirectory}autocut-${projectId}.mp4`;
-  const task = FileSystem.createDownloadResumable(
-    projectDownloadUrl(projectId),
-    target,
-    { headers: { Authorization: `Bearer ${token}` } },
-    ({ totalBytesWritten, totalBytesExpectedToWrite }) => {
-      if (totalBytesExpectedToWrite > 0) {
-        onProgress?.(totalBytesWritten / totalBytesExpectedToWrite);
-      }
-    },
-  );
-
-  const result = await task.downloadAsync();
-  if (!result || result.status !== 200) {
-    throw new Error(`Could not download the video (${result?.status ?? 'no response'}).`);
+  const destination = new File(Paths.cache, `autocut-${projectId}.mp4`);
+  try {
+    const file = await File.downloadFileAsync(projectDownloadUrl(projectId), destination, {
+      headers: { Authorization: `Bearer ${token}` },
+      // A re-render replaces the previous export for this project.
+      idempotent: true,
+      onProgress: ({ bytesWritten, totalBytes }) => {
+        if (totalBytes > 0) onProgress?.(bytesWritten / totalBytes);
+      },
+    });
+    return file.uri;
+  } catch (error: any) {
+    throw new Error(`Could not download the video: ${error?.message || 'network error'}`);
   }
-  return result.uri;
 }

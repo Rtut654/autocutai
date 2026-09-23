@@ -1,15 +1,31 @@
 import { describe, expect, it, jest, beforeEach } from '@jest/globals';
 
 const mockUploadAsync = jest.fn();
-const mockCreateUploadTask = jest.fn(() => ({ uploadAsync: mockUploadAsync }));
-const mockDownloadAsync = jest.fn();
-
-jest.mock('expo-file-system', () => ({
-  cacheDirectory: 'file:///cache/',
-  FileSystemUploadType: { MULTIPART: 'multipart' },
-  createUploadTask: (...args: any[]) => (mockCreateUploadTask as any)(...args),
-  createDownloadResumable: () => ({ downloadAsync: mockDownloadAsync }),
+const mockCreateUploadTask = jest.fn((_url: string, options: any) => ({
+  uploadAsync: mockUploadAsync,
+  options,
 }));
+const mockDownloadFileAsync = jest.fn();
+
+jest.mock('expo-file-system', () => {
+  class File {
+    uri: string;
+    constructor(...parts: any[]) {
+      this.uri = parts.map((part) => (typeof part === 'string' ? part : part.uri)).join('/');
+    }
+    createUploadTask(url: string, options: any) {
+      return (mockCreateUploadTask as any)(url, options);
+    }
+    static downloadFileAsync(...args: any[]) {
+      return (mockDownloadFileAsync as any)(...args);
+    }
+  }
+  return {
+    File,
+    Paths: { cache: { uri: 'file:///cache' } },
+    UploadType: { BINARY_CONTENT: 0, MULTIPART: 1 },
+  };
+});
 
 import {
   MAX_CLIPS_PER_PROJECT,
@@ -113,7 +129,7 @@ describe('createProjectFromClips', () => {
     await createProjectFromClips(TOKEN, 'Trip', [clip('a.mov'), clip('b.mov')]);
 
     for (const call of mockCreateUploadTask.mock.calls as any[]) {
-      expect(call[2].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+      expect(call[1].headers.Authorization).toBe(`Bearer ${TOKEN}`);
     }
   });
 
@@ -122,11 +138,11 @@ describe('createProjectFromClips', () => {
 
     await createProjectFromClips(TOKEN, 'Trip', [clip('a.mov')]);
 
-    const options = (mockCreateUploadTask.mock.calls[0] as any[])[2];
+    const options = (mockCreateUploadTask.mock.calls[0] as any[])[1];
     expect(options.parameters.aspect_ratio).toBe('vertical');
     expect(options.parameters.smart_pause_cutter).toBe('true');
     expect(options.parameters.generate_subtitles).toBe('true');
-    expect(options.uploadType).toBe('multipart');
+    expect(options.uploadType).toBe(1);
     expect(options.fieldName).toBe('files');
   });
 
@@ -135,7 +151,7 @@ describe('createProjectFromClips', () => {
 
     await createProjectFromClips(TOKEN, 'Trip', [clip('a.mov')]);
 
-    const options = (mockCreateUploadTask.mock.calls[0] as any[])[2];
+    const options = (mockCreateUploadTask.mock.calls[0] as any[])[1];
     expect(JSON.parse(options.parameters.capture_times_json)).toEqual(['2026-05-01T09:00:00Z']);
   });
 
@@ -151,7 +167,7 @@ describe('createProjectFromClips', () => {
 
     // Drive the progress callbacks the upload task was given.
     for (const call of mockCreateUploadTask.mock.calls as any[]) {
-      call[3]({ totalBytesSent: 50, totalBytesExpectedToSend: 100 });
+      call[1].onProgress({ bytesSent: 50, totalBytes: 100 });
     }
     expect(seen.map((entry) => entry.clipIndex)).toEqual([0, 1]);
     expect(seen.every((entry) => entry.fraction === 0.5)).toBe(true);
@@ -173,21 +189,41 @@ describe('createProjectFromClips', () => {
 
     await expect(createProjectFromClips(TOKEN, 'Trip', [clip('a.mov')])).rejects.toThrow(/Upload failed/i);
   });
+
+  it('names the clip when the network drops mid-upload', async () => {
+    mockUploadAsync.mockRejectedValueOnce(new Error('The network connection was lost.') as never);
+
+    await expect(createProjectFromClips(TOKEN, 'Trip', [clip('a.mov')])).rejects.toThrow(
+      /a\.mov failed: The network connection was lost/,
+    );
+  });
 });
 
 describe('downloadFinalVideo', () => {
   beforeEach(() => {
-    mockDownloadAsync.mockReset();
+    mockDownloadFileAsync.mockReset();
   });
 
   it('returns the local uri of the downloaded file', async () => {
-    mockDownloadAsync.mockResolvedValueOnce({ status: 200, uri: 'file:///cache/autocut-p1.mp4' } as never);
+    mockDownloadFileAsync.mockResolvedValueOnce({ uri: 'file:///cache/autocut-p1.mp4' } as never);
 
     await expect(downloadFinalVideo(TOKEN, 'p1')).resolves.toBe('file:///cache/autocut-p1.mp4');
   });
 
-  it('throws when the download fails', async () => {
-    mockDownloadAsync.mockResolvedValueOnce({ status: 404, uri: '' } as never);
+  it('downloads into the cache with auth and overwrites a previous export', async () => {
+    mockDownloadFileAsync.mockResolvedValueOnce({ uri: 'file:///cache/autocut-p1.mp4' } as never);
+
+    await downloadFinalVideo(TOKEN, 'p1');
+
+    const [url, destination, options] = mockDownloadFileAsync.mock.calls[0] as any[];
+    expect(url).toMatch(/\/api\/projects\/p1\/download$/);
+    expect(destination.uri).toBe('file:///cache/autocut-p1.mp4');
+    expect(options.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    expect(options.idempotent).toBe(true);
+  });
+
+  it('throws a readable error when the download fails', async () => {
+    mockDownloadFileAsync.mockRejectedValueOnce(new Error('HTTP 404') as never);
 
     await expect(downloadFinalVideo(TOKEN, 'p1')).rejects.toThrow(/could not download/i);
   });

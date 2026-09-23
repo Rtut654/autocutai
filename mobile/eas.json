@@ -1,6 +1,6 @@
 {
   "cli": {
-    "version": ">= 12.0.0",
+    "version": ">= 16.0.0",
     "appVersionSource": "local"
   },
   "build": {
@@ -17,8 +17,7 @@
     "preview": {
       "distribution": "internal",
       "ios": {
-        "simulator": false,
-        "resourceClass": "m-medium"
+        "simulator": false
       },
       "android": {
         "buildType": "apk"
@@ -26,9 +25,6 @@
     },
     "production": {
       "autoIncrement": true,
-      "ios": {
-        "resourceClass": "m-medium"
-      },
       "android": {
         "buildType": "app-bundle"
       }
