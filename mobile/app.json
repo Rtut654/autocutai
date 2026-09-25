@@ -6,6 +6,7 @@
     "scheme": "autocutai",
     "icon": "./assets/app_icon.png",
     "orientation": "portrait",
+    "userInterfaceStyle": "light",
     "platforms": [
       "ios",
       "android"
@@ -16,8 +17,18 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.bestshotai.app",
+      "buildNumber": "1",
       "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "AutoCutAI needs access to your photo library so you can choose the travel clips you want to edit.",
+        "NSPhotoLibraryAddUsageDescription": "AutoCutAI saves your finished edits back to your photo library.",
+        "NSMicrophoneUsageDescription": "AutoCutAI reads the audio from the clips you select so it can transcribe your narration.",
+        "ITSAppUsesNonExemptEncryption": false,
         "CFBundleURLTypes": [
+          {
+            "CFBundleURLSchemes": [
+              "autocutai"
+            ]
+          },
           {
             "CFBundleURLSchemes": [
               "com.googleusercontent.apps.643423102814-odqhn4m5k5jq7uuoitvbpolcvmhpfe94"
@@ -32,10 +43,28 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/app_icon.png",
         "backgroundColor": "#FFFFFF"
-      }
+      },
+      "permissions": [
+        "android.permission.READ_MEDIA_VIDEO"
+      ]
     },
     "plugins": [
-      "expo-apple-authentication"
+      "expo-apple-authentication",
+      "expo-video",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "AutoCutAI needs access to your photo library so you can choose the travel clips you want to edit."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "AutoCutAI needs access to your photo library so you can choose the travel clips you want to edit.",
+          "savePhotosPermission": "AutoCutAI saves your finished edits back to your photo library.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
     ]
   }
 }

@@ -17,7 +17,10 @@ from ..models.auth import (
     ProfileUpdateRequest,
     SignupRequest,
 )
+import os
+
 from ..services.auth_service import auth_service
+from ..services.identity_verification import IdentityVerificationError, identity_verifier
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -44,75 +47,62 @@ def _clear_session_cookies(response: Response) -> None:
     response.delete_cookie("refresh_token", path="/")
 
 
+def _start_session(response: Response, user) -> AuthResponse:
+    access_token, refresh_token = auth_service.create_session(user.id)
+    _set_session_cookies(response, access_token, refresh_token)
+    return AuthResponse(access_token=access_token, user_id=user.id)
+
+
 @router.post("/signup", response_model=AuthResponse)
 async def signup(request: SignupRequest, response: Response) -> AuthResponse:
     try:
-        auth_service.signup(request)
-        token = auth_service.login(LoginRequest(email=request.email, password=request.password))
-        user = auth_service.get_user_by_token(token)
-        if not user:
-            raise ValueError("Failed to create token")
-        access_token, refresh_token = auth_service.create_session(user.id)
-        auth_service.logout(access_token=token)
-        _set_session_cookies(response, access_token, refresh_token)
-        return AuthResponse(access_token=access_token, user_id=user.id)
+        user = auth_service.signup(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _start_session(response, user)
 
 
 @router.post("/google_login", response_model=AuthResponse)
 async def google_login(request: OAuthLoginRequest, response: Response) -> AuthResponse:
-    if not (request.email or request.provider_user_id or request.id_token):
-        raise HTTPException(status_code=400, detail="Missing Google identity payload")
-    token = auth_service.social_login(
-        "google",
-        email=request.email,
-        full_name=request.name,
-        picture=request.picture,
-        provider_user_id=request.provider_user_id,
-    )
-    user = auth_service.get_user_by_token(token)
-    if not user:
-        raise HTTPException(status_code=400, detail="Failed to create token")
-    access_token, refresh_token = auth_service.create_session(user.id)
-    auth_service.logout(access_token=token)
-    _set_session_cookies(response, access_token, refresh_token)
-    return AuthResponse(access_token=access_token, user_id=user.id)
+    """Sign in with a Google ID token.
+
+    Identity comes only from the verified token. `name` and `picture` in the
+    body are used for display if the token lacks them, nothing more.
+    """
+    if not request.id_token:
+        raise HTTPException(status_code=400, detail="Google sign-in needs an ID token.")
+    try:
+        identity = identity_verifier.verify_google(request.id_token)
+    except IdentityVerificationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    user = auth_service.social_login(identity, display_name=request.name, picture=request.picture)
+    return _start_session(response, user)
 
 
 @router.post("/apple_login", response_model=AuthResponse)
 async def apple_login(request: OAuthLoginRequest, response: Response) -> AuthResponse:
-    if not (request.email or request.provider_user_id or request.id_token or request.code):
-        raise HTTPException(status_code=400, detail="Missing Apple identity payload")
-    token = auth_service.social_login(
-        "apple",
-        email=request.email,
-        full_name=request.name,
-        picture=request.picture,
-        provider_user_id=request.provider_user_id,
-    )
-    user = auth_service.get_user_by_token(token)
-    if not user:
-        raise HTTPException(status_code=400, detail="Failed to create token")
-    access_token, refresh_token = auth_service.create_session(user.id)
-    auth_service.logout(access_token=token)
-    _set_session_cookies(response, access_token, refresh_token)
-    return AuthResponse(access_token=access_token, user_id=user.id)
+    """Sign in with an Apple identity token.
+
+    Apple puts the user's name in the app-side credential only, on first
+    sign-in, so `name` from the body is accepted as a display name.
+    """
+    if not request.id_token:
+        raise HTTPException(status_code=400, detail="Apple sign-in needs an identity token.")
+    try:
+        identity = identity_verifier.verify_apple(request.id_token)
+    except IdentityVerificationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    user = auth_service.social_login(identity, display_name=request.name)
+    return _start_session(response, user)
 
 
 @router.post("/login", response_model=AuthResponse)
 async def login(request: LoginRequest, response: Response) -> AuthResponse:
     try:
-        token = auth_service.login(request)
-        user = auth_service.get_user_by_token(token)
-        if not user:
-            raise ValueError("Invalid credentials")
-        access_token, refresh_token = auth_service.create_session(user.id)
-        auth_service.logout(access_token=token)
-        _set_session_cookies(response, access_token, refresh_token)
-        return AuthResponse(access_token=access_token, user_id=user.id)
+        user = auth_service.authenticate(request)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    return _start_session(response, user)
 
 
 @router.post("/refresh", response_model=AuthResponse)
@@ -196,10 +186,22 @@ async def start_payment(request: PaymentStartRequest, authorization: str = Heade
 
 @router.post("/payments/activate", response_model=MeResponse)
 async def activate_payment(request: PaymentStartRequest, authorization: str = Header(default="")) -> MeResponse:
+    """Grant a plan. Disabled unless explicitly enabled for internal testing.
+
+    There is no receipt or webhook verification behind this, so leaving it on
+    lets any signed-in user give themselves a paid plan. It returns 403 until
+    App Store / Stripe verification replaces it.
+    """
     token = authorization.replace("Bearer", "").strip()
     user = auth_service.get_user_by_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if os.getenv("AUTOCUT_ALLOW_UNVERIFIED_PURCHASES", "").lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="Purchases are not available yet. Every feature is free during testing.",
+        )
 
     updated = auth_service.set_subscription(user.id, request.plan)
     return _me_response(updated)

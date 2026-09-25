@@ -34,6 +34,33 @@ class TrackType(str, Enum):
     IMAGE = "image"
 
 
+class TrackOrientation(str, Enum):
+    HORIZONTAL = "horizontal"
+    VERTICAL = "vertical"
+    SQUARE = "square"
+    UNKNOWN = "unknown"
+
+
+class TrackRole(str, Enum):
+    PRIMARY = "primary"
+    BACKGROUND = "background"
+
+
+class BackgroundMusicPreset(str, Enum):
+    AMBIENT_PULSE = "ambient_pulse"
+    UPBEAT_MOTION = "upbeat_motion"
+    WARM_FOCUS = "warm_focus"
+
+
+class BackgroundMusicSettings(BaseModel):
+    """Background music settings for one track edit flow."""
+
+    enabled: bool = Field(default=False, description="Whether background music should be active")
+    preset: BackgroundMusicPreset = Field(default=BackgroundMusicPreset.AMBIENT_PULSE, description="Selected music preset")
+    volume: float = Field(default=0.16, description="Music gain mix level from 0 to 1")
+    ducking: float = Field(default=0.72, description="How strongly the music ducks under narration from 0 to 1")
+
+
 class VideoTrack(BaseModel):
     """Model for video track data."""
     
@@ -49,9 +76,38 @@ class VideoTrack(BaseModel):
     transcription: Optional[Dict[str, Any]] = Field(None, description="Transcription data if available")
     has_voice: bool = Field(default=False, description="Whether narration/voice exists in track")
     recorded_at: Optional[datetime] = Field(None, description="Capture time used for chronological ordering")
+    orientation: TrackOrientation = Field(default=TrackOrientation.UNKNOWN, description="Normalized track orientation")
+    width: Optional[int] = Field(default=None, description="Normalized display width in pixels")
+    height: Optional[int] = Field(default=None, description="Normalized display height in pixels")
     local_gap_ranges: List["GapRange"] = Field(
         default_factory=list, description="Track-local pause ranges to remove"
     )
+    background_music: BackgroundMusicSettings = Field(
+        default_factory=BackgroundMusicSettings,
+        description="Per-track background music settings",
+    )
+    render_versions: List["TrackRenderVersion"] = Field(
+        default_factory=list,
+        description="Rendered output versions for this track",
+    )
+    role: TrackRole = Field(default=TrackRole.PRIMARY, description="How the clip should be used in the edit")
+    background_description: Optional[str] = Field(
+        default=None,
+        description="Short user-written description for background/b-roll usage",
+    )
+    background_trim_start: float = Field(
+        default=0.0,
+        description="Saved trim start for background usage preview/rendering",
+    )
+    background_trim_end: Optional[float] = Field(
+        default=None,
+        description="Saved trim end for background usage preview/rendering",
+    )
+    background_playback_rate: float = Field(
+        default=1.0,
+        description="Saved playback rate for background usage preview/rendering",
+    )
+    status: Literal["visible", "hidden"] = Field(default="visible", description="Visibility within the project")
     excluded: bool = Field(default=False, description="Soft-deleted from project (file kept on disk)")
 
 
@@ -65,6 +121,24 @@ class ProjectSettings(BaseModel):
     generate_subtitles: bool = Field(default=False, description="Generate subtitles (pro feature)")
     insert_suggestions: bool = Field(default=False, description="Insert media suggestions (pro feature)")
     min_gap_seconds: float = Field(default=1.0, description="Minimum silence gap to auto-cut")
+    caption_style: Literal["bold", "boxed", "clean", "none"] = Field(
+        default="bold",
+        description="Burned-in caption look: word-by-word highlight (bold, boxed), plain lines (clean), or none",
+    )
+    fill_mode: Literal["blur", "crop", "black"] = Field(
+        default="blur",
+        description="How clips whose shape differs from the canvas are framed",
+    )
+    audio_cleanup: bool = Field(
+        default=True,
+        description="Reduce wind rumble and background noise, and normalise loudness to -14 LUFS",
+    )
+    broll_max_seconds: float = Field(
+        default=6.0,
+        ge=0.0,
+        le=60.0,
+        description="Longest a clip without narration may run in the edit; 0 keeps it whole",
+    )
 
 
 class GapRange(BaseModel):
@@ -76,6 +150,166 @@ class GapRange(BaseModel):
     reason: str = Field(default="silence_gap", description="Reason this interval is removable")
 
 
+class SpeechFilterCut(BaseModel):
+    """A suggested transcript-driven cut range within one track."""
+
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    duration: float = Field(..., description="Cut duration in seconds")
+    reason: str = Field(..., description="Why this region is suggested for removal")
+    transcript: str = Field(default="", description="Words covered by this cut")
+    confidence: float = Field(default=0.5, description="Confidence score from 0 to 1")
+
+
+class ZoomPreviewBeat(BaseModel):
+    """A logical transcript beat used for punch-in preview timing."""
+
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    duration: float = Field(..., description="Beat duration in seconds")
+    text: str = Field(default="", description="Transcript text associated with the beat")
+    enabled: bool = Field(default=False, description="Whether the zoom effect should apply on this beat")
+    scale: float = Field(default=1.12, description="Target scale for gradual center zoom preview")
+
+
+class SpeechFilterArtifact(BaseModel):
+    """Persisted speech-filter suggestions for a single track."""
+
+    project_id: str = Field(..., description="Project ID")
+    track_id: str = Field(..., description="Track ID")
+    filename: str = Field(..., description="Original filename")
+    status: Literal["completed", "error"] = Field(..., description="Generation result")
+    summary: str = Field(default="", description="Human-readable summary of the suggested cuts")
+    cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Suggested removable ranges")
+    zoom_beats: List[ZoomPreviewBeat] = Field(
+        default_factory=list,
+        description="Logical transcript beats used for preview zoom timing",
+    )
+    generated_at: datetime = Field(default_factory=datetime.utcnow, description="Artifact creation timestamp")
+    source_word_count: int = Field(default=0, description="Number of words evaluated")
+    model: str = Field(default="heuristic", description="Model/provider used to generate the suggestions")
+    error_message: Optional[str] = Field(default=None, description="Error detail if generation failed")
+
+
+class SpeechFilterUpdateRequest(BaseModel):
+    """Manual edits to persisted speech-filter suggestions."""
+
+    cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Edited removable ranges")
+
+
+class VisualAssetKind(str, Enum):
+    ANIMATION = "animation"
+    WEB_IMAGE = "web_image"
+
+
+class VisualAssetStatus(str, Enum):
+    PLANNED = "planned"
+    READY = "ready"
+    ERROR = "error"
+
+
+class VisualPlanPart(BaseModel):
+    """A timed visual enhancement aligned to narration."""
+
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+    duration: float = Field(..., description="Duration in seconds")
+    text: str = Field(default="", description="Narration text this visual supports")
+    visual_type: VisualAssetKind = Field(default=VisualAssetKind.ANIMATION, description="Animation or image")
+    prompt: str = Field(default="", description="Creative brief for the worker")
+    search_query: Optional[str] = Field(default=None, description="Optional search query for external image sourcing")
+    animation_kind: Optional[str] = Field(default=None, description="Explicit animation motif/category for overlay rendering")
+    title: Optional[str] = Field(default=None, description="Short visual title, usually 1 to 4 words")
+    keywords: List[str] = Field(default_factory=list, description="Short on-screen keywords or tags")
+    scene_objects: List[str] = Field(default_factory=list, description="Named visual objects to render in the scene")
+    placement: Optional[str] = Field(default=None, description="Preferred placement in frame, such as top_left or lower_right")
+    density: Optional[str] = Field(default=None, description="Visual density, usually light or medium")
+    palette: Optional[str] = Field(default=None, description="Color system for the composition, such as cool, mint, sunset, mono")
+    variant: Optional[str] = Field(default=None, description="Variant key within the animation family")
+    motion_profile: Optional[str] = Field(default=None, description="Motion treatment, such as calm, punchy, drift")
+    background_style: Optional[str] = Field(default="transparent", description="Background treatment, default transparent")
+    asset_status: VisualAssetStatus = Field(default=VisualAssetStatus.PLANNED, description="Worker result status")
+    asset_url: Optional[str] = Field(default=None, description="Source URL for downloaded image if used")
+    local_path: Optional[str] = Field(default=None, description="Local cached asset path if available")
+    transition_in: Optional[str] = Field(default=None, description="Reserved for future transition style")
+    transition_out: Optional[str] = Field(default=None, description="Reserved for future transition style")
+    sfx: Optional[str] = Field(default=None, description="Reserved for future sound effect cue")
+
+
+class VisualPlanArtifact(BaseModel):
+    """Separate visual worker artifact for script-following animations/images."""
+
+    project_id: str = Field(..., description="Project ID")
+    track_id: str = Field(..., description="Track ID")
+    filename: str = Field(..., description="Original filename")
+    status: Literal["completed", "error"] = Field(..., description="Generation result")
+    summary: str = Field(default="", description="Human-readable summary")
+    parts: List[VisualPlanPart] = Field(default_factory=list, description="Timed visual enhancement plan")
+    generated_at: datetime = Field(default_factory=datetime.utcnow, description="Artifact creation timestamp")
+    source_word_count: int = Field(default=0, description="Number of words evaluated")
+    model: str = Field(default="heuristic", description="Planner model/provider")
+    worker: str = Field(default="visual_enhancement_worker", description="Worker identity")
+    error_message: Optional[str] = Field(default=None, description="Error detail if generation failed")
+
+
+class TrackRenderVersion(BaseModel):
+    """A persisted rendered clip version for one track."""
+
+    id: str = Field(..., description="Unique render version ID")
+    label: str = Field(..., description="Human-readable version label")
+    filename: str = Field(..., description="Rendered filename")
+    file_path: str = Field(..., description="Absolute or project-relative render path")
+    created_at: datetime = Field(default_factory=datetime.utcnow, description="Creation timestamp")
+    source: Literal["speech_filter"] = Field(default="speech_filter", description="Source edit pipeline")
+    cut_count: int = Field(default=0, description="Number of cuts applied in this render")
+    duration_before: float = Field(default=0.0, description="Original clip duration")
+    duration_after: float = Field(default=0.0, description="Rendered clip duration")
+
+
+class TrackRenderRequest(BaseModel):
+    """Request payload for rendering the current track edit state."""
+
+    cuts: List[SpeechFilterCut] = Field(default_factory=list, description="Current editable cut ranges")
+
+
+class TrackBackgroundMusicUpdateRequest(BaseModel):
+    """Persisted background music settings for a track."""
+
+    enabled: bool = Field(default=False, description="Whether background music is enabled")
+    preset: BackgroundMusicPreset = Field(default=BackgroundMusicPreset.AMBIENT_PULSE, description="Preset key")
+    volume: float = Field(default=0.16, description="Music level")
+    ducking: float = Field(default=0.72, description="Music ducking under voice")
+
+
+class TrackBackgroundVideoUpdateRequest(BaseModel):
+    """Persisted background-clip role and description."""
+
+    role: Optional[TrackRole] = Field(default=None, description="Primary editable clip or background support clip")
+    background_description: Optional[str] = Field(
+        default=None,
+        description="Required semantic description when the clip is used as background",
+    )
+    background_trim_start: Optional[float] = Field(
+        default=None,
+        description="Optional background trim start in seconds",
+    )
+    background_trim_end: Optional[float] = Field(
+        default=None,
+        description="Optional background trim end in seconds",
+    )
+    background_playback_rate: Optional[float] = Field(
+        default=None,
+        description="Optional background playback rate from 0.5x to 10x",
+    )
+
+
+class TrackRenderResponse(BaseModel):
+    """Response payload after rendering a new track version."""
+
+    version: TrackRenderVersion = Field(..., description="Created render version")
+    message: str = Field(..., description="Response message")
+
+
 class InsertionSuggestion(BaseModel):
     """Recommended insertions to support narration moments."""
 
@@ -84,6 +318,34 @@ class InsertionSuggestion(BaseModel):
     media_type: Literal["picture", "meme_video", "broll"] = Field(
         default="picture", description="Suggested media type"
     )
+
+
+class BackgroundVideoPlacement(BaseModel):
+    """A suggested use of one background clip against narration."""
+
+    track_id: str = Field(..., description="Background track ID")
+    filename: str = Field(..., description="Background track filename")
+    description: str = Field(..., description="User-supplied semantic description")
+    start: float = Field(..., description="Suggested narration timeline start")
+    end: float = Field(..., description="Suggested narration timeline end")
+    duration: float = Field(..., description="Suggested visible duration")
+    transcript_excerpt: str = Field(default="", description="Narration excerpt that this background clip supports")
+    rationale: str = Field(default="", description="Why this clip fits here")
+    confidence: float = Field(default=0.5, description="Confidence score from 0 to 1")
+
+
+class BackgroundVideoPlanArtifact(BaseModel):
+    """Project-level worker output for fitting user-labeled background clips into narration."""
+
+    project_id: str = Field(..., description="Project ID")
+    status: Literal["completed", "error"] = Field(..., description="Generation result")
+    summary: str = Field(default="", description="Human-readable summary")
+    placements: List[BackgroundVideoPlacement] = Field(default_factory=list, description="Suggested timed placements")
+    generated_at: datetime = Field(default_factory=datetime.utcnow, description="Artifact creation timestamp")
+    source_word_count: int = Field(default=0, description="Number of narration words evaluated")
+    model: str = Field(default="heuristic", description="Planner model/provider")
+    worker: str = Field(default="background_video_worker", description="Worker identity")
+    error_message: Optional[str] = Field(default=None, description="Error detail if generation failed")
 
 
 class SubtitleCue(BaseModel):
@@ -107,6 +369,10 @@ class ProjectPipeline(BaseModel):
     gap_ranges: List[GapRange] = Field(default_factory=list, description="Project-level gaps")
     insertion_suggestions: List[InsertionSuggestion] = Field(
         default_factory=list, description="AI insertion suggestions"
+    )
+    background_video_suggestions: List[BackgroundVideoPlacement] = Field(
+        default_factory=list,
+        description="Project-level suggestions for where to overlay labeled background clips",
     )
     locations: List[str] = Field(default_factory=list, description="Detected location tags")
     render_plan: Dict[str, Any] = Field(default_factory=dict, description="Computed render instructions")
@@ -189,7 +455,33 @@ class ProjectUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, description="Project name")
     description: Optional[str] = Field(None, description="Project description")
     settings: Optional[ProjectSettings] = Field(None, description="Project settings")
-    tracks: Optional[List[VideoTrack]] = Field(None, description="Project tracks")
+    # Tracks are deliberately not updatable here. Each track carries a server
+    # file path, and accepting them from a client let it point a track at any
+    # file on the server and download it through the media endpoint. Tracks
+    # change through the reorder, exclude and add-tracks endpoints instead.
+
+    model_config = {"extra": "forbid"}
+
+
+class ProjectSettingsPatch(BaseModel):
+    """A partial settings change; fields left out keep their current value."""
+
+    model_config = {"extra": "forbid"}
+
+    caption_style: Optional[Literal["bold", "boxed", "clean", "none"]] = None
+    fill_mode: Optional[Literal["blur", "crop", "black"]] = None
+    audio_cleanup: Optional[bool] = None
+    broll_max_seconds: Optional[float] = Field(default=None, ge=0.0, le=60.0)
+    generate_subtitles: Optional[bool] = None
+    smart_pause_cutter: Optional[bool] = None
+    aspect_ratio: Optional[AspectRatio] = None
+    min_gap_seconds: Optional[float] = Field(default=None, ge=0.3, le=10.0)
+
+
+class TrackReorderRequest(BaseModel):
+    """Persisted manual clip order."""
+
+    track_ids: List[str] = Field(..., description="Track IDs in the desired order")
 
 
 class ProjectResponse(BaseModel):

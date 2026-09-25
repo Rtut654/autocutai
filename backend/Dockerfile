@@ -5,13 +5,30 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
     UVICORN_RELOAD=false \
-    UPLOAD_DIR=/app/data/uploads \
-    OUTPUT_DIR=/app/data/outputs
+    AUTOCUT_DATA_DIR=/app/data
 
 WORKDIR /app
 
+# ffmpeg for media work. Captions use the Montserrat files bundled in
+# app/assets/fonts, which cover Latin (including Vietnamese) and Cyrillic.
+# DejaVu is the fallback for Greek, Hebrew and Arabic. Narration in Thai,
+# Chinese, Japanese, Korean or Hindi needs a Noto package added here
+# (fonts-noto-cjk, fonts-thai-tlwg) or those captions render as boxes.
+# The rest are runtime dependencies of the Azure
+# Speech SDK's native libraries: OpenSSL 3 for transport, ALSA and libuuid
+# for its audio extension. Without libasound the SDK import fails at runtime,
+# not at build time, so it is easy to miss.
+# libasound2 was renamed libasound2t64 after Debian bookworm; accept either.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        fontconfig \
+        fonts-dejavu-core \
+        ca-certificates \
+        libssl3 \
+        libuuid1 \
+    && (apt-get install -y --no-install-recommends libasound2 \
+        || apt-get install -y --no-install-recommends libasound2t64) \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -19,11 +36,14 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
+# Fail the build, not the first request, if the native SDK cannot load.
+RUN python -c "import azure.cognitiveservices.speech as s; s.SpeechConfig(subscription='x'*32, region='westeurope')"
+
 COPY app ./app
 COPY main.py ./main.py
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /app/data/uploads /app/data/outputs \
+    && mkdir -p /app/data \
     && chown -R appuser:appuser /app
 
 USER appuser

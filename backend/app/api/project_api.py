@@ -7,7 +7,7 @@ import logging
 import mimetypes
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from .auth_dependencies import get_current_user
 from ..models.project import (
     AspectRatio,
+    BackgroundVideoPlanArtifact,
     EditMode,
     HybridProjectAnalyzeRequest,
     ProcessingStatus,
@@ -23,32 +24,71 @@ from ..models.project import (
     ProjectListResponse,
     ProjectResponse,
     ProjectSettings,
+    ProjectSettingsPatch,
+    TrackReorderRequest,
     ProjectUpdateRequest,
+    SpeechFilterArtifact,
+    SpeechFilterUpdateRequest,
+    TrackBackgroundVideoUpdateRequest,
+    TrackBackgroundMusicUpdateRequest,
+    TrackRenderRequest,
+    TrackRenderResponse,
+    VisualPlanArtifact,
+)
+from ..services.project_limits import (
+    ProjectLimitError,
+    max_upload_bytes,
+    check_clip_count,
+    check_total_duration,
 )
 from ..services.project_service import project_service
+from ..services.background_video_worker_service import background_video_worker_service
 from ..services.video_processor import video_processor
+from ..services.visual_worker_service import visual_worker_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
+CHUNK_BYTES = 4 * 1024 * 1024
+
+
+async def _stream_upload_to(upload: UploadFile, destination: Path) -> int:
+    """Copy an upload to disk in chunks and return the byte count.
+
+    Reading a multi-gigabyte clip with ``await upload.read()`` would hold the
+    whole file in memory; travel footage is exactly the case that breaks.
+    """
+    written = 0
+    limit = max_upload_bytes()
+    with destination.open("wb") as handle:
+        while chunk := await upload.read(CHUNK_BYTES):
+            written += len(chunk)
+            if written > limit:
+                handle.close()
+                destination.unlink(missing_ok=True)
+                raise ProjectLimitError(
+                    f"{upload.filename} is larger than the {limit // (1024 * 1024)} MB per-file limit."
+                )
+            handle.write(chunk)
+    return written
+
+
+def _is_duplicate_track_upload(project, filename: str, size: int) -> bool:
+    normalized_name = Path(filename).name.lower()
+    for track in project.tracks:
+        existing_name = str(track.filename or "").strip().lower()
+        existing_size = track.metadata.get("size")
+        if existing_name == normalized_name and existing_size == size:
+            return True
+    return False
+
+
 def _resolve_existing_project_path(path_value: str | None, project_id: str, current_user_id: str) -> Path:
-    if not path_value:
+    resolved = project_service.resolve_owned_path(current_user_id, project_id, path_value)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Media file not found")
-
-    candidates = [
-        Path(path_value),
-        Path.cwd() / path_value,
-        Path.cwd().parent / path_value,
-        project_service.get_project_dir(current_user_id, project_id, create=True) / Path(path_value).name,
-        project_service.get_project_video_dir(current_user_id, project_id) / Path(path_value).name,
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    raise HTTPException(status_code=404, detail="Media file not found")
+    return resolved
 
 
 @router.post("/hybrid-analyze", response_model=ProjectResponse)
@@ -56,6 +96,12 @@ async def hybrid_analyze_project(
     request: HybridProjectAnalyzeRequest,
     current_user=Depends(get_current_user),
 ):
+    try:
+        check_clip_count(len(request.tracks))
+        check_total_duration(track.duration for track in request.tracks)
+    except ProjectLimitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         project = await project_service.analyze_hybrid_project(request, user_id=current_user.id)
         return ProjectResponse(project=project, message="Hybrid analysis completed")
@@ -65,6 +111,7 @@ async def hybrid_analyze_project(
 
 @router.post("/", response_model=ProjectResponse)
 async def create_project(
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
     name: str = Form(...),
     description: Optional[str] = Form(None),
@@ -75,20 +122,34 @@ async def create_project(
     generate_subtitles: bool = Form(default=True),
     insert_suggestions: bool = Form(default=True),
     min_gap_seconds: float = Form(default=1.0),
+    caption_style: Literal["bold", "boxed", "clean", "none"] = Form(default="bold"),
+    fill_mode: Literal["blur", "crop", "black"] = Form(default="blur"),
+    audio_cleanup: bool = Form(default=True),
+    broll_max_seconds: float = Form(default=6.0, ge=0.0, le=60.0),
     capture_times_json: Optional[str] = Form(default=None),
     metadata_json: Optional[str] = Form(default=None),
     files: List[UploadFile] = File(...),
 ):
     try:
-        project_id = str(uuid4())
+        check_clip_count(len(files))
+    except ProjectLimitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        saved_files: List[str] = []
+    project_id = str(uuid4())
+    saved_files: List[str] = []
+    try:
         for upload in files:
             if not upload.filename:
                 raise HTTPException(status_code=400, detail="Each file needs a filename")
             destination = project_service.reserve_project_video_path(current_user.id, project_id, upload.filename)
-            destination.write_bytes(await upload.read())
+            await _stream_upload_to(upload, destination)
             saved_files.append(str(destination))
+    except ProjectLimitError as exc:
+        for path in saved_files:
+            Path(path).unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
 
         capture_times: Optional[List[Optional[datetime]]] = None
         if capture_times_json:
@@ -107,6 +168,10 @@ async def create_project(
             generate_subtitles=generate_subtitles,
             insert_suggestions=insert_suggestions,
             min_gap_seconds=min_gap_seconds,
+            caption_style=caption_style,
+            fill_mode=fill_mode,
+            audio_cleanup=audio_cleanup,
+            broll_max_seconds=broll_max_seconds,
         )
 
         request = ProjectCreateRequest(
@@ -119,6 +184,15 @@ async def create_project(
         )
 
         project = await project_service.create_project_with_id(project_id, request, user_id=current_user.id)
+
+        try:
+            check_total_duration(track.duration for track in project.tracks)
+        except ProjectLimitError as exc:
+            await project_service.delete_project(project_id, user_id=current_user.id)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if project_service.project_has_missing_transcripts(project):
+            background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
         return ProjectResponse(project=project, message="Project created successfully")
     except HTTPException:
         raise
@@ -138,10 +212,16 @@ async def list_projects(
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
-async def get_project(project_id: str, current_user=Depends(get_current_user)):
+async def get_project(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+):
     project = await project_service.get_project(project_id, user_id=current_user.id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project_service.project_has_missing_transcripts(project):
+        background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
     return ProjectResponse(project=project, message="Project retrieved successfully")
 
 
@@ -151,6 +231,25 @@ async def update_project(project_id: str, request: ProjectUpdateRequest, current
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return ProjectResponse(project=project, message="Project updated successfully")
+
+
+@router.patch("/{project_id}/settings", response_model=ProjectResponse)
+async def update_project_settings(
+    project_id: str,
+    request: ProjectSettingsPatch,
+    current_user=Depends(get_current_user),
+):
+    """Change how the edit looks. Takes effect on the next render."""
+    project = await project_service.get_project(project_id, user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    changes = request.model_dump(exclude_none=True)
+    merged = project.settings.model_copy(update=changes)
+    updated = await project_service.update_project(
+        project_id, ProjectUpdateRequest(settings=ProjectSettings(**merged.model_dump())), user_id=current_user.id
+    )
+    return ProjectResponse(project=updated, message="Settings updated")
 
 
 @router.delete("/{project_id}")
@@ -190,25 +289,7 @@ async def get_processing_status(project_id: str, current_user=Depends(get_curren
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    current_step = "idle"
-    progress = 0.0
-    if project.status == "processing":
-        current_step = "analyzing"
-        progress = 45.0
-    elif project.status == "completed":
-        current_step = "completed"
-        progress = 100.0
-    elif project.status == "error":
-        current_step = "error"
-
-    return ProcessingStatus(
-        project_id=project_id,
-        status=project.status,
-        progress=progress,
-        current_step=current_step,
-        estimated_time_remaining=None,
-        error_message=project.error_message,
-    )
+    return project_service.describe_progress(project)
 
 
 @router.get("/{project_id}/timeline")
@@ -258,6 +339,17 @@ async def get_insertions(project_id: str, current_user=Depends(get_current_user)
     }
 
 
+@router.get("/{project_id}/background-video-plan", response_model=BackgroundVideoPlanArtifact)
+async def get_background_video_plan(project_id: str, current_user=Depends(get_current_user)):
+    artifact = await background_video_worker_service.get_project_background_video_plan(
+        project_id,
+        user_id=current_user.id,
+    )
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Background video plan not found")
+    return artifact
+
+
 @router.get("/{project_id}/download")
 async def download_project_output(project_id: str, current_user=Depends(get_current_user)):
     project = await project_service.get_project(project_id, user_id=current_user.id)
@@ -281,14 +373,16 @@ async def exclude_track(project_id: str, track_id: str, current_user=Depends(get
         raise HTTPException(status_code=404, detail="Track not found")
 
     track.excluded = not track.excluded
+    track.status = "hidden" if track.excluded else "visible"
     project.updated_at = datetime.now()
     await project_service._save_project(project)
-    return {"track_id": track_id, "excluded": track.excluded}
+    return {"track_id": track_id, "excluded": track.excluded, "status": track.status}
 
 
 @router.post("/{project_id}/tracks", response_model=ProjectResponse)
 async def add_tracks_to_project(
     project_id: str,
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
     files: List[UploadFile] = File(...),
     capture_times_json: Optional[str] = Form(default=None),
@@ -298,13 +392,29 @@ async def add_tracks_to_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    existing_tracks = [track for track in project.tracks if not track.excluded]
+    try:
+        check_clip_count(len(files), existing_clips=len(existing_tracks))
+    except ProjectLimitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     saved_files: List[str] = []
-    for upload in files:
-        if not upload.filename:
-            raise HTTPException(status_code=400, detail="Each file needs a filename")
-        destination = project_service.reserve_project_video_path(current_user.id, project_id, upload.filename)
-        destination.write_bytes(await upload.read())
-        saved_files.append(str(destination))
+    skipped_duplicates = 0
+    try:
+        for upload in files:
+            if not upload.filename:
+                raise HTTPException(status_code=400, detail="Each file needs a filename")
+            destination = project_service.reserve_project_video_path(current_user.id, project_id, upload.filename)
+            written = await _stream_upload_to(upload, destination)
+            if _is_duplicate_track_upload(project, upload.filename, written):
+                destination.unlink(missing_ok=True)
+                skipped_duplicates += 1
+                continue
+            saved_files.append(str(destination))
+    except ProjectLimitError as exc:
+        for path in saved_files:
+            Path(path).unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     capture_times = None
     if capture_times_json:
@@ -328,10 +438,241 @@ async def add_tracks_to_project(
         )
         project.tracks.append(track)
 
-    project.tracks = project_service._sorted_tracks(project.tracks)
+    try:
+        check_total_duration(track.duration for track in project.tracks if not track.excluded)
+    except ProjectLimitError as exc:
+        for path in saved_files:
+            Path(path).unlink(missing_ok=True)
+        project.tracks = [track for track in project.tracks if track.file_path not in saved_files]
+        await project_service._save_project(project)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    project.tracks = project_service._ordered_tracks(project.tracks, project.settings.edit_mode)
+    project_service.mark_missing_transcripts_pending(project)
     project.updated_at = datetime.now()
     await project_service._save_project(project)
+    if project_service.project_has_missing_transcripts(project):
+        background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
+    if not saved_files and skipped_duplicates:
+        return ProjectResponse(project=project, message="All selected clips were already uploaded")
+    if skipped_duplicates:
+        return ProjectResponse(project=project, message=f"Tracks added successfully ({skipped_duplicates} duplicates skipped)")
     return ProjectResponse(project=project, message="Tracks added successfully")
+
+
+@router.patch("/{project_id}/tracks/reorder", response_model=ProjectResponse)
+async def reorder_project_tracks(
+    project_id: str,
+    request: TrackReorderRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        project = await project_service.reorder_project_tracks(
+            project_id,
+            request.track_ids,
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "Project not found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return ProjectResponse(project=project, message="Track order updated")
+
+
+@router.patch("/{project_id}/tracks/{track_id}/background-music", response_model=ProjectResponse)
+async def update_track_background_music(
+    project_id: str,
+    track_id: str,
+    request: TrackBackgroundMusicUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        project = await project_service.update_track_background_music(
+            project_id,
+            track_id,
+            request.model_dump(),
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    return ProjectResponse(project=project, message="Background music updated")
+
+
+@router.patch("/{project_id}/tracks/{track_id}/background-video", response_model=ProjectResponse)
+async def update_track_background_video(
+    project_id: str,
+    track_id: str,
+    request: TrackBackgroundVideoUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        project = await project_service.update_track_background_video(
+            project_id,
+            track_id,
+            request.model_dump(exclude_unset=True),
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    return ProjectResponse(project=project, message="Background clip updated")
+
+
+@router.post("/{project_id}/background-video-plan", response_model=BackgroundVideoPlanArtifact)
+async def generate_background_video_plan(project_id: str, current_user=Depends(get_current_user)):
+    try:
+        return await background_video_worker_service.generate_project_background_video_plan(
+            project_id,
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "Project not found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate background video plan: {exc}") from exc
+
+
+@router.post("/{project_id}/transcribe-missing", response_model=ProjectResponse)
+async def transcribe_missing_project_tracks(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+):
+    project = await project_service.get_project(project_id, user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_service.mark_missing_transcripts_pending(project)
+    project.updated_at = datetime.utcnow()
+    await project_service._save_project(project)
+
+    if project_service.project_has_missing_transcripts(project):
+        background_tasks.add_task(project_service.backfill_missing_transcripts, project.id, current_user.id)
+        return ProjectResponse(project=project, message="Transcript processing started")
+
+    return ProjectResponse(project=project, message="All transcripts already available")
+
+
+@router.get("/{project_id}/tracks/{track_id}/speech-filter", response_model=SpeechFilterArtifact)
+async def get_track_speech_filter(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    artifact = await project_service.get_track_speech_filter(project_id, track_id, user_id=current_user.id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Speech filter suggestions not found")
+    return artifact
+
+
+@router.post("/{project_id}/tracks/{track_id}/speech-filter", response_model=SpeechFilterArtifact)
+async def generate_track_speech_filter(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return await project_service.generate_track_speech_filter(project_id, track_id, user_id=current_user.id)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate speech filter suggestions: {exc}") from exc
+
+
+@router.patch("/{project_id}/tracks/{track_id}/speech-filter", response_model=SpeechFilterArtifact)
+async def update_track_speech_filter(
+    project_id: str,
+    track_id: str,
+    request: SpeechFilterUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return await project_service.update_track_speech_filter(
+            project_id,
+            track_id,
+            [cut.model_dump() for cut in request.cuts],
+            user_id=current_user.id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update speech filter suggestions: {exc}") from exc
+
+
+@router.get("/{project_id}/tracks/{track_id}/visual-plan", response_model=VisualPlanArtifact)
+async def get_track_visual_plan(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    artifact = await visual_worker_service.get_track_visual_plan(project_id, track_id, user_id=current_user.id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Visual plan not found")
+    return artifact
+
+
+@router.post("/{project_id}/tracks/{track_id}/visual-plan", response_model=VisualPlanArtifact)
+async def generate_track_visual_plan(
+    project_id: str,
+    track_id: str,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return await visual_worker_service.generate_track_visual_plan(project_id, track_id, user_id=current_user.id)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate visual plan: {exc}") from exc
+
+
+@router.get("/{project_id}/tracks/{track_id}/visual-assets/{part_index}")
+async def get_track_visual_asset(
+    project_id: str,
+    track_id: str,
+    part_index: int,
+    current_user=Depends(get_current_user),
+):
+    artifact = await visual_worker_service.get_track_visual_plan(project_id, track_id, user_id=current_user.id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Visual plan not found")
+    if part_index < 0 or part_index >= len(artifact.parts):
+        raise HTTPException(status_code=404, detail="Visual asset not found")
+
+    part = artifact.parts[part_index]
+    if not part.local_path:
+        raise HTTPException(status_code=404, detail="Visual asset not ready")
+
+    asset_path = Path(part.local_path)
+    if not asset_path.exists():
+        raise HTTPException(status_code=404, detail="Visual asset not found")
+
+    media_type, _ = mimetypes.guess_type(asset_path.name)
+    return FileResponse(
+        asset_path,
+        media_type=media_type or "application/octet-stream",
+        filename=asset_path.name,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
 
 
 @router.get("/{project_id}/tracks/{track_id}/media")
@@ -364,7 +705,63 @@ async def download_project_track_media(project_id: str, track_id: str, current_u
         except RuntimeError as exc:
             logger.warning("Falling back to original track media for %s: %s", track.id, exc)
 
-    return FileResponse(served_path, media_type=media_type or "application/octet-stream", filename=served_filename)
+    return FileResponse(
+        served_path,
+        media_type=media_type or "application/octet-stream",
+        filename=served_filename,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
+
+
+@router.post("/{project_id}/tracks/{track_id}/render", response_model=TrackRenderResponse)
+async def render_project_track_version(
+    project_id: str,
+    track_id: str,
+    request: TrackRenderRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        version = await project_service.render_track_version(
+            project_id,
+            track_id,
+            cuts=[cut.model_dump() for cut in request.cuts],
+            user_id=current_user.id,
+        )
+        return TrackRenderResponse(version=version, message="Track version rendered successfully")
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"Project not found", "Track not found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to render track version: {exc}") from exc
+
+
+@router.get("/{project_id}/tracks/{track_id}/renders/{version_id}")
+async def download_project_track_render_version(
+    project_id: str,
+    track_id: str,
+    version_id: str,
+    current_user=Depends(get_current_user),
+):
+    resolved = await project_service.get_track_render_version(
+        project_id,
+        track_id,
+        version_id,
+        user_id=current_user.id,
+    )
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Rendered version not found")
+
+    _, _, version = resolved
+    render_path = _resolve_existing_project_path(version.file_path, project_id, current_user.id)
+    media_type, _ = mimetypes.guess_type(version.filename)
+    return FileResponse(
+        render_path,
+        media_type=media_type or "video/mp4",
+        filename=version.filename,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
 
 
 @router.get("/{project_id}/subtitles")

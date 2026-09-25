@@ -10,12 +10,15 @@ backvenv/
 
 # macOS
 .DS_Store
+.env
 
 # Mobile/Web heavy generated folders
 mobile/node_modules/
 mobile/.expo/
-mobile/ios/build/
-mobile/android/build/
+# Native projects are generated from app.json by `expo prebuild`.
+# Do not commit them: a stale copy silently ignores config changes.
+mobile/ios/
+mobile/android/
 web/node_modules/
 web/.next/
 web/.next-dev/
@@ -31,3 +34,13 @@ dist/
 backend/projects/
 projects/
 temp/
+
+# Local state, databases and secrets - never commit these
+*.db
+*.sqlite
+*.sqlite3
+backend/.runtime/
+.env
+.env.*
+!.env.example
+!.env.docker.example

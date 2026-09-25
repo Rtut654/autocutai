@@ -7,18 +7,23 @@ services:
     environment:
       PORT: 8000
       UVICORN_RELOAD: "false"
-      WHISPER_API_URL: ${WHISPER_API_URL:-https://testsucceed.com/whisper}
-      WHISPER_URL: ${WHISPER_URL:-https://testsucceed.com/whisper}
+      AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY:-}
+      AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-westeurope}
+      AZURE_SPEECH_ENDPOINT: ${AZURE_SPEECH_ENDPOINT:-}
+      AZURE_SPEECH_LANGUAGE: ${AZURE_SPEECH_LANGUAGE:-en-US}
+      AZURE_SPEECH_CANDIDATE_LOCALES: ${AZURE_SPEECH_CANDIDATE_LOCALES:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      UPLOAD_DIR: /app/data/uploads
-      OUTPUT_DIR: /app/data/outputs
+      AUTOCUT_DATA_DIR: /app/data
+      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-643423102814-odqhn4m5k5jq7uuoitvbpolcvmhpfe94.apps.googleusercontent.com}
+      APPLE_AUDIENCES: ${APPLE_AUDIENCES:-com.bestshotai.app}
+      AUTOCUT_ALLOW_UNVERIFIED_PURCHASES: ${AUTOCUT_ALLOW_UNVERIFIED_PURCHASES:-false}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
-      - backend_uploads:/app/data/uploads
-      - backend_outputs:/app/data/outputs
+      - backend_data:/app/data
     healthcheck:
       test:
         [
@@ -58,5 +63,4 @@ services:
       start_period: 20s
 
 volumes:
-  backend_uploads:
-  backend_outputs:
+  backend_data:

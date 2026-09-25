@@ -1,12 +1,14 @@
+import { PHASE_DEVELOPMENT_SERVER } from "next/constants.js";
+
 /** @type {import('next').NextConfig} */
-const isDev = process.env.NODE_ENV !== "production";
+export default function nextConfig(phase) {
+  const isDev = phase === PHASE_DEVELOPMENT_SERVER;
 
-const nextConfig = {
-  distDir: isDev ? ".next-dev" : ".next",
-  output: isDev ? undefined : "standalone",
-  experimental: {
-    typedRoutes: false
-  }
-};
-
-export default nextConfig;
+  return {
+    distDir: isDev ? ".next-dev" : ".next",
+    output: isDev ? undefined : "standalone",
+    experimental: {
+      typedRoutes: false
+    }
+  };
+}

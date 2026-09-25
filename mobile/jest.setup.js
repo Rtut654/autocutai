@@ -1,4 +1,9 @@
-import "@testing-library/jest-native/extend-expect";
+const { configure } = require("@testing-library/react-native");
+
+// The first render in a suite loads and transforms every module the screen
+// uses. On a cold cache or a slow CI runner that alone takes over a second,
+// the default waitFor timeout, so the first test in a file failed there.
+configure({ asyncUtilTimeout: 5000 });
 
 jest.mock("@expo/vector-icons", () => {
   const React = require("react");
@@ -8,18 +13,24 @@ jest.mock("@expo/vector-icons", () => {
   };
 });
 
-jest.mock("expo-in-app-purchases", () => ({
-  IAPResponseCode: {
-    OK: 0,
-    USER_CANCELED: 1,
-  },
-  connectAsync: jest.fn().mockResolvedValue({}),
-  disconnectAsync: jest.fn().mockResolvedValue({}),
-  setPurchaseListener: jest.fn(),
-  getProductsAsync: jest.fn().mockResolvedValue({ responseCode: 0, results: [] }),
-  purchaseItemAsync: jest.fn().mockResolvedValue({}),
-  finishTransactionAsync: jest.fn().mockResolvedValue({}),
+jest.mock("expo-image-picker", () => ({
+  requestMediaLibraryPermissionsAsync: jest.fn().mockResolvedValue({ granted: true }),
+  launchImageLibraryAsync: jest.fn().mockResolvedValue({ canceled: true, assets: [] }),
 }));
+
+jest.mock("expo-media-library", () => ({
+  requestPermissionsAsync: jest.fn().mockResolvedValue({ granted: true }),
+  saveToLibraryAsync: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock("expo-video", () => {
+  const React = require("react");
+  const { View } = require("react-native");
+  return {
+    useVideoPlayer: jest.fn(() => ({ loop: false, play: jest.fn(), pause: jest.fn() })),
+    VideoView: (props) => React.createElement(View, props),
+  };
+});
 
 jest.mock("expo-apple-authentication", () => ({
   AppleAuthenticationButton: "AppleAuthenticationButton",
