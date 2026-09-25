@@ -1,3 +1,10 @@
+const { configure } = require("@testing-library/react-native");
+
+// The first render in a suite loads and transforms every module the screen
+// uses. On a cold cache or a slow CI runner that alone takes over a second,
+// the default waitFor timeout, so the first test in a file failed there.
+configure({ asyncUtilTimeout: 5000 });
+
 jest.mock("@expo/vector-icons", () => {
   const React = require("react");
   const { Text } = require("react-native");
